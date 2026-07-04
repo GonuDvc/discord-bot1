@@ -252,6 +252,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
         ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
         ("web_auth_mode", "panel"),                 # 認証誘導方式: "panel"（パネル設置）/ "dm"（参加時DM自動送信）
+        # --- 荒らし対策：隔離ロール・新規ロール自動制限（/arasi_setup） ---
+        ("arasi_quarantine_role_id", None),      # 隔離ロールのID
+        ("arasi_quarantine_role_name", "隔離"),   # 隔離ロールの名前（表示用）
+        ("arasi_verify_channel_id", None),       # 認証チャンネル（隔離ロールでも閲覧可能にするチャンネル）
+        ("arasi_newrole_autolimit_enabled", True),  # 新規ロール作成時にmention_everyone/use_external_appsを自動OFF
         # --- 荒らしリスト（ブラックリスト）自動BAN ---
         ("troll_autoban_enabled", True),        # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF ★デフォルトON
         ("server_blacklist_verify_channel_id", None),   # サーバーBL認証チャンネルID（パネルモード用）
@@ -1254,6 +1259,7 @@ class VerifyButtonView(discord.ui.View):
             return
         try:
             await interaction.user.add_roles(role)
+            await _remove_arasi_quarantine_role(interaction.user, guild_config)
             await interaction.response.send_message("認証が完了しました。", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
@@ -4150,6 +4156,9 @@ async def on_member_join(member: discord.Member):
     embed.add_field(name="アカウント作成日時", value=member.created_at.strftime("%Y/%m/%d %H:%M:%S UTC"), inline=False)
     await _send_mod_log(member.guild, embed)
 
+    # 荒らし対策: 隔離ロールの自動付与（未認証状態にする）
+    await _grant_arasi_quarantine_role(member, cfg)
+
     # ウェルカムメッセージ送信
     welcome_ch_id = cfg.get("welcome_channel_id")
     welcome_msg = cfg.get("welcome_message")
@@ -4347,6 +4356,115 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
 
     if recent_count >= threshold_count:
         asyncio.create_task(_handle_nuke_detected(guild, member, action_type, cfg))
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    """荒らし対策（/arasi_setup）: 新規作成されたロールの『@everyoneメンション』
+    『外部アプリのスラッシュコマンド使用』権限を自動でOFFにします。"""
+    guild = role.guild
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+
+    if not cfg.get("arasi_newrole_autolimit_enabled", True):
+        return
+
+    # @everyoneロール自体や、権限変更が不要なケースはスキップ
+    if role.is_default():
+        return
+    if not role.permissions.mention_everyone and not role.permissions.use_external_apps:
+        return
+
+    new_permissions = role.permissions
+    new_permissions.update(mention_everyone=False, use_external_apps=False)
+
+    try:
+        await role.edit(permissions=new_permissions, reason="荒らし対策: 新規ロールのメンション/外部コマンド権限を自動OFF")
+    except discord.Forbidden:
+        print(f"[荒らし対策] ロール「{role.name}」の権限自動制限に失敗しました（Botの権限不足）。")
+    except discord.HTTPException as e:
+        print(f"[荒らし対策] ロール「{role.name}」の権限自動制限に失敗しました: {e}")
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    """荒らし対策（/arasi_setup）: 新規作成されたチャンネルを隔離ロールから見えないようにします。
+    認証チャンネルとして設定されているチャンネルのみ、閲覧を許可します。
+    カテゴリーチャンネルは対象外（個々のテキスト/ボイス等チャンネルのみ処理）です。"""
+    if isinstance(channel, discord.CategoryChannel):
+        return
+
+    guild = channel.guild
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+
+    role_id = cfg.get("arasi_quarantine_role_id")
+    if not role_id:
+        return
+    role = guild.get_role(role_id)
+    if role is None:
+        return
+
+    verify_channel_id = cfg.get("arasi_verify_channel_id")
+    is_verify_channel = verify_channel_id is not None and channel.id == verify_channel_id
+
+    try:
+        if is_verify_channel:
+            await channel.set_permissions(
+                role,
+                view_channel=True,
+                send_messages=False,
+                add_reactions=False,
+                reason="荒らし対策: 新規作成された認証チャンネルに隔離ロールの閲覧を許可"
+            )
+        else:
+            await channel.set_permissions(
+                role,
+                view_channel=False,
+                send_messages=False,
+                reason="荒らし対策: 新規作成されたチャンネルを隔離ロールから非表示に設定"
+            )
+    except discord.Forbidden:
+        print(f"[荒らし対策] チャンネル「{channel.name}」の隔離ロール権限設定に失敗しました（Botの権限不足）。")
+    except discord.HTTPException as e:
+        print(f"[荒らし対策] チャンネル「{channel.name}」の隔離ロール権限設定に失敗しました: {e}")
+
+
+async def _grant_arasi_quarantine_role(member: discord.Member, cfg: dict):
+    """荒らし対策（/arasi_setup）: 新規参加者に隔離ロールを自動付与します。
+    隔離ロールが未設定・存在しない場合は何もしません（エラーにしません）。"""
+    role_id = cfg.get("arasi_quarantine_role_id")
+    if not role_id:
+        return
+    role = member.guild.get_role(role_id)
+    if role is None:
+        return
+    try:
+        await member.add_roles(role, reason="荒らし対策: 新規参加者に隔離ロールを自動付与")
+    except discord.Forbidden:
+        print(f"[荒らし対策] {member} への隔離ロール付与権限がありません。")
+    except discord.HTTPException as e:
+        print(f"[荒らし対策] {member} への隔離ロール付与に失敗しました: {e}")
+
+
+async def _remove_arasi_quarantine_role(member: discord.Member, cfg: dict):
+    """荒らし対策（/arasi_setup）: 認証完了時に隔離ロールを解除します。
+    隔離ロールが未設定・付与されていない場合は何もしません（エラーにしません）。
+    ボタン認証・ウェブ認証の両方の完了処理から呼び出されます。"""
+    role_id = cfg.get("arasi_quarantine_role_id")
+    if not role_id:
+        return
+    role = member.guild.get_role(role_id)
+    if role is None:
+        return
+    if role not in member.roles:
+        return
+    try:
+        await member.remove_roles(role, reason="荒らし対策: 認証完了により隔離ロールを解除")
+    except discord.Forbidden:
+        print(f"[荒らし対策] {member} の隔離ロール解除権限がありません。")
+    except discord.HTTPException as e:
+        print(f"[荒らし対策] {member} の隔離ロール解除に失敗しました: {e}")
 
 
 # ====================================================================
@@ -5381,6 +5499,111 @@ async def antinuke_status(interaction: discord.Interaction):
     embed = _build_antinuke_status_embed(interaction.guild, cfg)
     embed.set_footer(text="設定変更: /antinuke /antinuke_level /antinuke_threshold /antinuke_notify")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="arasi_setup", description="【管理者専用】荒らし対策：隔離ロール作成＋新規ロールの権限自動制限を設定します")
+@discord.app_commands.describe(
+    隔離ロール名="作成する隔離ロールの名前（未指定時は「隔離」）。既に同名ロールがあれば再利用します",
+    認証チャンネル="隔離ロールでも閲覧を許可するチャンネル（認証用チャンネルなど。任意）",
+    新規ロール自動制限="新規作成されたロールの「@everyoneメンション」「外部アプリのコマンド使用」権限を自動でOFFにするか"
+)
+async def arasi_setup(
+    interaction: discord.Interaction,
+    隔離ロール名: str = "隔離",
+    認証チャンネル: discord.TextChannel = None,
+    新規ロール自動制限: bool = True
+):
+    if not await is_guild_admin(interaction):
+        return
+    guild = interaction.guild
+    if not guild:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+
+    # --- 隔離ロールの作成 or 再利用 ---
+    quarantine_role = None
+    existing_role_id = cfg.get("arasi_quarantine_role_id")
+    if existing_role_id:
+        quarantine_role = guild.get_role(existing_role_id)
+
+    if quarantine_role is None:
+        # 同名の既存ロールがあれば再利用する
+        quarantine_role = discord.utils.find(lambda r: r.name == 隔離ロール名, guild.roles)
+
+    created_new_role = False
+    if quarantine_role is None:
+        try:
+            quarantine_role = await guild.create_role(
+                name=隔離ロール名,
+                permissions=discord.Permissions.none(),
+                reason="荒らし対策(/arasi_setup): 隔離ロールを作成"
+            )
+            created_new_role = True
+        except discord.Forbidden:
+            await interaction.followup.send("ロールを作成する権限がBotにありません。管理者にご確認ください。", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"隔離ロールの作成に失敗しました: {e}", ephemeral=True)
+            return
+
+    # --- 全チャンネルで閲覧・発言不可にする（認証チャンネルのみ例外で許可） ---
+    channel_update_errors = []
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+        try:
+            if 認証チャンネル is not None and channel.id == 認証チャンネル.id:
+                await channel.set_permissions(
+                    quarantine_role,
+                    view_channel=True,
+                    send_messages=False,
+                    add_reactions=False,
+                    reason="荒らし対策(/arasi_setup): 認証チャンネルのみ隔離ロールに閲覧を許可"
+                )
+            else:
+                await channel.set_permissions(
+                    quarantine_role,
+                    view_channel=False,
+                    send_messages=False,
+                    reason="荒らし対策(/arasi_setup): 隔離ロールを全チャンネル非表示に設定"
+                )
+        except discord.Forbidden:
+            channel_update_errors.append(channel.mention)
+        except discord.HTTPException:
+            channel_update_errors.append(channel.mention)
+
+    # --- 設定を保存 ---
+    cfg["arasi_quarantine_role_id"] = quarantine_role.id
+    cfg["arasi_quarantine_role_name"] = quarantine_role.name
+    cfg["arasi_verify_channel_id"] = 認証チャンネル.id if 認証チャンネル else None
+    cfg["arasi_newrole_autolimit_enabled"] = 新規ロール自動制限
+    save_data(all_data)
+
+    # --- 結果報告 ---
+    lines = []
+    if created_new_role:
+        lines.append(f"[OK] 隔離ロール {quarantine_role.mention} を新規作成しました。")
+    else:
+        lines.append(f"[OK] 既存のロール {quarantine_role.mention} を隔離ロールとして設定しました。")
+    lines.append("全チャンネルで閲覧・発言不可に設定しました。")
+    if 認証チャンネル is not None:
+        lines.append(f"認証チャンネル {認証チャンネル.mention} のみ閲覧を許可しました（発言は不可）。")
+    else:
+        lines.append("認証チャンネルは指定されていません（すべてのチャンネルが非表示です）。")
+    lines.append(f"新規ロール自動制限: {'有効' if 新規ロール自動制限 else '無効'}"
+                 "（新しく作成されたロールの「@everyoneメンション」「外部アプリのコマンド使用」権限を自動でOFFにします）")
+    if channel_update_errors:
+        lines.append(f"[警告] 以下のチャンネルは権限変更に失敗しました（Botの権限をご確認ください）: {', '.join(channel_update_errors[:10])}")
+    lines.append(
+        "\n新規参加者には自動で隔離ロールが付与されます。\n"
+        "ボタン認証（/verify系パネル）またはウェブ認証（OAuth2）が完了すると、隔離ロールは自動的に解除されます。"
+    )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="warn", description="【モデレーター専用】ユーザーに警告を与えます")
@@ -9763,13 +9986,10 @@ async def admin_dashboard_link(interaction: discord.Interaction):
 
 async def _grant_verified_role(bot_client, guild_id: int, user_id: int, cfg: dict):
     """
-    認証完了時に web_auth_verified_role_id で指定されたロールをメンバーへ付与します。
+    認証完了時に web_auth_verified_role_id で指定されたロールをメンバーへ付与し、
+    荒らし対策の隔離ロールが設定されていればそれを解除します。
     ロール未設定・メンバー不在・権限不足のいずれの場合もエラーにせず静かに終了します。
     """
-    role_id = cfg.get("web_auth_verified_role_id")
-    if not role_id:
-        return
-
     guild = bot_client.get_guild(guild_id)
     if not guild:
         return
@@ -9778,18 +9998,22 @@ async def _grant_verified_role(bot_client, guild_id: int, user_id: int, cfg: dic
     if not member:
         return
 
-    role = guild.get_role(role_id)
-    if not role:
-        print(f"[ウェブ認証] ロールID {role_id} がサーバーに存在しません。")
-        return
+    role_id = cfg.get("web_auth_verified_role_id")
+    if role_id:
+        role = guild.get_role(role_id)
+        if not role:
+            print(f"[ウェブ認証] ロールID {role_id} がサーバーに存在しません。")
+        else:
+            try:
+                await member.add_roles(role, reason="ウェブ認証完了によるロール付与")
+                print(f"[ウェブ認証] ユーザー {user_id} にロール「{role.name}」を付与しました。")
+            except discord.Forbidden:
+                print(f"[ウェブ認証] ロール付与権限がありません（ロール: {role.name}）。")
+            except Exception as e:
+                print(f"[ウェブ認証] ロール付与エラー: {e}")
 
-    try:
-        await member.add_roles(role, reason="ウェブ認証完了によるロール付与")
-        print(f"[ウェブ認証] ユーザー {user_id} にロール「{role.name}」を付与しました。")
-    except discord.Forbidden:
-        print(f"[ウェブ認証] ロール付与権限がありません（ロール: {role.name}）。")
-    except Exception as e:
-        print(f"[ウェブ認証] ロール付与エラー: {e}")
+    # 荒らし対策: ウェブ認証完了時に隔離ロールを解除
+    await _remove_arasi_quarantine_role(member, cfg)
 
 
 def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_message: str = "") -> str:
