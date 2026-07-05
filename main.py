@@ -311,7 +311,10 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("interview_pass_message", None),      # 合格時に応募者へ追加送信するメッセージ（URL等も可）
         # --- ひろゆき構文ランダム返信 ---
         ("hiroyuki_channel_id", None),        # 対象チャンネルID（このチャンネルの発言に反応）
-        ("hiroyuki_chance_percent", 15),       # メッセージごとに発言する確率（%）
+        ("hiroyuki_chance_percent", 15),       # メッセージごとに発言する確率（%）（NGワードモード時は未使用）
+        ("hiroyuki_ng_mode_enabled", False),   # True: NGワードを含む発言にのみ反応する専用モード
+        ("hiroyuki_ng_words", []),             # ひろゆきモード専用のNGワード一覧
+        ("hiroyuki_ng_reply", "そういうのやめてもらっていいですか"),  # NGワード検知時の固定返信文
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -3602,16 +3605,31 @@ async def on_message(message: discord.Message):
         # 5.5 ひろゆき構文ランダム返信
         hiroyuki_ch_id = guild_config.get("hiroyuki_channel_id")
         if hiroyuki_ch_id and message.channel.id == hiroyuki_ch_id:
-            chance = guild_config.get("hiroyuki_chance_percent", 15)
-            if random.randint(1, 100) <= chance:
-                phrase = random.choice(HIROYUKI_PHRASES)
-                try:
-                    await message.reply(phrase, mention_author=False)
-                except discord.Forbidden:
+            if guild_config.get("hiroyuki_ng_mode_enabled", False):
+                # NGワード検知モード: NGワードが含まれる時だけ固定文で反応
+                ng_words = guild_config.get("hiroyuki_ng_words", [])
+                content_lower = message.content.lower()
+                if any(ng and ng.lower() in content_lower for ng in ng_words):
+                    reply_text = guild_config.get("hiroyuki_ng_reply", "そういうのやめてもらっていいですか")
                     try:
-                        await message.channel.send(phrase)
-                    except Exception:
-                        pass
+                        await message.reply(reply_text, mention_author=False)
+                    except discord.Forbidden:
+                        try:
+                            await message.channel.send(reply_text)
+                        except Exception:
+                            pass
+            else:
+                # 通常モード: 確率判定でランダムなセリフを返信
+                chance = guild_config.get("hiroyuki_chance_percent", 15)
+                if random.randint(1, 100) <= chance:
+                    phrase = random.choice(HIROYUKI_PHRASES)
+                    try:
+                        await message.reply(phrase, mention_author=False)
+                    except discord.Forbidden:
+                        try:
+                            await message.channel.send(phrase)
+                        except Exception:
+                            pass
 
         # 6. 経済システム: メッセージ送信報酬（グローバルMコイン・クールダウン付き）
         if guild_config.get("economy_enabled", False):
@@ -5083,12 +5101,22 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_hiroyuki_setup", description="【管理者専用】指定チャンネルでひろゆき構文がランダムに返信されるようにします")
+@bot.tree.command(name="server_hiroyuki_setup", description="【管理者専用】指定チャンネルでひろゆき構文が発動するように設定します")
 @app_commands.describe(
     channel="ひろゆき構文の対象にするチャンネル",
-    chance_percent="メッセージが送られるたびに返信する確率（%）。1〜100で指定（デフォルト15）"
+    mode="発動モード（ランダム発動 / NGワード検知時のみ発動）",
+    chance_percent="【ランダムモード時】メッセージが送られるたびに返信する確率（%）。1〜100で指定（デフォルト15）"
 )
-async def server_hiroyuki_setup(interaction: discord.Interaction, channel: discord.TextChannel, chance_percent: int = 15):
+@app_commands.choices(mode=[
+    app_commands.Choice(name="ランダム発動（確率でひろゆき構文を返信）", value="random"),
+    app_commands.Choice(name="NGワード検知時のみ発動", value="ng_word"),
+])
+async def server_hiroyuki_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    mode: app_commands.Choice[str] = None,
+    chance_percent: int = 15
+):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
     if not (1 <= chance_percent <= 100):
@@ -5100,19 +5128,34 @@ async def server_hiroyuki_setup(interaction: discord.Interaction, channel: disco
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         cfg["hiroyuki_channel_id"] = channel.id
         cfg["hiroyuki_chance_percent"] = chance_percent
+        if mode is not None:
+            cfg["hiroyuki_ng_mode_enabled"] = (mode.value == "ng_word")
         save_data(all_data)
-        await interaction.followup.send(
-            "ひろゆき構文ランダム返信を設定しました。\n"
-            f"・対象チャンネル: {channel.mention}\n"
-            f"・返信確率: {chance_percent}%（メッセージが送られるたびに判定）\n"
-            f"・登録セリフ数: {len(HIROYUKI_PHRASES)}種類",
-            ephemeral=True
-        )
+
+        ng_mode = cfg.get("hiroyuki_ng_mode_enabled", False)
+        if ng_mode:
+            ng_count = len(cfg.get("hiroyuki_ng_words", []))
+            await interaction.followup.send(
+                "ひろゆき構文（NGワード検知モード）を設定しました。\n"
+                f"・対象チャンネル: {channel.mention}\n"
+                f"・登録NGワード数: {ng_count}件\n"
+                f"・検知時の返信文: 「{cfg.get('hiroyuki_ng_reply')}」\n"
+                "NGワードの追加は `/hiroyuki_ngword add` をご利用ください。",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "ひろゆき構文（ランダム発動モード）を設定しました。\n"
+                f"・対象チャンネル: {channel.mention}\n"
+                f"・返信確率: {chance_percent}%（メッセージが送られるたびに判定）\n"
+                f"・登録セリフ数: {len(HIROYUKI_PHRASES)}種類",
+                ephemeral=True
+            )
     except Exception as e:
         await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_hiroyuki_reset", description="【管理者専用】ひろゆき構文ランダム返信の設定を解除（OFF）します")
+@bot.tree.command(name="server_hiroyuki_reset", description="【管理者専用】ひろゆき構文（全モード）の設定を解除（OFF）します")
 async def server_hiroyuki_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5122,9 +5165,72 @@ async def server_hiroyuki_reset(interaction: discord.Interaction):
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         cfg["hiroyuki_channel_id"] = None
         save_data(all_data)
-        await interaction.followup.send("ひろゆき構文ランダム返信をOFFにしました。", ephemeral=True)
+        await interaction.followup.send("ひろゆき構文をOFFにしました。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# ひろゆき構文：NGワード検知モード専用の管理コマンド群
+# --------------------------------------------------------------------
+hiroyuki_ngword_group = app_commands.Group(name="hiroyuki_ngword", description="【管理者専用】ひろゆき構文NGワード検知モードの単語を管理")
+
+
+@hiroyuki_ngword_group.command(name="add", description="ひろゆき構文が反応するNGワードを追加します")
+async def hiroyuki_ngword_add(interaction: discord.Interaction, word: str):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ng_words = set(cfg.get("hiroyuki_ng_words", []))
+    ng_words.add(word)
+    cfg["hiroyuki_ng_words"] = list(ng_words)
+    save_data(all_data)
+    await interaction.response.send_message(f"NGワード「{word}」を追加しました。（登録数: {len(ng_words)}件）", ephemeral=True)
+
+
+@hiroyuki_ngword_group.command(name="remove", description="ひろゆき構文のNGワードを削除します")
+async def hiroyuki_ngword_remove(interaction: discord.Interaction, word: str):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ng_words = set(cfg.get("hiroyuki_ng_words", []))
+    if word not in ng_words:
+        await interaction.response.send_message(f"NGワード「{word}」は登録されていません。", ephemeral=True)
+        return
+    ng_words.discard(word)
+    cfg["hiroyuki_ng_words"] = list(ng_words)
+    save_data(all_data)
+    await interaction.response.send_message(f"NGワード「{word}」を削除しました。（登録数: {len(ng_words)}件）", ephemeral=True)
+
+
+@hiroyuki_ngword_group.command(name="list", description="登録済みのひろゆき構文NGワード一覧を表示します")
+async def hiroyuki_ngword_list(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ng_words = cfg.get("hiroyuki_ng_words", [])
+    if not ng_words:
+        await interaction.response.send_message("NGワードは登録されていません。", ephemeral=True)
+        return
+    text = "、".join(ng_words)
+    await interaction.response.send_message(f"登録済みNGワード（{len(ng_words)}件）:\n{text}", ephemeral=True)
+
+
+@hiroyuki_ngword_group.command(name="setreply", description="NGワード検知時にひろゆき構文が返す固定メッセージを変更します")
+async def hiroyuki_ngword_setreply(interaction: discord.Interaction, text: str):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["hiroyuki_ng_reply"] = text
+    save_data(all_data)
+    await interaction.response.send_message(f"NGワード検知時の返信文を「{text}」に変更しました。", ephemeral=True)
+
+
+bot.tree.add_command(hiroyuki_ngword_group)
 
 
 @bot.tree.command(name="server_backup", description="サーバーのロール・チャンネル構成・権限設定をJSONファイルとしてバックアップします")
