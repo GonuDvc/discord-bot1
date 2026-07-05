@@ -925,39 +925,61 @@ class UserManageView(discord.ui.View):
             await interaction.response.send_message(f"{target_user.mention} は登録されていません。", ephemeral=True)
 
 
+class DynamicRoleSelect(discord.ui.Select):
+    """ロールパネル用のセレクトメニュー（複数選択可・選択したロールを全付与）です。"""
+    def __init__(self, roles):
+        options = [
+            discord.SelectOption(label=role.name[:100], value=str(role.id))
+            for role in roles[:25]  # Discordのセレクトメニュー選択肢は最大25個
+        ]
+        super().__init__(
+            placeholder="受け取りたいロールを選択してください（複数選択可）",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            custom_id="dynamic_role_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            return
+
+        selected_role_ids = [int(v) for v in self.values]
+        granted = []
+        already_had = []
+        failed = []
+
+        for role_id in selected_role_ids:
+            role = guild.get_role(role_id)
+            if not role:
+                continue
+            if role in interaction.user.roles:
+                already_had.append(role)
+                continue
+            try:
+                await interaction.user.add_roles(role)
+                granted.append(role)
+            except discord.Forbidden:
+                failed.append(role)
+
+        parts = []
+        if granted:
+            parts.append("✅ 付与しました: " + ", ".join(r.name for r in granted))
+        if already_had:
+            parts.append("➖ すでに持っています: " + ", ".join(r.name for r in already_had))
+        if failed:
+            parts.append("❌ 付与に失敗しました（Botの権限不足）: " + ", ".join(r.name for r in failed))
+
+        message = "\n".join(parts) if parts else "対象のロールが見つかりませんでした。"
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 class DynamicRoleView(discord.ui.View):
-    """ロール自動付与・剥奪用のボタンを表示する動的パネルビューです。"""
+    """ロール自動付与用のセレクトメニューを表示する動的パネルビューです。"""
     def __init__(self, roles):
         super().__init__(timeout=None)
-        for role in roles:
-            button = discord.ui.Button(
-                label=f"{role.name} を受け取る / 外す", 
-                style=discord.ButtonStyle.secondary, 
-                custom_id=f"dynamic_role_{role.id}"
-            )
-            button.callback = self.create_callback(role.id)
-            self.add_item(button)
-
-    def create_callback(self, role_id):
-        async def button_callback(interaction: discord.Interaction):
-            guild = interaction.guild
-            if not guild: return
-            role = guild.get_role(role_id)
-            if not role: return
-
-            if role in interaction.user.roles:
-                try:
-                    await interaction.user.remove_roles(role)
-                    await interaction.response.send_message(f"{role.name} ロールを外しました。", ephemeral=True)
-                except discord.Forbidden:
-                    await interaction.response.send_message("Botの権限が不足しているためロールを外せませんでした。ロールの順序を確認してください。", ephemeral=True)
-            else:
-                try:
-                    await interaction.user.add_roles(role)
-                    await interaction.response.send_message(f"{role.name} ロールを付与しました。", ephemeral=True)
-                except discord.Forbidden:
-                    await interaction.response.send_message("Botの権限が不足しているためロールを付与できませんでした。ボットのロールを対象ロールより上に移動してください。", ephemeral=True)
-        return button_callback
+        self.add_item(DynamicRoleSelect(roles))
 
 
 class VerifyButtonView(discord.ui.View):
@@ -2932,7 +2954,7 @@ async def on_ready():
             roles = [guild.get_role(rid) for rid in panel_roles if guild.get_role(rid)]
             if roles:
                 bot.add_view(DynamicRoleView(roles))
-                print(f"  > ロールパネル: {len(roles)}個の取得ボタンを再活性化しました")
+                print(f"  > ロールパネル: {len(roles)}個のロールを含むセレクトメニューを再活性化しました")
 
         # 統計チャンネルの自動更新ループを再起動
         stats_ch_ids = [
@@ -4794,26 +4816,35 @@ async def server_disable_external_apps(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="server_role_panel", description="指定したロール（最大5つ）を取得できるボタン付きパネルを送信します")
+@bot.tree.command(name="server_role_panel", description="指定したロール（最大23個）を取得できるセレクトメニュー付きパネルを送信します")
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
-    role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None
+    role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
+    role6: discord.Role = None, role7: discord.Role = None, role8: discord.Role = None, role9: discord.Role = None, role10: discord.Role = None,
+    role11: discord.Role = None, role12: discord.Role = None, role13: discord.Role = None, role14: discord.Role = None, role15: discord.Role = None,
+    role16: discord.Role = None, role17: discord.Role = None, role18: discord.Role = None, role19: discord.Role = None, role20: discord.Role = None,
+    role21: discord.Role = None, role22: discord.Role = None, role23: discord.Role = None
 ):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
     await interaction.response.defer(ephemeral=True)
     ch = interaction.channel
     g = interaction.guild
-    raw_roles = [role1, role2, role3, role4, role5]
+    raw_roles = [
+        role1, role2, role3, role4, role5, role6, role7, role8, role9, role10,
+        role11, role12, role13, role14, role15, role16, role17, role18, role19, role20,
+        role21, role22, role23
+    ]
     roles = [r for r in raw_roles if r is not None]
     all_data = load_data()
     get_guild_config(all_data, str(g.id))["panel_roles"] = [r.id for r in roles]
     save_data(all_data)
     embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
     role_mentions = [f"{r.mention}" for r in roles]
-    embed.add_field(name="対象ロール一覧", value="\n\n".join(role_mentions), inline=False)
+    embed.add_field(name=f"対象ロール一覧（{len(roles)}個）", value="\n".join(role_mentions), inline=False)
+    embed.set_footer(text="下のメニューから受け取りたいロールを選択してください（複数選択可）")
     await ch.send(embed=embed, view=DynamicRoleView(roles))
-    await interaction.followup.send("ロールパネルを設置しました。", ephemeral=True)
+    await interaction.followup.send(f"ロールパネルを設置しました（{len(roles)}個のロール）。", ephemeral=True)
 
 
 @bot.tree.command(name="server_forward_setup", description="メッセージ転送元のチャンネルと転送先を設定します")
