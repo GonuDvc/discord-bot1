@@ -4458,9 +4458,13 @@ async def apology(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="say", description="Botに指定したメッセージを代わりに発言させます")
+@app_commands.describe(
+    message="Botに発言させる内容",
+    reply_to_message_id="このメッセージID宛に返信（リプライ）形式で送信したい場合に指定します（省略時は通常送信）"
+)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
-async def say(interaction: discord.Interaction, message: str):
+async def say(interaction: discord.Interaction, message: str, reply_to_message_id: str = None):
     # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
     owner_id = await resolve_owner_id(interaction.client)
     if not interaction.guild:
@@ -4473,10 +4477,42 @@ async def say(interaction: discord.Interaction, message: str):
         if not await is_admin_or_allowed(interaction):
             return
 
+    # 返信先メッセージIDが指定されている場合は事前に解析・取得しておく
+    target_message = None
+    if reply_to_message_id:
+        try:
+            target_message_id = int(reply_to_message_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "メッセージIDの形式が正しくありません。数字のみで指定してください。", ephemeral=True
+            )
+            return
+
+        if interaction.channel:
+            try:
+                target_message = await interaction.channel.fetch_message(target_message_id)
+            except discord.NotFound:
+                await interaction.response.send_message(
+                    "指定されたメッセージIDがこのチャンネル内で見つかりませんでした。", ephemeral=True
+                )
+                return
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "そのメッセージを取得する権限がありません。", ephemeral=True
+                )
+                return
+        else:
+            await interaction.response.send_message(
+                "このコンテキストではメッセージID指定の返信を利用できません。", ephemeral=True
+            )
+            return
+
     await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
 
     # DMチャンネルでは interaction.channel が None になる場合があるので followup で対処
-    if interaction.channel:
+    if target_message:
+        await target_message.reply(message, mention_author=False)
+    elif interaction.channel:
         await interaction.channel.send(message)
     else:
         # DMチャンネルが取得できない場合はユーザーのDMへ直接送信
