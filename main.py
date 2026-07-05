@@ -55,22 +55,17 @@ if not TOKEN:
     print("エラー: 環境変数 'DISCORD_TOKEN' が見つかりません。")
     sys.exit(1)
 
-# 承認パネル用デフォルトチャンネル名
-APPROVAL_PANEL_CHANNEL_NAME = os.getenv("APPROVAL_PANEL_CHANNEL_NAME", "bot-許可申請")
-
-# インテントの設定 (メッセージ、メンバー一覧の取得を有効化)
+# インテントの設定 (メッセージ、メンバー一覧 of 取得を有効化)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.dm_messages = True      # DMメッセージの受信を有効化（on_message で DM を処理するために必要）
+intents.dm_messages = True      # DMメッセージ of 受信を有効化（on_message で DM を処理するために必要）
 
-# JSONデータファイルのパス設定 (Railway用の永続化パス '/app/data' の存在チェック)
+# JSONデータファイル of パス設定 (Railway用の永続化パス '/app/data' of 存在チェック)
 if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
-    SERVER_BOARD_JSON_FILE = "/app/data/server_board.json"
 else:
     JSON_FILE = "allowed_users.json"
-    SERVER_BOARD_JSON_FILE = "server_board.json"
 
 # Botのカスタムステータステキスト保存用変数
 current_custom_status = None
@@ -106,62 +101,6 @@ def save_data(data: dict):
         print(f"[JSON保存エラー] {e}")
 
 
-# --------------------------------------------------------------------
-# サーバー掲示板（グローバル・複数サーバー間の宣伝掲示板機能）
-# DISBOARD/ディス速のように、このBotを導入している全サーバー同士が
-# お互いを宣伝し合うための仕組みです。allowed_users.json とは独立した
-# 専用ファイル（server_board.json）でデータを管理します。
-# --------------------------------------------------------------------
-
-SERVER_BOARD_BUMP_COOLDOWN_SECONDS = 3600  # bump間隔 = 1時間
-
-
-def load_server_board_data() -> dict:
-    """サーバー掲示板データ（server_board.json）を読み込みます。"""
-    if os.path.exists(SERVER_BOARD_JSON_FILE):
-        try:
-            with open(SERVER_BOARD_JSON_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[掲示板JSON読み込みエラー] {e}")
-            return {}
-    return {}
-
-
-def save_server_board_data(data: dict):
-    """サーバー掲示板データ（server_board.json）を書き込みます。"""
-    try:
-        dir_name = os.path.dirname(SERVER_BOARD_JSON_FILE)
-        if dir_name and not os.path.exists(dir_name):
-            os.makedirs(dir_name, exist_ok=True)
-        with open(SERVER_BOARD_JSON_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"[掲示板JSON保存エラー] {e}")
-
-
-def get_board_entry(board_data: dict, guild_id_str: str) -> dict | None:
-    """指定サーバーの掲示板登録情報を取得します。未登録ならNoneを返します。"""
-    return board_data.get("entries", {}).get(guild_id_str)
-
-
-def ensure_board_entry(board_data: dict, guild_id_str: str) -> dict:
-    """指定サーバーの掲示板登録情報を取得し、無ければデフォルト値で新規作成します。"""
-    if "entries" not in board_data:
-        board_data["entries"] = {}
-    if guild_id_str not in board_data["entries"]:
-        board_data["entries"][guild_id_str] = {
-            "description": "",
-            "tags": [],
-            "invite_url": "",
-            "registered_at": int(time.time()),
-            "last_bumped_at": 0,
-            "bump_count": 0,
-            "bumped_by": None,
-        }
-    return board_data["entries"][guild_id_str]
-
-
 def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
     """指定されたサーバーの設定を取得します。存在しない場合はデフォルト値で初期化します。"""
     if guild_id_str not in all_data:
@@ -177,8 +116,6 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "mention_trigger_channel": None,
             "mention_target_role": None,
             "mention_custom_message": None,
-            "approval_status": "pending",
-            "approval_panel_channel_id": None,
             "warnings": {},
             "automod_spam_enabled": False,
             "automod_invite_enabled": False,
@@ -191,8 +128,6 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
     
     # 既存データへの互換性のためキーが無ければ追加
     cfg = all_data[guild_id_str]
-    if "approval_status" not in cfg:
-        cfg["approval_status"] = "pending"
     for key, default in [
         ("warnings", {}),
         ("automod_spam_enabled", False),
@@ -286,12 +221,6 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
     return cfg
 
 
-def is_guild_approved(all_data: dict, guild_id_str: str) -> bool:
-    """サーバーがBot所有者から利用許可されているかを確認します。"""
-    cfg = get_guild_config(all_data, guild_id_str)
-    return cfg.get("approval_status") == "approved"
-
-
 def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
     """指定されたユーザーの個人用データ（メモ、クリップ）を取得します。"""
     if "user_apps" not in all_data:
@@ -305,47 +234,14 @@ def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
 
 
 # ====================================================================
-# セクション 2: 権限チェックヘルパー & カスタムCommandTree
+# セクション 2: 権限チェックヘルパー
 # ====================================================================
-
-class ApprovalCommandTree(app_commands.CommandTree):
-    """
-    サーバーが承認されているかチェックするカスタム CommandTree です。
-    承認されていないサーバーでは、管理者および一般ユーザーのコマンド実行を無効化します。
-    """
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # DMやプライベートチャット内はチェックを通す
-        if not interaction.guild:
-            return True
-
-        client = interaction.client
-
-        # BotのオーナーIDの解決（個人所有 / Team所有の両方に対応）
-        await resolve_owner_id(client)
-
-        # Botオーナー本人の実行であれば無条件で許可
-        if interaction.user.id == client.owner_id:
-            return True
-
-        # サーバーの承認状況をチェック
-        all_data = load_data()
-        if not is_guild_approved(all_data, str(interaction.guild.id)):
-            await interaction.response.send_message(
-                "エラー: このサーバーはまだBOT利用申請が完了していません。\n"
-                "BOT所有者の承認が得られるまでコマンドは使用できません。\n"
-                "サーバー管理者は申請パネルのボタンから利用申請を送信してください。",
-                ephemeral=True
-            )
-            return False
-
-        return True
 
 
 # Botクライアントのインスタンス化
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents,
-    tree_cls=ApprovalCommandTree
+    intents=intents
 )
 
 # --------------------------------------------------------------------
@@ -686,22 +582,6 @@ def create_user_list_embed(allowed_users: list) -> discord.Embed:
     return embed
 
 
-def build_approval_request_embed(guild: discord.Guild) -> discord.Embed:
-    """サーバー管理者が使用する「Bot導入の利用申請パネル」用の Embed を作成します。"""
-    embed = discord.Embed(
-        title="BOT利用申請",
-        description=(
-            "このBOTを利用するには、**BOT所有者の承認**が必要です。\n\n"
-            "下のボタンを押すと、BOT所有者に利用申請のDMが送信されます。\n"
-            "所有者が**承認**するとすべての機能が利用可能になります。\n"
-            "所有者が**拒否**した場合、BOTは自動的にサーバーから退出します。"
-        ),
-        color=discord.Color.orange()
-    )
-    embed.add_field(name="サーバー名", value=guild.name, inline=True)
-    embed.add_field(name="メンバー数", value=f"{guild.member_count}人", inline=True)
-    embed.set_footer(text="サーバー管理者のみ申請できます")
-    return embed
 
 
 GUILDS_PER_PAGE = 5
@@ -751,166 +631,7 @@ async def update_bot_status(client, text=None):
 # セクション 4: UIビュー部品 (ボタン・セレクト・モーダル)
 # ====================================================================
 
-class ApprovalRequestView(discord.ui.View):
-    """サーバー管理者がBot所有者に利用許可申請を送るためのボタンビューです。"""
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
 
-    @discord.ui.button(label="BOT所有者に利用申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
-    async def send_request(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            return
-
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("このボタンはサーバー管理者のみ使用できます。", ephemeral=True)
-            return
-
-        all_data = load_data()
-        cfg = get_guild_config(all_data, str(interaction.guild.id))
-
-        if cfg.get("approval_status") == "approved":
-            await interaction.response.send_message("このサーバーは既に承認済みです。", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        client = interaction.client
-        owner_id = await resolve_owner_id(client)
-
-        try:
-            owner = client.get_user(owner_id) or await client.fetch_user(owner_id)
-        except Exception:
-            owner = None
-
-        if not owner:
-            await interaction.followup.send("BOT所有者の情報を取得できませんでした。時間をおいて再試行してください。", ephemeral=True)
-            return
-
-        request_embed = discord.Embed(
-            title="BOT利用申請（新規サーバー）",
-            description="以下のサーバーからBOTの利用申請が届きました。",
-            color=discord.Color.gold()
-        )
-        if interaction.guild.icon:
-            request_embed.set_thumbnail(url=interaction.guild.icon.url)
-
-        owner_text = f"<@{interaction.guild.owner_id}>" if interaction.guild.owner_id else "不明"
-        request_embed.add_field(name="サーバー名", value=interaction.guild.name, inline=True)
-        request_embed.add_field(name="サーバーID", value=f"`{interaction.guild.id}`", inline=True)
-        request_embed.add_field(name="サーバーオーナー", value=owner_text, inline=True)
-        request_embed.add_field(name="メンバー数", value=f"{interaction.guild.member_count}人", inline=True)
-        request_embed.add_field(name="申請者", value=f"{interaction.user} ({interaction.user.mention})", inline=False)
-        request_embed.timestamp = discord.utils.utcnow()
-
-        try:
-            await owner.send(
-                embed=request_embed,
-                view=ApprovalDecisionView(
-                    guild_id=interaction.guild.id,
-                    panel_channel_id=interaction.channel.id
-                )
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "BOT所有者へのDM送信に失敗しました（DM拒否設定の可能性があります）。所有者に直接ご連絡ください。",
-                ephemeral=True
-            )
-            return
-        except Exception as e:
-            await interaction.followup.send(f"申請送信中にエラーが発生しました: {e}", ephemeral=True)
-            return
-
-        cfg["approval_status"] = "pending_review"
-        save_data(all_data)
-
-        button.disabled = True
-        button.label = "申請送信済み（所有者の確認待ち）"
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
-
-        await interaction.followup.send("BOT所有者に利用申請を送信しました。承認結果をお待ちください。", ephemeral=True)
-
-
-class ApprovalDecisionView(discord.ui.View):
-    """Bot所有者のDMに送信される、サーバー承認・拒否を選択するボタンビューです。"""
-    def __init__(self, guild_id: int, panel_channel_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.panel_channel_id = panel_channel_id
-
-    async def _notify_panel_channel(self, client, text: str):
-        guild = client.get_guild(self.guild_id)
-        if not guild:
-            return
-        channel = guild.get_channel(self.panel_channel_id)
-        if channel:
-            try:
-                await channel.send(text)
-            except Exception:
-                pass
-
-    @discord.ui.button(label="許可する", style=discord.ButtonStyle.success, custom_id="approve_guild")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        client = interaction.client
-        owner_id = await resolve_owner_id(client)
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
-            return
-
-        guild = client.get_guild(self.guild_id)
-        guild_name = guild.name if guild else f"ID:{self.guild_id}"
-
-        all_data = load_data()
-        cfg = get_guild_config(all_data, str(self.guild_id))
-        cfg["approval_status"] = "approved"
-        save_data(all_data)
-
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content=f"**{guild_name}** の利用を許可しました。",
-            embed=None,
-            view=self
-        )
-
-        await self._notify_panel_channel(
-            client,
-            "BOT所有者がこのサーバーの利用申請を承認しました。全機能が利用可能になりました。"
-        )
-
-    @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        client = interaction.client
-        owner_id = await resolve_owner_id(client)
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
-            return
-
-        guild = client.get_guild(self.guild_id)
-        guild_name = guild.name if guild else f"ID:{self.guild_id}"
-
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content=f"**{guild_name}** への導入を拒否しました。サーバーから退出します。",
-            embed=None,
-            view=self
-        )
-
-        if guild:
-            try:
-                await guild.leave()
-                print(f"[許可拒否] {guild_name} (ID: {self.guild_id}) から自動退出しました。")
-            except Exception as e:
-                print(f"[許可拒否エラー] 退出処理に失敗しました: {e}")
-
-        all_data = load_data()
-        if str(self.guild_id) in all_data:
-            del all_data[str(self.guild_id)]
-            save_data(all_data)
 
 
 class GuildLeaveConfirmView(discord.ui.View):
@@ -1390,146 +1111,8 @@ def _build_guild_dashboard_url(guild_id: int, user_id: int) -> str:
     return f"{base}/dashboard?{query}"
 
 
-# --------------------------------------------------------------------
-# サーバー掲示板（グローバル掲示板）関連のトークン
-# ・管理ページ（/board/manage）用トークン: /dashboard と同じHMAC署名方式。
-#   Discordの /board_manage コマンド実行時点で管理者確認済みの本人専用リンク。
-# ・Webログインセッション用トークン: 掲示板ページから直接「サーバーを登録する」
-#   ボタンを押した場合に、OAuth2でDiscordログインしてもらい、本人が管理者権限を
-#   持つ「Bot導入済みサーバー一覧」から選んで登録できるようにするためのものです。
-# --------------------------------------------------------------------
-
-BOARD_MANAGE_TOKEN_TTL = 1800  # サーバー掲示板・管理ページの個人専用リンクの有効期限（秒）= 30分
-BOARD_SESSION_TOKEN_TTL = 1800  # Webログインセッションの有効期限（秒）= 30分
 
 
-def _generate_board_manage_token(guild_id: int, user_id: int) -> str:
-    """サーバー掲示板の管理ページ（/board/manage）用の、有効期限付きHMAC署名トークンを生成します。"""
-    import hmac
-    import hashlib
-    expiry = int(time.time()) + BOARD_MANAGE_TOKEN_TTL
-    payload = f"board:{guild_id}:{user_id}:{expiry}"
-    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
-
-
-def _verify_board_manage_token(token: str):
-    """_generate_board_manage_token で発行したトークンを検証します。"""
-    import hmac
-    import hashlib
-    try:
-        decoded = base64.urlsafe_b64decode(token.encode()).decode()
-        tag, guild_id_str, user_id_str, expiry_str, signature = decoded.split(":")
-        if tag != "board":
-            return None
-        payload = f"{tag}:{guild_id_str}:{user_id_str}:{expiry_str}"
-        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected_signature):
-            return None
-        if int(time.time()) > int(expiry_str):
-            return None
-        return int(guild_id_str), int(user_id_str)
-    except Exception:
-        return None
-
-
-def _build_board_manage_url(guild_id: int, user_id: int) -> str:
-    """指定ユーザー専用の、サーバー掲示板管理ページ（/board/manage）への秘密リンクを生成します。"""
-    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    token = _generate_board_manage_token(guild_id, user_id)
-    query = urllib.parse.urlencode({"token": token})
-    return f"{base}/board/manage?{query}"
-
-
-def _build_board_url() -> str:
-    """サーバー掲示板の一覧ページ（誰でも閲覧可）のURLを生成します。"""
-    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    return f"{base}/board"
-
-
-def _generate_board_login_state() -> str:
-    """
-    掲示板ログイン（/board/login）用のHMAC署名付きstateトークンを生成します。
-    guild_idを固定しない汎用ログインなので、既存の _generate_web_auth_state とは別に定義します。
-    """
-    import hmac
-    import hashlib
-    nonce = secrets.token_urlsafe(16)
-    payload = f"boardlogin:{nonce}"
-    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
-
-
-def _verify_board_login_state(state: str) -> bool:
-    """_generate_board_login_state で発行したstateを検証します。"""
-    import hmac
-    import hashlib
-    try:
-        decoded = base64.urlsafe_b64decode(state.encode()).decode()
-        tag, nonce, signature = decoded.split(":")
-        if tag != "boardlogin":
-            return False
-        payload = f"{tag}:{nonce}"
-        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(signature, expected_signature)
-    except Exception:
-        return False
-
-
-def _build_board_login_url() -> str:
-    """サーバー掲示板ページから直接Discordログインを開始するためのURLを生成します（scope: identify guilds）。"""
-    state = _generate_board_login_state()
-    params = urllib.parse.urlencode({
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": _board_oauth_redirect_uri(),
-        "response_type": "code",
-        "scope": "identify guilds",
-        "state": state,
-    })
-    return f"https://discord.com/oauth2/authorize?{params}"
-
-
-def _board_oauth_redirect_uri() -> str:
-    """掲示板ログイン専用のOAuth2リダイレクトURIを生成します（既存の/callbackとは別エンドポイント）。"""
-    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    return f"{base}/board/oauth_callback"
-
-
-def _generate_board_session_token(user_id: int) -> str:
-    """
-    掲示板ログインセッション用の、有効期限付きHMAC署名トークンを生成します。
-    このトークンを持っている間、本人が管理者権限を持つ「Bot導入済みサーバー」の
-    掲示板情報を編集できます（サーバーごとの管理者チェックはアクセスの都度再検証します）。
-    """
-    import hmac
-    import hashlib
-    expiry = int(time.time()) + BOARD_SESSION_TOKEN_TTL
-    payload = f"boardsession:{user_id}:{expiry}"
-    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
-
-
-def _verify_board_session_token(token: str):
-    """_generate_board_session_token で発行したトークンを検証し、有効なら user_id を返します。"""
-    import hmac
-    import hashlib
-    try:
-        decoded = base64.urlsafe_b64decode(token.encode()).decode()
-        tag, user_id_str, expiry_str, signature = decoded.split(":")
-        if tag != "boardsession":
-            return None
-        payload = f"{tag}:{user_id_str}:{expiry_str}"
-        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected_signature):
-            return None
-        if int(time.time()) > int(expiry_str):
-            return None
-        return int(user_id_str)
-    except Exception:
-        return None
 
 
 class VerifyBlacklistButtonView(discord.ui.View):
@@ -1826,10 +1409,7 @@ class GuildDetailSelect(discord.ui.Select):
 
         all_data = load_data()
         cfg = get_guild_config(all_data, str(guild.id))
-        approval_status = cfg.get("approval_status", "pending")
-        approval_label = {"approved": "許可済み", "pending_review": "確認待ち", "pending": "未申請"}.get(approval_status, approval_status)
         settings = [
-            f"利用許可: {approval_label}",
             f"{'ON' if cfg.get('from_channel') else 'OFF'} メッセージ転送",
             f"{'ON' if cfg.get('verify_channel') else 'OFF'} サーバー認証",
             f"{'ON' if cfg.get('announce_channel') else 'OFF'} 配信お知らせ",
@@ -2977,38 +2557,6 @@ async def _smart_restore_from_backup(guild: discord.Guild, data: dict) -> tuple[
     return success_logs, fail_logs
 
 
-def find_approval_panel_channel(guild: discord.Guild):
-    channel = discord.utils.find(
-        lambda c: c.name == APPROVAL_PANEL_CHANNEL_NAME and isinstance(c, discord.TextChannel),
-        guild.text_channels
-    )
-    if channel:
-        return channel
-    for ch in guild.text_channels:
-        perms = ch.permissions_for(guild.me)
-        if perms.send_messages:
-            return ch
-    return None
-
-
-async def send_approval_panel(guild: discord.Guild):
-    channel = find_approval_panel_channel(guild)
-    if not channel:
-        print(f"[許可パネル] {guild.name} に送信可能なチャンネルが見つかりませんでした。")
-        return
-    embed = build_approval_request_embed(guild)
-    view = ApprovalRequestView(guild_id=guild.id)
-    try:
-        await channel.send(embed=embed, view=view)
-        print(f"[許可パネル] {guild.name} (#{channel.name}) に申請パネルを送信しました。")
-        all_data = load_data()
-        cfg = get_guild_config(all_data, str(guild.id))
-        cfg["approval_panel_channel_id"] = channel.id
-        save_data(all_data)
-    except discord.Forbidden:
-        print(f"[許可パネルエラー] {guild.name} で送信権限がありません。")
-    except Exception as e:
-        print(f"[許可パネルエラー] {guild.name} で予期しないエラー: {e}")
 
 
 # ====================================================================
@@ -3386,7 +2934,6 @@ async def on_ready():
         guild = bot.get_guild(guild_id_int)
         guild_name = guild.name if guild else "不明なサーバー"
         print(f"サーバー: {guild_name} (ID: {guild_id_str})")
-        print(f"  > 承認状態: {config.get('approval_status', 'pending')}")
         print(f"  > Message転送: {'有効' if config.get('from_channel') else '未設定'}")
         print(f"  > サーバー認証: {'有効' if config.get('verify_channel') else '未設定'}")
         print(f"  > 配信お知らせ: {'有効' if config.get('announce_channel') else '未設定'}")
@@ -3448,19 +2995,6 @@ async def on_ready():
 async def on_guild_join(guild: discord.Guild):
     print(f"[サーバー参加] {guild.name} (ID: {guild.id}) に導入されました。")
     await update_bot_status(bot)
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(guild.id))
-
-    # すでに承認済みのサーバーはステータスを保持し、申請パネルも再送しない
-    if cfg.get("approval_status") == "approved":
-        print(f"[サーバー参加] {guild.name} はすでに承認済みのためステータスを保持します。")
-        save_data(all_data)
-        return
-
-    # 新規サーバーまたは未承認サーバーのみ pending に設定して申請パネルを送る
-    cfg["approval_status"] = "pending"
-    save_data(all_data)
-    await send_approval_panel(guild)
 
 
 @bot.event
@@ -3902,10 +3436,7 @@ async def on_message(message: discord.Message):
             if await _run_automod_checks(message, guild_config):
                 return
 
-        # 承認済みサーバーでない場合は !コマンド処理のみ
-        if guild_config.get("approval_status") != "approved":
-            await bot.process_commands(message)
-            return
+
 
         # 3. メッセージ自動転送処理
         from_id = guild_config.get("from_channel")
@@ -4850,9 +4381,7 @@ async def server_status(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{g.name} - 設定状況", description="このサーバーで有効化されている設定一覧です。", color=discord.Color.blue())
     if g.icon:
         embed.set_thumbnail(url=g.icon.url)
-    approval_status = cfg.get("approval_status", "pending")
-    approval_label = {"approved": "許可済み", "pending_review": "所有者確認待ち", "pending": "未申請"}.get(approval_status, approval_status)
-    embed.add_field(name="BOT利用許可状態", value=approval_label, inline=False)
+
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
     to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
     forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
@@ -12471,22 +12000,7 @@ async def _guild_dashboard_toggle_handler(request):
     return _dashboard_redirect_with_token(token, f"「{label}」を {new_state} にしました。")
 
 
-# ====================================================================
-# セクション 17: サーバー掲示板（グローバル・複数サーバー間の宣伝掲示板）
-# ====================================================================
-# DISBOARD/ディス速のように、このBotを導入している全サーバーが互いに
-# 宣伝し合うための機能です。
-#   ・一覧ページ（Web） /board                … 誰でも閲覧可。メンバー数の多い順に表示
-#   ・ログイン         /board/login           … Discordログインを開始（サーバー登録用）
-#   ・OAuth2コールバック /board/oauth_callback … ログイン後、管理サーバー選択ページへ
-#   ・サーバー選択      /board/servers?session=... … 自分が管理者権限を持つ、Bot導入済みサーバー一覧
-#   ・管理ページ（Web） /board/manage          … サーバー管理者のみ（本人専用リンク／セッション両対応）
-#   ・/board_manage スラッシュコマンド         … 管理ページへの本人専用リンクをDiscord上で発行（従来通り）
-#   ・/bump スラッシュコマンド                 … 誰でも実行可。1時間に1回、サーバーを最新（上位）に上げる
-# bump後1時間経過すると、実行者にDiscord DMで再bump可能になった旨を通知します。
-# --------------------------------------------------------------------
 
-def _collect_board_ranking(board_data: dict) -> list[dict]:
     """
     掲示板登録済みの全サーバーを、現在のメンバー数が多い順に並べたリストを作成します。
     Botが既に退出しているサーバーはランキングから除外します。
