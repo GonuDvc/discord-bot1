@@ -214,6 +214,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("interview_records", {}),           # {record_id_str: {...}}
         ("interview_panel_channel_id", None),  # 設置済み面接パネルのチャンネルID
         ("interview_panel_message_id", None),  # 設置済み面接パネルのメッセージID
+        ("interview_pass_message", None),      # 合格時に応募者へ追加送信するメッセージ（URL等も可）
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -2791,18 +2792,6 @@ async def on_ready():
     bot.add_view(InterviewPanelView())  # 面接パネル（面接を受けるボタン）の永続化
     all_data = load_data()
 
-    for guild_id_str, config in all_data.items():
-        if guild_id_str in ("user_apps", "global_config"):
-            continue
-        if not isinstance(config, dict):
-            continue
-        try:
-            bot.add_view(ApprovalRequestView(guild_id=int(guild_id_str)))
-            panel_ch_id = config.get("approval_panel_channel_id") or 0
-            bot.add_view(ApprovalDecisionView(guild_id=int(guild_id_str), panel_channel_id=panel_ch_id))
-        except Exception:
-            pass
-
     resolved_owner_id = await resolve_owner_id(bot)
     if resolved_owner_id is not None:
         print(f"[システム] オーナーIDを確定しました: {resolved_owner_id}")
@@ -2953,7 +2942,7 @@ async def on_ready():
         ]
         if guild and any(stats_ch_ids):
             _stats_tasks[guild_id_int] = asyncio.create_task(_stats_loop(guild))
-            print(f"  > 統計ループ: 再起動しました")
+            print("  > 統計ループ: 再起動しました")
 
         # 進行中プレゼントのタスクを再起動
         giveaways = config.get("giveaways", {})
@@ -4057,6 +4046,41 @@ async def sync_command_error(ctx, error):
 # セクション 8: スラッシュコマンド
 # ====================================================================
 
+class HelpQuickActionSelect(discord.ui.Select):
+    """/help から、あなたの権限で使える一部のコマンドを直接実行できるセレクトメニュー。
+    引数の要らない（または全て省略可能な）コマンドのみが選択肢として並びます。"""
+
+    def __init__(self, actions: list):
+        # actions: [(value, label, description, callback_func), ...]
+        options = [
+            discord.SelectOption(label=label[:100], description=desc[:100], value=value)
+            for value, label, desc, _ in actions[:25]
+        ]
+        super().__init__(placeholder="実行したいコマンドを選択...", options=options, min_values=1, max_values=1)
+        self._actions = {value: func for value, label, desc, func in actions}
+
+    async def callback(self, interaction: discord.Interaction):
+        func = self._actions.get(self.values[0])
+        if func is None:
+            await interaction.response.send_message("そのコマンドは実行できませんでした。", ephemeral=True)
+            return
+        try:
+            await func(interaction)
+        except Exception as e:
+            print(f"[help選択実行エラー] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("コマンドの実行中にエラーが発生しました。", ephemeral=True)
+
+
+class HelpQuickActionView(discord.ui.View):
+    """helpの選択式コマンド実行メニュー用View。実行できるコマンドが1つも無い場合は何も表示しない。"""
+
+    def __init__(self, actions: list):
+        super().__init__(timeout=180)
+        if actions:
+            self.add_item(HelpQuickActionSelect(actions))
+
+
 @bot.tree.command(name="help", description="利用可能なコマンド一覧をカテゴリ別に表示します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
@@ -4132,7 +4156,8 @@ async def help_command(interaction: discord.Interaction):
                 "`/ban` : ユーザーをサーバーからBANします\n"
                 "`/mute` : ユーザーをタイムアウト（ミュート）します\n"
                 "`/purge` : 指定件数のメッセージを一括削除します\n"
-                "`/slowmode` : チャンネルの低速モードを設定します"
+                "`/slowmode` : チャンネルの低速モードを設定します\n"
+                "`/role_permission_add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
             ),
             inline=False
         )
@@ -4156,7 +4181,8 @@ async def help_command(interaction: discord.Interaction):
                 "`/ticket close` : 現在のチケットチャンネルをクローズします\n"
                 "`/interview setup` : 面接システムの実施方式・結果通知先などを設定します\n"
                 "`/interview panel` : このチャンネルに「面接を受ける」ボタン付きパネルを設置します\n"
-                "`/interview question add` / `remove` / `list` : 面接の質問リストを管理します"
+                "`/interview question add` / `remove` / `list` : 面接の質問リストを管理します\n"
+                "`/interview pass_message` : 合格時に追加送信するメッセージ（招待URL等）を設定します"
             ),
             inline=False
         )
@@ -4204,8 +4230,35 @@ async def help_command(interaction: discord.Interaction):
             ),
             inline=False
         )
-    embed.set_footer(text="セキュリティのため、このヘルプは実行したあなたにのみ見えています。")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed.set_footer(text="セキュリティのため、このヘルプは実行したあなたにのみ見えています。下のメニューから一部のコマンドを直接実行できます。")
+
+    # --- 選択式クイック実行メニュー ---
+    # 引数が不要（または全て省略可能）な代表的なコマンドのみを、権限に応じて表示する。
+    general_actions = [
+        ("my_scan", "🔍 情報を見る (/my_scan)", "サーバー情報を表示します", my_scan.callback),
+        ("balance", "💰 残高確認 (/balance)", "自分のMコイン残高を確認します", balance.callback),
+        ("board", "📋 掲示板を見る (/board)", "サーバー掲示板ページのURLを表示します", board_command.callback),
+        ("bump", "⬆️ bumpする (/bump)", "サーバー掲示板の上位に上げます", bump_command.callback),
+        ("work", "💼 働く (/work)", "働いてMコインを稼ぎます", work.callback),
+    ]
+    admin_actions = [
+        ("server_status", "⚙️ サーバー設定確認 (/server_status)", "各種機能の設定状況を確認します", server_status.callback),
+        ("server_list_users", "👥 許可ユーザー管理 (/server_list_users)", "コマンド使用許可リストを確認・編集します", server_list_users.callback),
+        ("role_permission_list", "🔐 権限一覧 (/role_permission_list)", "管理コマンドの許可ロール/ユーザー一覧を見ます", role_permission_list.callback),
+        ("antinuke_status", "🛡️ antinuke状況 (/antinuke_status)", "antinukeの設定状況を確認します", antinuke_status.callback),
+        ("dashboard", "📊 管理ダッシュボード (/dashboard)", "サーバーの統計・設定をまとめて確認します", dashboard_command.callback),
+    ]
+    owner_actions = [
+        ("owner_guilds", "🌐 導入サーバー一覧 (/owner_guilds)", "Bot導入中のサーバー一覧を表示します", owner_guilds.callback),
+    ]
+
+    quick_actions = list(general_actions)
+    if is_admin or is_allowed or is_owner:
+        quick_actions += admin_actions
+    if is_owner:
+        quick_actions += owner_actions
+
+    await interaction.response.send_message(embed=embed, view=HelpQuickActionView(quick_actions), ephemeral=True)
 
 
 @bot.tree.command(name="my_scan", description="サーバー情報、または指定ユーザーの基本情報を確認します")
@@ -9441,7 +9494,7 @@ async def sbl_setup(
 
         result_embed = discord.Embed(
             title="ウェブ認証: パネル設置モードに設定しました",
-            description=f"このチャンネルに認証パネルを設置しました。\nメンバーはボタンを押して認証を行います。",
+            description="このチャンネルに認証パネルを設置しました。\nメンバーはボタンを押して認証を行います。",
             color=discord.Color.green()
         )
         result_embed.add_field(name="設定", value=role_text, inline=False)
@@ -12000,7 +12053,70 @@ async def _guild_dashboard_toggle_handler(request):
     return _dashboard_redirect_with_token(token, f"「{label}」を {new_state} にしました。")
 
 
+# --------------------------------------------------------------------
+# サーバー掲示板：データ永続化・URL/トークン生成ヘルパー
+# （/board, /board_manage, /bump および Webの各ハンドラから参照される）
+# --------------------------------------------------------------------
 
+SERVER_BOARD_BUMP_COOLDOWN_SECONDS = 3600  # bumpの再実行までのクールダウン（秒）= 1時間
+BOARD_MANAGE_TOKEN_TTL = 1800   # /board_manage の本人専用リンクの有効期限（秒）= 30分
+BOARD_SESSION_TOKEN_TTL = 1800  # 掲示板Webログインのセッション有効期限（秒）= 30分
+
+if os.path.exists("/app/data"):
+    SERVER_BOARD_FILE = "/app/data/server_board.json"
+else:
+    SERVER_BOARD_FILE = "server_board.json"
+
+
+def load_server_board_data() -> dict:
+    """サーバー掲示板の登録データ（server_board.json）を読み込みます。"""
+    if os.path.exists(SERVER_BOARD_FILE):
+        try:
+            with open(SERVER_BOARD_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    return {"entries": {}}
+                data.setdefault("entries", {})
+                return data
+        except Exception as e:
+            print(f"[サーバー掲示板] データ読み込みエラー: {e}")
+            return {"entries": {}}
+    return {"entries": {}}
+
+
+def save_server_board_data(data: dict):
+    """サーバー掲示板の登録データをserver_board.jsonへ保存します。"""
+    try:
+        dir_name = os.path.dirname(SERVER_BOARD_FILE)
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
+        with open(SERVER_BOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"[サーバー掲示板] データ保存エラー: {e}")
+
+
+def get_board_entry(board_data: dict, guild_id_str: str):
+    """指定サーバーの掲示板登録情報を取得します（未登録の場合は None）。"""
+    return board_data.get("entries", {}).get(guild_id_str)
+
+
+def ensure_board_entry(board_data: dict, guild_id_str: str) -> dict:
+    """指定サーバーの掲示板登録情報を取得し、無ければ既定値で新規作成します。"""
+    entries = board_data.setdefault("entries", {})
+    if guild_id_str not in entries:
+        entries[guild_id_str] = {
+            "description": "",
+            "tags": [],
+            "invite_url": "",
+            "last_bumped_at": 0,
+            "bump_count": 0,
+            "bumped_by": None,
+        }
+    return entries[guild_id_str]
+
+
+def _collect_board_ranking(board_data: dict) -> list:
     """
     掲示板登録済みの全サーバーを、現在のメンバー数が多い順に並べたリストを作成します。
     Botが既に退出しているサーバーはランキングから除外します。
@@ -12032,6 +12148,120 @@ async def _guild_dashboard_toggle_handler(request):
         })
     ranking.sort(key=lambda item: item["member_count"], reverse=True)
     return ranking
+
+
+def _board_oauth_redirect_uri() -> str:
+    """掲示板ログイン専用のOAuth2コールバックURI（/board/oauth_callback）を組み立てます。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/board/oauth_callback"
+
+
+def _build_board_url() -> str:
+    """サーバー掲示板の一覧ページ（/board）のURLを生成します。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/board"
+
+
+def _generate_board_login_state() -> str:
+    """掲示板ログイン開始時のCSRF対策用stateトークンを生成します。"""
+    import hmac
+    import hashlib
+    nonce = secrets.token_urlsafe(16)
+    signature = hmac.new(OAUTH_SECRET_KEY.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{nonce}:{signature}".encode()).decode()
+
+
+def _verify_board_login_state(state: str) -> bool:
+    """_generate_board_login_state で発行したstateトークンを検証します。"""
+    import hmac
+    import hashlib
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode()).decode()
+        nonce, signature = decoded.split(":")
+        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected_signature)
+    except Exception:
+        return False
+
+
+def _build_board_login_url() -> str:
+    """掲示板ページの「サーバーを登録する」から遷移する、Discord OAuth2認証URLを生成します。"""
+    state = _generate_board_login_state()
+    params = urllib.parse.urlencode({
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": _board_oauth_redirect_uri(),
+        "response_type": "code",
+        "scope": "identify",
+        "state": state,
+    })
+    return f"https://discord.com/oauth2/authorize?{params}"
+
+
+def _generate_board_session_token(user_id: int) -> str:
+    """掲示板Webログイン後の、有効期限付きセッショントークンを生成します。"""
+    import hmac
+    import hashlib
+    expiry = int(time.time()) + BOARD_SESSION_TOKEN_TTL
+    payload = f"{user_id}:{expiry}"
+    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _verify_board_session_token(session_token: str):
+    """_generate_board_session_token で発行したセッショントークンを検証し、有効ならuser_idを返します。"""
+    import hmac
+    import hashlib
+    try:
+        decoded = base64.urlsafe_b64decode(session_token.encode()).decode()
+        user_id_str, expiry_str, signature = decoded.split(":")
+        payload = f"{user_id_str}:{expiry_str}"
+        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return int(user_id_str)
+    except Exception:
+        return None
+
+
+def _generate_board_manage_token(guild_id: int, user_id: int) -> str:
+    """/board_manage コマンドが発行する、本人専用の掲示板管理リンク用トークンを生成します。"""
+    import hmac
+    import hashlib
+    expiry = int(time.time()) + BOARD_MANAGE_TOKEN_TTL
+    payload = f"{guild_id}:{user_id}:{expiry}"
+    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _verify_board_manage_token(token: str):
+    """_generate_board_manage_token で発行したトークンを検証し、有効なら (guild_id, user_id) を返します。"""
+    import hmac
+    import hashlib
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        guild_id_str, user_id_str, expiry_str, signature = decoded.split(":")
+        payload = f"{guild_id_str}:{user_id_str}:{expiry_str}"
+        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return int(guild_id_str), int(user_id_str)
+    except Exception:
+        return None
+
+
+def _build_board_manage_url(guild_id: int, user_id: int) -> str:
+    """/board_manage コマンド用の、本人専用掲示板管理ページURLを生成します。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    token = _generate_board_manage_token(guild_id, user_id)
+    query = urllib.parse.urlencode({"token": token})
+    return f"{base}/board/manage?{query}"
 
 
 async def _board_bump_reminder_task(user_id: int, guild_id: int, guild_name: str):
@@ -13073,6 +13303,17 @@ async def _handle_interview_decision(interaction: discord.Interaction, action: s
         except discord.HTTPException:
             pass
 
+        # 合格時のみ：管理者が設定した任意のメッセージ・URL（招待リンク等）を追加送信
+        if action == "pass":
+            pass_message = cfg.get("interview_pass_message")
+            if pass_message:
+                try:
+                    await applicant.send(pass_message)
+                except discord.Forbidden:
+                    pass
+                except discord.HTTPException:
+                    pass
+
 
 @interview_group.command(name="setup", description="【管理者専用】面接システムの実施方式・結果通知先などを設定します")
 @discord.app_commands.describe(
@@ -13110,10 +13351,38 @@ async def interview_setup(
         f"有効: {'はい' if 有効化 else 'いいえ'} / 方式: {実施方式.name} / "
         f"結果通知先: {結果通知先チャンネル.mention}\n"
         f"質問への回答は埋め込みフォーム（Modal）形式です。\n"
-        f"質問がまだの場合は `/interview question add` で登録してください。",
+        f"質問がまだの場合は `/interview question add` で登録してください。\n"
+        f"合格時に招待URL等を自動送信したい場合は `/interview pass_message` で設定してください。",
         ephemeral=True
     )
 
+
+
+@interview_group.command(name="pass_message", description="【管理者専用】面接合格時に応募者へ追加送信するメッセージ（招待URL等）を設定します")
+@discord.app_commands.describe(
+    メッセージ="合格時に追加でDM送信するメッセージ。招待URLなども入力できます。空欄のまま実行するとクリア（送信なし）になります"
+)
+async def interview_pass_message(interaction: discord.Interaction, メッセージ: str = None):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["interview_pass_message"] = メッセージ if メッセージ else None
+    save_data(all_data)
+
+    if メッセージ:
+        await interaction.response.send_message(
+            f"[OK] 面接合格時に以下のメッセージを追加送信するよう設定しました。\n\n> {メッセージ}",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "[OK] 合格時の追加送信メッセージをクリアしました（今後は結果通知のみ送信されます）。",
+            ephemeral=True
+        )
 
 
 @interview_question_group.command(name="add", description="【管理者専用】面接の質問を末尾に追加します")
@@ -13259,10 +13528,10 @@ async def interview_panel(interaction: discord.Interaction, タイトル: str = 
 
 class InterviewAnswerModal(discord.ui.Modal):
     """1問分の回答を入力するModal（埋め込みフォーム）。
-    送信すると回答を記録し、次の質問があれば続けて質問embed+ボタンを表示、
-    無ければ集計処理へ進む。"""
+    送信すると回答を「仮登録」し、内容を確認した上で確定 or やり直しを選べる
+    確認画面（InterviewConfirmView）を表示する。"""
 
-    def __init__(self, guild_id: int, record_id: int, question_index: int, question_text: str):
+    def __init__(self, guild_id: int, record_id: int, question_index: int, question_text: str, default_answer: str = None):
         super().__init__(title=f"質問 {question_index + 1}"[:45])
         self.guild_id = guild_id
         self.record_id = record_id
@@ -13273,7 +13542,8 @@ class InterviewAnswerModal(discord.ui.Modal):
             style=discord.TextStyle.paragraph,
             required=True,
             max_length=1000,
-            placeholder="ここに回答を入力してください"
+            placeholder="ここに回答を入力してください",
+            default=default_answer[:1000] if default_answer else None
         )
         self.add_item(self.answer_input)
 
@@ -13286,7 +13556,8 @@ class InterviewAnswerModal(discord.ui.Modal):
 
 class InterviewAnswerButton(discord.ui.Button):
     """質問embedに添える「回答する」ボタン。押すとModalが開く。
-    custom_idにguild_id/record_id/question_indexを埋め込むため、Bot再起動後も対象を特定できる。"""
+    custom_idにguild_id/record_id/question_indexを埋め込むため、Bot再起動後も対象を特定できる。
+    すでに仮登録済みの回答がある場合は、その内容を初期値としてModalに表示する。"""
 
     def __init__(self, guild_id: int, record_id: int, question_index: int):
         super().__init__(
@@ -13319,8 +13590,53 @@ class InterviewAnswerButton(discord.ui.Button):
             return
 
         question_text = questions[self.question_index]
-        modal = InterviewAnswerModal(self.guild_id, self.record_id, self.question_index, question_text)
+        pending = record.get("pending_answer") or {}
+        default_answer = pending.get("answer") if pending.get("question_index") == self.question_index else None
+        modal = InterviewAnswerModal(self.guild_id, self.record_id, self.question_index, question_text, default_answer)
         await interaction.response.send_modal(modal)
+
+
+class InterviewConfirmProceedButton(discord.ui.Button):
+    """回答確認画面の「この内容で確定する」ボタン。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int):
+        super().__init__(
+            label="この内容で確定する",
+            style=discord.ButtonStyle.success,
+            custom_id=f"interview_confirm_{guild_id}_{record_id}_{question_index}"
+        )
+        self.guild_id = guild_id
+        self.record_id = record_id
+        self.question_index = question_index
+
+    async def callback(self, interaction: discord.Interaction):
+        await _handle_interview_answer_confirm(interaction, self.guild_id, self.record_id, self.question_index)
+
+
+class InterviewRedoButton(discord.ui.Button):
+    """回答確認画面の「回答をやり直す」ボタン。入力し直すためのModalを再度開く。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int):
+        super().__init__(
+            label="回答をやり直す",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"interview_redo_{guild_id}_{record_id}_{question_index}"
+        )
+        self.guild_id = guild_id
+        self.record_id = record_id
+        self.question_index = question_index
+
+    async def callback(self, interaction: discord.Interaction):
+        await _handle_interview_answer_redo(interaction, self.guild_id, self.record_id, self.question_index)
+
+
+class InterviewConfirmView(discord.ui.View):
+    """回答内容を確認し、「確定する」か「やり直す」かを選ぶView。timeout=Noneで永続化。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int):
+        super().__init__(timeout=None)
+        self.add_item(InterviewConfirmProceedButton(guild_id, record_id, question_index))
+        self.add_item(InterviewRedoButton(guild_id, record_id, question_index))
 
 
 class InterviewQuestionView(discord.ui.View):
@@ -13352,7 +13668,9 @@ async def _handle_interview_answer_submit(
     interaction: discord.Interaction, guild_id: int, record_id: int,
     question_index: int, question_text: str, answer_text: str
 ):
-    """Modal送信時のコールバック本体。回答を記録し、次の質問へ進むか結果送信を行う。"""
+    """Modal送信時のコールバック本体。回答をいったん「仮登録」し、
+    内容を確認した上で確定 or やり直しを選べる確認画面を表示する。
+    （この時点ではまだ次の質問へは進まない）"""
     guild = bot.get_guild(guild_id)
     if guild is None:
         await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
@@ -13369,8 +13687,83 @@ async def _handle_interview_answer_submit(
         await interaction.response.send_message("この質問は既に回答済みです。", ephemeral=True)
         return
 
+    record["pending_answer"] = {
+        "question_index": question_index,
+        "question": question_text,
+        "answer": answer_text or "(空の回答)",
+    }
+    save_data(all_data)
+
+    confirm_embed = discord.Embed(
+        title="回答内容の確認",
+        description="以下の内容で回答します。よろしければ「この内容で確定する」を、\n入力し直す場合は「回答をやり直す」を押してください。",
+        color=discord.Color.orange()
+    )
+    confirm_embed.add_field(name=f"Q{question_index + 1}. {question_text[:256]}", value=(answer_text or "(空の回答)")[:1024], inline=False)
+
+    await interaction.response.send_message(
+        embed=confirm_embed,
+        view=InterviewConfirmView(guild_id, record_id, question_index),
+        ephemeral=True
+    )
+
+
+async def _handle_interview_answer_redo(interaction: discord.Interaction, guild_id: int, record_id: int, question_index: int):
+    """「回答をやり直す」ボタンのコールバック本体。前回入力した内容を初期値としてModalを再度開く。"""
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    records = cfg.setdefault("interview_records", {})
+    record = records.get(str(record_id))
+    if record is None or record.get("status") != "in_progress":
+        await interaction.response.send_message("この面接は既に終了・中断されています。", ephemeral=True)
+        return
+    if record.get("current_question_index", 0) != question_index:
+        await interaction.response.send_message("この質問は既に回答済みです。", ephemeral=True)
+        return
+
+    questions = cfg.get("interview_questions", [])
+    if question_index >= len(questions):
+        await interaction.response.send_message("質問データが見つかりませんでした。", ephemeral=True)
+        return
+
+    question_text = questions[question_index]
+    pending = record.get("pending_answer") or {}
+    default_answer = pending.get("answer") if pending.get("question_index") == question_index else None
+
+    modal = InterviewAnswerModal(guild_id, record_id, question_index, question_text, default_answer)
+    await interaction.response.send_modal(modal)
+
+
+async def _handle_interview_answer_confirm(interaction: discord.Interaction, guild_id: int, record_id: int, question_index: int):
+    """「この内容で確定する」ボタンのコールバック本体。仮登録された回答を確定し、
+    次の質問へ進むか、全問終了していれば集計して結果チャンネルへ送信する。"""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    records = cfg.setdefault("interview_records", {})
+    record = records.get(str(record_id))
+    if record is None or record.get("status") != "in_progress":
+        await interaction.response.send_message("この面接は既に終了・中断されています。", ephemeral=True)
+        return
+    if record.get("current_question_index", 0) != question_index:
+        await interaction.response.send_message("この質問は既に回答済みです。", ephemeral=True)
+        return
+
+    pending = record.get("pending_answer") or {}
+    if pending.get("question_index") != question_index:
+        await interaction.response.send_message("回答データが見つかりませんでした。もう一度「回答する」からやり直してください。", ephemeral=True)
+        return
+
+    question_text = pending.get("question", "")
+    answer_text = pending.get("answer", "(空の回答)")
+
     answers = record.setdefault("answers", [])
-    answers.append({"question": question_text, "answer": answer_text or "(空の回答)"})
+    answers.append({"question": question_text, "answer": answer_text})
+    record.pop("pending_answer", None)
 
     questions = cfg.get("interview_questions", [])
     next_index = question_index + 1
@@ -13380,7 +13773,10 @@ async def _handle_interview_answer_submit(
         record["current_question_index"] = next_index
         save_data(all_data)
 
-        await interaction.response.send_message("[OK] 回答を受け付けました。次の質問を表示します。", ephemeral=True)
+        try:
+            await interaction.response.edit_message(content="[OK] 回答を確定しました。次の質問を表示します。", embed=None, view=None)
+        except discord.HTTPException:
+            pass
 
         next_question_text = questions[next_index]
         target = interaction.channel if record.get("interview_channel_id") else interaction.user
@@ -13394,9 +13790,13 @@ async def _handle_interview_answer_submit(
     record["status"] = "pending_review"
     save_data(all_data)
 
-    await interaction.response.send_message(
-        "[OK] 全ての質問への回答が完了しました。ご協力ありがとうございました。結果は追ってお知らせします。", ephemeral=True
-    )
+    try:
+        await interaction.response.edit_message(
+            content="[OK] 全ての質問への回答が完了しました。ご協力ありがとうございました。結果は追ってお知らせします。",
+            embed=None, view=None
+        )
+    except discord.HTTPException:
+        pass
 
     result_channel_id = cfg.get("interview_result_channel_id")
     result_channel = guild.get_channel(result_channel_id) if result_channel_id else None
