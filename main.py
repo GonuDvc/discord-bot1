@@ -4463,7 +4463,7 @@ async def apology(interaction: discord.Interaction):
     reply_to_message_id="このメッセージID宛に返信（リプライ）形式で送信したい場合に指定します（省略時は通常送信）"
 )
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def say(interaction: discord.Interaction, message: str, reply_to_message_id: str = None):
     # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
     owner_id = await resolve_owner_id(interaction.client)
