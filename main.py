@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import math
+import random
 import asyncio
 import urllib.request
 import urllib.parse
@@ -38,6 +39,99 @@ except ImportError:
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
+
+# --------------------------------------------------------------------
+# ひろゆき構文ランダム返信機能で使用するセリフ一覧
+# --------------------------------------------------------------------
+HIROYUKI_PHRASES = [
+    "それってあなたの感想ですよね？",
+    "なんかそういうデータあるんですか？",
+    "嘘つくのやめてもらっていいですか？",
+    "はいか、いいえで答えてください。",
+    "なんだろう。",
+    "と、僕は思います。はい。",
+    "無理です。",
+    "いいえ。",
+    "優秀っすね。",
+    "はい、すいません。",
+    "ばーか。",
+    "嘘は嘘であると、見抜ける人でないと難しい。",
+    "いや、別にいいんですけど。",
+    "そうなんですね。",
+    "なるほど。",
+    "なんでそう思ったんですか？",
+    "それ、根拠あります？",
+    "証拠はありますか？",
+    "論理的に考えると…",
+    "前提が違います。",
+    "話がずれてますよ。",
+    "質問に答えてもらっていいですか？",
+    "結論から言うと…",
+    "それは違うと思います。",
+    "可能性はありますね。",
+    "僕だったらやらないですね。",
+    "コスパが悪いですね。",
+    "別に好きにすればいいんじゃないですか。",
+    "損するだけですよ。",
+    "効率が悪いですよね。",
+    "その情報、どこからですか？",
+    "僕の知る限りでは…",
+    "そういう人もいます。",
+    "普通に考えれば…",
+    "結局、お金の問題ですよね。",
+    "リスクのほうが大きいと思います。",
+    "その前提なら、そうですね。",
+    "その場合は別です。",
+    "人それぞれじゃないですか。",
+    "感情論ですよね。",
+    "データで判断したほうがいいです。",
+    "僕はそう思わないです。",
+    "そういうことではないです。",
+    "その話、関係あります？",
+    "前提を確認したいんですけど。",
+    "質問に質問で返すようで申し訳ないんですが。",
+    "仮にそうだとして。",
+    "じゃあ逆に聞くんですけど。",
+    "例えばですよ？",
+    "そのケースだと。",
+    "それは例外ですね。",
+    "一般論としては。",
+    "僕の理解だと。",
+    "そこは勘違いしてます。",
+    "話を整理すると。",
+    "矛盾してませんか？",
+    "因果関係と相関関係は違いますよ。",
+    "証明できますか？",
+    "誰が言ってるんですか？",
+    "ソースはありますか？",
+    "その情報、信頼できます？",
+    "確率の話ですよ。",
+    "僕ならそうしないです。",
+    "別に困らないですよね。",
+    "好きにすればいいと思います。",
+    "それを選ぶ理由がないです。",
+    "メリットが少ないです。",
+    "デメリットのほうが大きいです。",
+    "その人が幸せならいいんじゃないですか。",
+    "別に止めませんけど。",
+    "それは自由です。",
+    "そういう考え方もありますね。",
+    "それで何が変わるんですか？",
+    "それって事実ですか？それとも推測ですか？",
+    "僕はそういう情報を見たことがないです。",
+    "それを証明できるなら話は別です。",
+    "その話をすると長くなるんですけど。",
+    "結果がすべてだと思います。",
+    "うん。",
+    "はい。",
+    "えっと。",
+    "あー。",
+    "なるほどね。",
+    "そうそう。",
+    "ですよね。",
+    "まぁ。",
+    "別に。",
+]
 ROBLOX_API_KEY = os.getenv("ROBLOX_API_KEY")
 ROBLOX_UNIVERSE_ID = os.getenv("ROBLOX_UNIVERSE_ID")
 
@@ -215,6 +309,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("interview_panel_channel_id", None),  # 設置済み面接パネルのチャンネルID
         ("interview_panel_message_id", None),  # 設置済み面接パネルのメッセージID
         ("interview_pass_message", None),      # 合格時に応募者へ追加送信するメッセージ（URL等も可）
+        # --- ひろゆき構文ランダム返信 ---
+        ("hiroyuki_channel_id", None),        # 対象チャンネルID（このチャンネルの発言に反応）
+        ("hiroyuki_chance_percent", 15),       # メッセージごとに発言する確率（%）
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -3502,6 +3599,20 @@ async def on_message(message: discord.Message):
         # 5. カスタムトリガー自動返信処理
         await _run_custom_triggers(message, guild_config)
 
+        # 5.5 ひろゆき構文ランダム返信
+        hiroyuki_ch_id = guild_config.get("hiroyuki_channel_id")
+        if hiroyuki_ch_id and message.channel.id == hiroyuki_ch_id:
+            chance = guild_config.get("hiroyuki_chance_percent", 15)
+            if random.randint(1, 100) <= chance:
+                phrase = random.choice(HIROYUKI_PHRASES)
+                try:
+                    await message.reply(phrase, mention_author=False)
+                except discord.Forbidden:
+                    try:
+                        await message.channel.send(phrase)
+                    except Exception:
+                        pass
+
         # 6. 経済システム: メッセージ送信報酬（グローバルMコイン・クールダウン付き）
         if guild_config.get("economy_enabled", False):
             _grant_message_reward(all_data, guild_config, message)
@@ -4968,6 +5079,50 @@ async def server_mention_reset(interaction: discord.Interaction):
         cfg["mention_custom_message"] = None
         save_data(all_data)
         await interaction.followup.send("自動返信ロールメンションの設定を解除しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="server_hiroyuki_setup", description="【管理者専用】指定チャンネルでひろゆき構文がランダムに返信されるようにします")
+@app_commands.describe(
+    channel="ひろゆき構文の対象にするチャンネル",
+    chance_percent="メッセージが送られるたびに返信する確率（%）。1〜100で指定（デフォルト15）"
+)
+async def server_hiroyuki_setup(interaction: discord.Interaction, channel: discord.TextChannel, chance_percent: int = 15):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    if not (1 <= chance_percent <= 100):
+        await interaction.response.send_message("確率は1〜100の範囲で指定してください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        cfg["hiroyuki_channel_id"] = channel.id
+        cfg["hiroyuki_chance_percent"] = chance_percent
+        save_data(all_data)
+        await interaction.followup.send(
+            "ひろゆき構文ランダム返信を設定しました。\n"
+            f"・対象チャンネル: {channel.mention}\n"
+            f"・返信確率: {chance_percent}%（メッセージが送られるたびに判定）\n"
+            f"・登録セリフ数: {len(HIROYUKI_PHRASES)}種類",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="server_hiroyuki_reset", description="【管理者専用】ひろゆき構文ランダム返信の設定を解除（OFF）します")
+async def server_hiroyuki_reset(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        cfg["hiroyuki_channel_id"] = None
+        save_data(all_data)
+        await interaction.followup.send("ひろゆき構文ランダム返信をOFFにしました。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
 
