@@ -4659,6 +4659,141 @@ async def server_create_channel(interaction: discord.Interaction, name: str, cat
         await interaction.followup.send(f"作成失敗: {e}", ephemeral=True)
 
 
+@bot.tree.command(name="server_role_bulk_create", description="【管理者専用】複数のロールをカンマ区切りで一気に作成します")
+@app_commands.describe(
+    role_names="作成したいロール名をカンマ（,）区切りで入力してください（例: 初心者,中級者,上級者）",
+    color="作成する全ロールに適用する色（16進数カラーコード、例: ff0000）。省略時はデフォルト色",
+    hoist="メンバーリストでロールごとに表示を分ける（デフォルト: しない）",
+    mentionable="このロールを誰でもメンションできるようにする（デフォルト: しない）"
+)
+async def server_role_bulk_create(
+    interaction: discord.Interaction,
+    role_names: str,
+    color: str = None,
+    hoist: bool = False,
+    mentionable: bool = False
+):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+
+    # カンマ区切りで分解し、空白除去・空文字除外
+    names = [n.strip() for n in role_names.split(",") if n.strip()]
+    if not names:
+        await interaction.response.send_message(
+            "作成するロール名が指定されていません。カンマ（,）区切りで1つ以上入力してください。", ephemeral=True
+        )
+        return
+    if len(names) > 20:
+        await interaction.response.send_message(
+            "一度に作成できるロールは20個までです。件数を減らして再度お試しください。", ephemeral=True
+        )
+        return
+
+    # 色の解析（未指定時はデフォルト色）
+    role_color = discord.Color.default()
+    if color:
+        color_str = color.strip().lstrip("#")
+        try:
+            role_color = discord.Color(int(color_str, 16))
+        except ValueError:
+            await interaction.response.send_message(
+                "カラーコードの形式が正しくありません。16進数（例: ff0000）で指定してください。", ephemeral=True
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    created = []
+    failed = []
+    for name in names:
+        try:
+            new_role = await interaction.guild.create_role(
+                name=name,
+                color=role_color,
+                hoist=hoist,
+                mentionable=mentionable,
+                reason=f"{interaction.user} によるロール一括作成"
+            )
+            created.append(new_role)
+        except discord.Forbidden:
+            failed.append((name, "Botの権限不足"))
+        except discord.HTTPException as e:
+            failed.append((name, str(e)))
+
+    embed = discord.Embed(
+        title="[ロール一括作成] 結果",
+        color=discord.Color.green() if created else discord.Color.red()
+    )
+    if created:
+        embed.add_field(
+            name=f"✅ 作成成功（{len(created)}件）",
+            value="\n".join(r.mention for r in created),
+            inline=False
+        )
+    if failed:
+        embed.add_field(
+            name=f"❌ 作成失敗（{len(failed)}件）",
+            value="\n".join(f"・{name}: {reason}" for name, reason in failed),
+            inline=False
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="server_disable_external_apps", description="【管理者専用】サーバー内すべてのロールの『外部アプリの使用』権限をOFFにします")
+async def server_disable_external_apps(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+
+    await interaction.response.defer(ephemeral=True)
+
+    updated = []
+    skipped = []
+    failed = []
+
+    for role in interaction.guild.roles:
+        if role.is_default():
+            continue
+        if not role.permissions.use_external_apps:
+            skipped.append(role)
+            continue
+        try:
+            new_permissions = role.permissions
+            new_permissions.update(use_external_apps=False)
+            await role.edit(
+                permissions=new_permissions,
+                reason=f"{interaction.user} により全ロールの外部アプリ使用権限をOFF"
+            )
+            updated.append(role)
+        except discord.Forbidden:
+            failed.append((role.name, "Botの権限不足（ロール階層を確認してください）"))
+        except discord.HTTPException as e:
+            failed.append((role.name, str(e)))
+
+    embed = discord.Embed(
+        title="[外部アプリ使用] 一括OFF処理結果",
+        description="サーバー内すべてのロールの『外部アプリの使用（use_external_apps）』権限を確認し、有効になっていたロールをOFFにしました。",
+        color=discord.Color.green() if not failed else discord.Color.orange()
+    )
+    embed.add_field(name="✅ OFFにしたロール", value=str(len(updated)) + "件", inline=True)
+    embed.add_field(name="➖ 元からOFFだったロール", value=str(len(skipped)) + "件", inline=True)
+    embed.add_field(name="❌ 失敗", value=str(len(failed)) + "件", inline=True)
+
+    if updated:
+        embed.add_field(
+            name="OFFにしたロール一覧",
+            value="\n".join(r.mention for r in updated)[:1024],
+            inline=False
+        )
+    if failed:
+        embed.add_field(
+            name="失敗したロール",
+            value="\n".join(f"・{name}: {reason}" for name, reason in failed)[:1024],
+            inline=False
+        )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="server_role_panel", description="指定したロール（最大5つ）を取得できるボタン付きパネルを送信します")
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
