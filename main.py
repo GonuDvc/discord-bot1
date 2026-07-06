@@ -4508,30 +4508,41 @@ async def say(interaction: discord.Interaction, message: str, reply_to_message_i
             return
 
     try:
-        if target_message:
-            await target_message.reply(message, mention_author=False)
-        else:
-            channel = interaction.channel
-            if channel is None:
-                # チャンネルがキャッシュされていない場合は明示的に取得を試みる
-                try:
-                    channel = await interaction.client.fetch_channel(interaction.channel_id)
-                except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-                    channel = None
-
-            if channel is not None:
-                await channel.send(message)
+        if interaction.guild:
+            # サーバー内: Botがチャンネルへの通常アクセス権を持っているため、
+            # 従来通りチャンネル送信・メッセージへのリプライを行う
+            if target_message:
+                await target_message.reply(message, mention_author=False)
             else:
-                # 通常のチャンネル取得・送信ができない場合（ユーザーインストール状態の
-                # グループDM等、Botがチャンネルへ直接アクセスできないコンテキスト）は
-                # インタラクションのレスポンスを使って直接発言する。
-                # これはインタラクショントークン経由のため、Botがそのチャンネルに
-                # 通常アクセスできない場合でも送信できる。
-                await interaction.response.send_message(message)
-                return
+                channel = interaction.channel
+                if channel is None:
+                    try:
+                        channel = await interaction.client.fetch_channel(interaction.channel_id)
+                    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                        channel = None
 
-        # 実発言に成功した場合のみ「送信しました」の確認をエフェメラルで返す
-        await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
+                if channel is not None:
+                    await channel.send(message)
+                else:
+                    await interaction.response.send_message(message)
+                    return
+
+            await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
+
+        else:
+            # DM・グループDM: ユーザーインストールされたBotはチャンネルへの
+            # 直接アクセス権限を持たないため、チャンネル送信やメッセージへの
+            # リプライ（reply）はできない。インタラクションの応答（Webhook経由）
+            # のみが送信手段となるため、常にこちらを使う。
+            # ※この方法では特定メッセージへの「返信」形式にはできないため、
+            #   reply_to_message_id が指定されていた場合は引用形式で代替する。
+            if target_message:
+                quoted = target_message.content or "(内容なし/添付ファイルのみ)"
+                quoted = quoted if len(quoted) <= 200 else quoted[:200] + "…"
+                content = f"> {quoted}\n{message}"
+            else:
+                content = message
+            await interaction.response.send_message(content)
 
     except discord.Forbidden:
         await interaction.response.send_message(
