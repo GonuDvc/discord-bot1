@@ -2060,8 +2060,15 @@ class ApologySendButton(discord.ui.Button):
             embed=None,
             view=view
         )
+        content = f"{interaction.user.mention}\n{final_text}"
         try:
-            await interaction.channel.send(f"{interaction.user.mention}\n{final_text}")
+            if interaction.guild:
+                # サーバー内: Botが通常のチャンネルアクセス権を持っている
+                await interaction.channel.send(content)
+            else:
+                # DM・グループDM: Botはチャンネルへの直接アクセス権限を持たないため、
+                # インタラクションのフォローアップ（Webhook経由）で送信する
+                await interaction.followup.send(content)
         except discord.Forbidden:
             await interaction.followup.send("このチャンネルへの送信権限がないため、送信に失敗しました。", ephemeral=True)
         except Exception as e:
@@ -4298,7 +4305,7 @@ class HelpQuickActionView(discord.ui.View):
 
 @bot.tree.command(name="help", description="利用可能なコマンド一覧をカテゴリ別に表示します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def help_command(interaction: discord.Interaction):
     owner_id = await resolve_owner_id(interaction.client)
     is_owner = (interaction.user.id == owner_id)
@@ -4509,7 +4516,7 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
 
 @bot.tree.command(name="apology", description="セレクトメニューから謝罪文を組み立てて送信します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def apology(interaction: discord.Interaction):
     view = ApologyBuilderView(author=interaction.user)
     await interaction.response.send_message(
@@ -4806,9 +4813,13 @@ async def my_audit_perms(interaction: discord.Interaction):
 
 @bot.tree.command(name="my_check_url", description="URLの安全性をVirusTotalでチェックします")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def my_check_url(interaction: discord.Interaction, url: str):
-    if not await is_admin_or_allowed(interaction): return
+    if not interaction.guild:
+        if not await is_trusted_user(interaction):
+            return
+    elif not await is_admin_or_allowed(interaction):
+        return
     await interaction.response.defer(ephemeral=True)
     api_key = os.getenv("VT_API_KEY")
     if not api_key:
@@ -7894,7 +7905,7 @@ async def eval_command(interaction: discord.Interaction, コード: str):
 
 @bot.tree.command(name="calc", description="数式を計算して結果を返します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def calc(interaction: discord.Interaction, 数式: str):
     """
     四則演算・累乗・括弧・関数（sin/cos/sqrt等）に対応。
