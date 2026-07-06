@@ -6375,7 +6375,7 @@ async def poll(
     choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
     choices = [c for c in choices_raw if c]
 
-    EMOJIS = ["1", "2", "3", "4", "5"]
+    EMOJIS = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3"]  # 1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣（数字キーキャップ）
 
     embed = discord.Embed(
         title=f"[STATS] {質問}",
@@ -6386,7 +6386,14 @@ async def poll(
     embed.set_footer(text=f"投票者: {interaction.user} | ボタンを押して投票してください")
 
     view = PollView(choices, EMOJIS[:len(choices)])
-    await interaction.response.send_message(embed=embed, view=view)
+    try:
+        await interaction.response.send_message(embed=embed, view=view)
+    except discord.HTTPException as e:
+        # ここに到達した場合、Discord側でメッセージ内容が拒否されている
+        # （絵文字の形式・文字数制限など）ため、理由を表示する
+        await interaction.followup.send(
+            f"投票パネルの送信に失敗しました。内容を確認してください。\n`{e}`", ephemeral=True
+        )
 
 
 class PollView(discord.ui.View):
