@@ -243,6 +243,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("alt_check_days", 30),
         ("alt_check_action", "notify"),
         ("iplogger_check_enabled", False),
+        ("polls", {}),
+        ("poll_next_id", 1),
         ("giveaways", {}),
         # --- Embedビルダー：Modal付きパネル（送信済み分の永続化用） ---
         ("embed_response_panels", {}),  # {panel_id_str: {"button_label": str, "modal_title": str,
@@ -3033,6 +3035,27 @@ async def on_ready():
         except Exception as e:
             print(f"[警告] サーバーBL認証パネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
 
+    # /poll 投票パネルの永続化View再登録（締め切り済みのものはボタン無効状態で再登録）
+    for guild_id_str, config in all_data.items():
+        if guild_id_str in ("user_apps", "global_config"):
+            continue
+        if not isinstance(config, dict):
+            continue
+        polls = config.get("polls", {})
+        for poll_id_str, record in polls.items():
+            if not isinstance(record, dict):
+                continue
+            try:
+                guild_id_int = int(guild_id_str)
+                poll_id_int = int(poll_id_str)
+                view = PollView(guild_id_int, poll_id_int, record.get("choices", []))
+                if record.get("status") != "open":
+                    for item in view.children:
+                        item.disabled = True
+                bot.add_view(view)
+            except Exception as e:
+                print(f"[警告] 投票パネルの再登録に失敗しました（guild={guild_id_str}, poll={poll_id_str}）: {e}")
+
     try:
         await update_bot_status(bot)
     except Exception as e:
@@ -4339,7 +4362,8 @@ async def help_command(interaction: discord.Interaction):
             "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
             "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
             "`/calc` : 数式を計算して結果を返します\n"
-            "`/poll` : 投票パネルを作成します\n"
+            "`/poll` : 投票パネルを作成します（作成者/Botオーナーが締め切り可能）\n"
+            "`/poll_admin` : 【Botオーナー専用】投票結果の確認・票の取消・手動調整・強制締切\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server_stats` : サーバーの統計情報を表示します\n"
@@ -6361,8 +6385,66 @@ async def slowmode(
 
 
 # --------------------------------------------------------------------
-# /poll — リアクション投票パネル
+# /poll — リアクション投票パネル（JSON永続化 + 結果操作機能付き）
 # --------------------------------------------------------------------
+
+EMOJIS = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3"]  # 1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣（数字キーキャップ）
+
+
+def _get_poll_record(all_data: dict, guild_id: int, poll_id: int) -> dict | None:
+    """指定ギルド・投票IDのレコードを取得します（存在しなければNone）。"""
+    cfg = get_guild_config(all_data, str(guild_id))
+    polls = cfg.get("polls", {})
+    return polls.get(str(poll_id))
+
+
+def _build_poll_embed(record: dict, *, closed: bool = False) -> discord.Embed:
+    """投票データから一覧表示用のEmbed（投票受付中）を組み立てます。"""
+    choices = record["choices"]
+    emojis = EMOJIS[:len(choices)]
+    embed = discord.Embed(
+        title=f"[STATS] {record['question']}",
+        color=discord.Color.blurple() if not closed else discord.Color.dark_grey()
+    )
+    for i, choice in enumerate(choices):
+        embed.add_field(name=f"{emojis[i]} {choice}", value="\u200b", inline=False)
+    status = "締め切りました" if closed else "ボタンを押して投票してください"
+    embed.set_footer(text=f"投票者: {record['creator_name']} | {status}")
+    return embed
+
+
+def _build_result_embed(record: dict, *, title: str = "[STATS] 現在の投票結果") -> discord.Embed:
+    """投票データから結果集計用のEmbedを組み立てます。"""
+    choices = record["choices"]
+    emojis = EMOJIS[:len(choices)]
+    votes: dict[str, int] = record.get("votes", {})  # {user_id_str: choice_index}
+    manual_adjust: dict[str, int] = record.get("manual_adjust", {})  # {choice_index_str: 加算数}
+    total_voters = len(votes)
+
+    counts = []
+    for i in range(len(choices)):
+        count = sum(1 for v in votes.values() if v == i)
+        count += manual_adjust.get(str(i), 0)
+        counts.append(max(count, 0))
+    total = sum(counts) if sum(counts) > 0 else 0
+
+    lines = []
+    for i, (choice, emoji) in enumerate(zip(choices, emojis)):
+        count = counts[i]
+        pct = int(count / total * 100) if total > 0 else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        adj = manual_adjust.get(str(i), 0)
+        adj_text = f"（手動調整: {adj:+d}）" if adj else ""
+        lines.append(f"{emoji} **{choice}**\n`{bar}` {count}票 ({pct}%){adj_text}")
+
+    embed = discord.Embed(
+        title=title,
+        description="\n\n".join(lines) if lines else "まだ投票はありません。",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"総投票数: {total}票（実投票者数: {total_voters}人） | 投票ID: {record.get('poll_id', '?')}")
+    return embed
+
 
 @bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作成します（管理者/許可ユーザー専用、DM・グループDMはオーナー/信頼ユーザーのみ）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -6386,93 +6468,339 @@ async def poll(
     choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
     choices = [c for c in choices_raw if c]
 
-    EMOJIS = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3"]  # 1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣（数字キーキャップ）
+    guild_id = interaction.guild.id if interaction.guild else 0
 
-    embed = discord.Embed(
-        title=f"[STATS] {質問}",
-        color=discord.Color.blurple()
-    )
-    for i, choice in enumerate(choices):
-        embed.add_field(name=f"{EMOJIS[i]} {choice}", value="\u200b", inline=False)
-    embed.set_footer(text=f"投票者: {interaction.user} | ボタンを押して投票してください")
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    poll_id = cfg.get("poll_next_id", 1)
+    cfg["poll_next_id"] = poll_id + 1
 
-    view = PollView(choices, EMOJIS[:len(choices)])
+    record = {
+        "poll_id": poll_id,
+        "question": 質問,
+        "choices": choices,
+        "creator_id": interaction.user.id,
+        "creator_name": str(interaction.user),
+        "votes": {},           # {user_id_str: choice_index}
+        "manual_adjust": {},   # {choice_index_str: 加算数（マイナス可）}
+        "status": "open",      # open / closed
+        "channel_id": interaction.channel_id,
+        "message_id": None,
+    }
+    cfg.setdefault("polls", {})[str(poll_id)] = record
+    save_data(all_data)
+
+    embed = _build_poll_embed(record)
+    view = PollView(guild_id, poll_id, choices)
     try:
         await interaction.response.send_message(embed=embed, view=view)
+        sent_message = await interaction.original_response()
     except discord.HTTPException as e:
         # ここに到達した場合、Discord側でメッセージ内容が拒否されている
         # （絵文字の形式・文字数制限など）ため、理由を表示する
         await interaction.followup.send(
             f"投票パネルの送信に失敗しました。内容を確認してください。\n`{e}`", ephemeral=True
         )
+        return
+
+    # メッセージIDを保存（締め切り後の編集・再起動後の復元に使用）
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    if str(poll_id) in cfg.get("polls", {}):
+        cfg["polls"][str(poll_id)]["message_id"] = sent_message.id
+        save_data(all_data)
+
+
+async def _is_poll_closer(interaction: discord.Interaction, record: dict) -> bool:
+    """締め切り操作の権限判定：投票作成者 または Botオーナーのみ許可します。"""
+    owner_id = await resolve_owner_id(interaction.client)
+    if interaction.user.id == record.get("creator_id"):
+        return True
+    if interaction.user.id == owner_id:
+        return True
+    await interaction.response.send_message(
+        "投票の締め切りは、作成者またはBotオーナーのみ実行できます。", ephemeral=True
+    )
+    return False
 
 
 class PollView(discord.ui.View):
-    """投票パネル用ビュー。各選択肢のボタン押下で票数を集計します。"""
+    """投票パネル用ビュー。各選択肢のボタン押下で票数を集計し、JSONへ永続化します。"""
 
-    def __init__(self, choices: list[str], emojis: list[str]):
+    def __init__(self, guild_id: int, poll_id: int, choices: list[str]):
         super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.poll_id = poll_id
         self.choices = choices
-        self.emojis = emojis
-        # {user_id: choice_index} — 1人1票
-        self.votes: dict[int, int] = {}
+        emojis = EMOJIS[:len(choices)]
         for i, (choice, emoji) in enumerate(zip(choices, emojis)):
             btn = discord.ui.Button(
                 label=choice[:40],
                 emoji=emoji,
                 style=discord.ButtonStyle.primary,
-                custom_id=f"poll_choice_{i}",
+                custom_id=f"poll_choice_{guild_id}_{poll_id}_{i}",
                 row=i // 3,
             )
             btn.callback = self._make_callback(i)
             self.add_item(btn)
 
-        # 結果表示ボタン
+        # 結果表示ボタン（本人向け・非公開）
         result_btn = discord.ui.Button(
             label="現在の結果を見る",
             style=discord.ButtonStyle.secondary,
             emoji="📊",
-            custom_id="poll_result",
+            custom_id=f"poll_result_{guild_id}_{poll_id}",
             row=2,
         )
         result_btn.callback = self._show_result
         self.add_item(result_btn)
 
+        # 締め切りボタン（作成者/Botオーナーのみ）
+        close_btn = discord.ui.Button(
+            label="締め切る",
+            style=discord.ButtonStyle.danger,
+            emoji="🔒",
+            custom_id=f"poll_close_{guild_id}_{poll_id}",
+            row=2,
+        )
+        close_btn.callback = self._close_poll
+        self.add_item(close_btn)
+
     def _make_callback(self, index: int):
         async def callback(interaction: discord.Interaction):
-            uid = interaction.user.id
-            prev = self.votes.get(uid)
+            all_data = load_data()
+            record = _get_poll_record(all_data, self.guild_id, self.poll_id)
+            if record is None or record.get("status") != "open":
+                await interaction.response.send_message("この投票は既に締め切られています。", ephemeral=True)
+                return
+
+            uid = str(interaction.user.id)
+            votes = record.setdefault("votes", {})
+            prev = votes.get(uid)
             if prev == index:
                 # 同じ選択肢を再押し→取消
-                del self.votes[uid]
+                del votes[uid]
+                save_data(all_data)
                 await interaction.response.send_message(
-                    f"{self.emojis[index]} **{self.choices[index]}** への投票を取り消しました。",
+                    f"{EMOJIS[index]} **{self.choices[index]}** への投票を取り消しました。",
                     ephemeral=True
                 )
             else:
-                self.votes[uid] = index
+                votes[uid] = index
+                save_data(all_data)
                 await interaction.response.send_message(
-                    f"{self.emojis[index]} **{self.choices[index]}** に投票しました！\n"
+                    f"{EMOJIS[index]} **{self.choices[index]}** に投票しました！\n"
                     "もう一度押すと取り消せます。",
                     ephemeral=True
                 )
         return callback
 
     async def _show_result(self, interaction: discord.Interaction):
-        total = len(self.votes)
-        lines = []
-        for i, (choice, emoji) in enumerate(zip(self.choices, self.emojis)):
-            count = sum(1 for v in self.votes.values() if v == i)
-            pct = int(count / total * 100) if total > 0 else 0
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            lines.append(f"{emoji} **{choice}**\n`{bar}` {count}票 ({pct}%)")
-        embed = discord.Embed(
-            title="[STATS] 現在の投票結果",
-            description="\n\n".join(lines) if lines else "まだ投票はありません。",
-            color=discord.Color.green()
-        )
-        embed.set_footer(text=f"総投票数: {total}票")
+        all_data = load_data()
+        record = _get_poll_record(all_data, self.guild_id, self.poll_id)
+        if record is None:
+            await interaction.response.send_message("投票データが見つかりませんでした。", ephemeral=True)
+            return
+        embed = _build_result_embed(record)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _close_poll(self, interaction: discord.Interaction):
+        all_data = load_data()
+        record = _get_poll_record(all_data, self.guild_id, self.poll_id)
+        if record is None:
+            await interaction.response.send_message("投票データが見つかりませんでした。", ephemeral=True)
+            return
+        if record.get("status") != "open":
+            await interaction.response.send_message("この投票は既に締め切られています。", ephemeral=True)
+            return
+        if not await _is_poll_closer(interaction, record):
+            return
+
+        record["status"] = "closed"
+        save_data(all_data)
+
+        # パネル本体を「締切済み」表示に更新（ボタン無効化）
+        closed_embed = _build_poll_embed(record, closed=True)
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(embed=closed_embed, view=self)
+        except discord.HTTPException:
+            pass
+
+        # 結果を公開（同じチャンネルに結果embedを送信）
+        result_embed = _build_result_embed(record, title="[STATS] 投票結果（締め切りました）")
+        try:
+            if interaction.channel is not None:
+                await interaction.channel.send(embed=result_embed)
+            else:
+                await interaction.followup.send(embed=result_embed)
+        except discord.HTTPException:
+            try:
+                await interaction.followup.send(embed=result_embed, ephemeral=True)
+            except discord.HTTPException:
+                pass
+
+
+# --------------------------------------------------------------------
+# /poll_admin — 投票の結果操作機能（Botオーナー専用）
+#   ・特定ユーザーの投票を取り消す
+#   ・票数を手動で加算/修正する
+#   ・結果を（締切前でも）確認する
+# --------------------------------------------------------------------
+
+poll_admin_group = app_commands.Group(
+    name="poll_admin",
+    description="【Botオーナー専用】投票の結果操作（票の取消・手動調整・結果確認）を行います",
+)
+
+
+@poll_admin_group.command(name="view", description="投票結果を確認します（締め切り前でも閲覧可能）")
+async def poll_admin_view(interaction: discord.Interaction, 投票id: int):
+    if not await is_owner_check(interaction):
+        return
+    guild_id = interaction.guild.id if interaction.guild else 0
+    all_data = load_data()
+    record = _get_poll_record(all_data, guild_id, 投票id)
+    if record is None:
+        await interaction.response.send_message(f"投票ID `{投票id}` が見つかりませんでした。", ephemeral=True)
+        return
+    status_text = "受付中" if record.get("status") == "open" else "締め切り済み"
+    embed = _build_result_embed(record, title=f"[STATS] 投票結果（{status_text}）")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@poll_admin_group.command(name="remove_vote", description="特定ユーザーの投票を取り消します")
+async def poll_admin_remove_vote(interaction: discord.Interaction, 投票id: int, 対象ユーザー: discord.User):
+    if not await is_owner_check(interaction):
+        return
+    guild_id = interaction.guild.id if interaction.guild else 0
+    all_data = load_data()
+    record = _get_poll_record(all_data, guild_id, 投票id)
+    if record is None:
+        await interaction.response.send_message(f"投票ID `{投票id}` が見つかりませんでした。", ephemeral=True)
+        return
+
+    votes = record.setdefault("votes", {})
+    uid = str(対象ユーザー.id)
+    if uid not in votes:
+        await interaction.response.send_message(
+            f"{対象ユーザー} はこの投票に投票していません。", ephemeral=True
+        )
+        return
+
+    removed_index = votes.pop(uid)
+    save_data(all_data)
+    choice_name = record["choices"][removed_index] if removed_index < len(record["choices"]) else "?"
+    await interaction.response.send_message(
+        f"[OK] {対象ユーザー} の投票（{choice_name}）を取り消しました。（投票ID: {投票id}）",
+        ephemeral=True
+    )
+
+
+@poll_admin_group.command(name="adjust", description="指定した選択肢の票数を手動で加算・修正します（マイナス値で減算も可）")
+async def poll_admin_adjust(interaction: discord.Interaction, 投票id: int, 選択肢番号: int, 加算する票数: int):
+    if not await is_owner_check(interaction):
+        return
+    guild_id = interaction.guild.id if interaction.guild else 0
+    all_data = load_data()
+    record = _get_poll_record(all_data, guild_id, 投票id)
+    if record is None:
+        await interaction.response.send_message(f"投票ID `{投票id}` が見つかりませんでした。", ephemeral=True)
+        return
+
+    choices = record.get("choices", [])
+    index = 選択肢番号 - 1  # ユーザー入力は1始まり
+    if index < 0 or index >= len(choices):
+        await interaction.response.send_message(
+            f"選択肢番号は 1〜{len(choices)} の範囲で指定してください。", ephemeral=True
+        )
+        return
+
+    manual_adjust = record.setdefault("manual_adjust", {})
+    key = str(index)
+    manual_adjust[key] = manual_adjust.get(key, 0) + 加算する票数
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[OK] 「{choices[index]}」の票数を {加算する票数:+d} 調整しました。"
+        f"（現在の手動調整合計: {manual_adjust[key]:+d}、投票ID: {投票id}）",
+        ephemeral=True
+    )
+
+
+@poll_admin_group.command(name="reset_adjust", description="指定した選択肢の手動調整（加算分）をリセットします")
+async def poll_admin_reset_adjust(interaction: discord.Interaction, 投票id: int, 選択肢番号: int):
+    if not await is_owner_check(interaction):
+        return
+    guild_id = interaction.guild.id if interaction.guild else 0
+    all_data = load_data()
+    record = _get_poll_record(all_data, guild_id, 投票id)
+    if record is None:
+        await interaction.response.send_message(f"投票ID `{投票id}` が見つかりませんでした。", ephemeral=True)
+        return
+
+    choices = record.get("choices", [])
+    index = 選択肢番号 - 1
+    if index < 0 or index >= len(choices):
+        await interaction.response.send_message(
+            f"選択肢番号は 1〜{len(choices)} の範囲で指定してください。", ephemeral=True
+        )
+        return
+
+    manual_adjust = record.setdefault("manual_adjust", {})
+    manual_adjust.pop(str(index), None)
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"[OK] 「{choices[index]}」の手動調整をリセットしました。（投票ID: {投票id}）", ephemeral=True
+    )
+
+
+@poll_admin_group.command(name="close", description="投票を締め切り、結果を公開します（Botオーナー専用の強制締切）")
+async def poll_admin_close(interaction: discord.Interaction, 投票id: int):
+    if not await is_owner_check(interaction):
+        return
+    guild_id = interaction.guild.id if interaction.guild else 0
+    all_data = load_data()
+    record = _get_poll_record(all_data, guild_id, 投票id)
+    if record is None:
+        await interaction.response.send_message(f"投票ID `{投票id}` が見つかりませんでした。", ephemeral=True)
+        return
+    if record.get("status") != "open":
+        await interaction.response.send_message("この投票は既に締め切られています。", ephemeral=True)
+        return
+
+    record["status"] = "closed"
+    save_data(all_data)
+
+    # 元のパネルメッセージがあれば締切表示に更新
+    channel_id = record.get("channel_id")
+    message_id = record.get("message_id")
+    channel = interaction.guild.get_channel(channel_id) if (interaction.guild and channel_id) else None
+    if channel is not None and message_id:
+        try:
+            msg = await channel.fetch_message(message_id)
+            closed_embed = _build_poll_embed(record, closed=True)
+            new_view = PollView(guild_id, 投票id, record["choices"])
+            for item in new_view.children:
+                item.disabled = True
+            await msg.edit(embed=closed_embed, view=new_view)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    result_embed = _build_result_embed(record, title="[STATS] 投票結果（Botオーナーにより締め切られました）")
+    try:
+        if channel is not None:
+            await channel.send(embed=result_embed)
+    except discord.HTTPException:
+        pass
+
+    await interaction.response.send_message(
+        f"[OK] 投票ID `{投票id}` を締め切りました。", ephemeral=True
+    )
+
+
+bot.tree.add_command(poll_admin_group)
 
 
 # --------------------------------------------------------------------
