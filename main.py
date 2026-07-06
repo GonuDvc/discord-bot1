@@ -4465,12 +4465,10 @@ async def apology(interaction: discord.Interaction):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def say(interaction: discord.Interaction, message: str, reply_to_message_id: str = None):
-    # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
-    owner_id = await resolve_owner_id(interaction.client)
+    # DM・グループDMの場合はBotオーナーまたは信頼ユーザー(owner_trust)のみ許可、サーバー内は通常の権限チェック
     if not interaction.guild:
         # DM / グループDM
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        if not await is_trusted_user(interaction):
             return
     else:
         # サーバー内は従来の権限チェック
@@ -4594,11 +4592,9 @@ async def say_embed(
     フッター: str = None,
     reply_to_message_id: str = None,
 ):
-    # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
-    owner_id = await resolve_owner_id(interaction.client)
+    # DM・グループDMの場合はBotオーナーまたは信頼ユーザー(owner_trust)のみ許可、サーバー内は通常の権限チェック
     if not interaction.guild:
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        if not await is_trusted_user(interaction):
             return
     else:
         if not await is_admin_or_allowed(interaction):
@@ -6293,7 +6289,7 @@ async def slowmode(
 # /poll — リアクション投票パネル
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作成します（管理者/許可ユーザー専用、DM・グループDMはBotオーナーのみ）")
+@bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作成します（管理者/許可ユーザー専用、DM・グループDMはオーナー/信頼ユーザーのみ）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def poll(
@@ -6305,8 +6301,12 @@ async def poll(
     選択肢4: str = None,
     選択肢5: str = None,
 ):
-    if not await is_admin_or_allowed(interaction):
-        return
+    if not interaction.guild:
+        if not await is_trusted_user(interaction):
+            return
+    else:
+        if not await is_admin_or_allowed(interaction):
+            return
 
     choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
     choices = [c for c in choices_raw if c]
