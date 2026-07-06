@@ -4507,16 +4507,40 @@ async def say(interaction: discord.Interaction, message: str, reply_to_message_i
             )
             return
 
-    await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
+    try:
+        if target_message:
+            await target_message.reply(message, mention_author=False)
+        else:
+            channel = interaction.channel
+            if channel is None:
+                # チャンネルがキャッシュされていない場合は明示的に取得を試みる
+                try:
+                    channel = await interaction.client.fetch_channel(interaction.channel_id)
+                except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                    channel = None
 
-    # DMチャンネルでは interaction.channel が None になる場合があるので followup で対処
-    if target_message:
-        await target_message.reply(message, mention_author=False)
-    elif interaction.channel:
-        await interaction.channel.send(message)
-    else:
-        # DMチャンネルが取得できない場合はユーザーのDMへ直接送信
-        await interaction.user.send(message)
+            if channel is not None:
+                await channel.send(message)
+            else:
+                # 通常のチャンネル取得・送信ができない場合（ユーザーインストール状態の
+                # グループDM等、Botがチャンネルへ直接アクセスできないコンテキスト）は
+                # インタラクションのレスポンスを使って直接発言する。
+                # これはインタラクショントークン経由のため、Botがそのチャンネルに
+                # 通常アクセスできない場合でも送信できる。
+                await interaction.response.send_message(message)
+                return
+
+        # 実発言に成功した場合のみ「送信しました」の確認をエフェメラルで返す
+        await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"メッセージの送信に失敗しました: {e}", ephemeral=True
+        )
 
 
 @bot.tree.command(name="my_scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャンします")
