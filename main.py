@@ -4554,7 +4554,137 @@ async def say(interaction: discord.Interaction, message: str, reply_to_message_i
         )
 
 
-@bot.tree.command(name="my_scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャンします")
+# --------------------------------------------------------------------
+# /say_embed — /say のEmbed版（タイトル・本文・色などを指定して代わりに発言）
+# サーバー内・DM・グループDM いずれでも利用可能（権限は/sayと同様）
+# --------------------------------------------------------------------
+
+_SAY_EMBED_COLORS = {
+    "ブルー":   discord.Color.blue(),
+    "グリーン": discord.Color.green(),
+    "レッド":   discord.Color.red(),
+    "ゴールド": discord.Color.gold(),
+    "パープル": discord.Color.purple(),
+    "オレンジ": discord.Color.orange(),
+    "グレー":   discord.Color.greyple(),
+    "ティール": discord.Color.teal(),
+    "白":       discord.Color.from_rgb(255, 255, 255),
+    "黒":       discord.Color.from_rgb(30, 30, 30),
+}
+
+
+@bot.tree.command(name="say_embed", description="Botに指定した内容でEmbedメッセージを代わりに発言させます")
+@app_commands.describe(
+    本文="Embedの本文（説明文）",
+    タイトル="Embedのタイトル（省略可）",
+    色="Embedの枠線の色（省略時はブルー）",
+    画像url="Embedに表示する画像のURL（省略可）",
+    フッター="Embed下部に表示する小さなテキスト（省略可）",
+    reply_to_message_id="このメッセージID宛に返信（リプライ）形式で送信したい場合に指定します（サーバー内のみ・省略時は通常送信）"
+)
+@app_commands.choices(色=[app_commands.Choice(name=name, value=name) for name in _SAY_EMBED_COLORS])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def say_embed(
+    interaction: discord.Interaction,
+    本文: str,
+    タイトル: str = None,
+    色: app_commands.Choice[str] = None,
+    画像url: str = None,
+    フッター: str = None,
+    reply_to_message_id: str = None,
+):
+    # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
+    owner_id = await resolve_owner_id(interaction.client)
+    if not interaction.guild:
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+    else:
+        if not await is_admin_or_allowed(interaction):
+            return
+
+    color_name = 色.value if 色 else "ブルー"
+    embed = discord.Embed(
+        title=タイトル,
+        description=本文,
+        color=_SAY_EMBED_COLORS.get(color_name, discord.Color.blue())
+    )
+    if 画像url:
+        embed.set_image(url=画像url)
+    if フッター:
+        embed.set_footer(text=フッター)
+
+    # 返信先メッセージIDが指定されている場合は事前に解析・取得しておく（サーバー内のみ対応）
+    target_message = None
+    if reply_to_message_id:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "DM・グループDMではメッセージID指定の返信は利用できません。", ephemeral=True
+            )
+            return
+        try:
+            target_message_id = int(reply_to_message_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "メッセージIDの形式が正しくありません。数字のみで指定してください。", ephemeral=True
+            )
+            return
+
+        if interaction.channel:
+            try:
+                target_message = await interaction.channel.fetch_message(target_message_id)
+            except discord.NotFound:
+                await interaction.response.send_message(
+                    "指定されたメッセージIDがこのチャンネル内で見つかりませんでした。", ephemeral=True
+                )
+                return
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "そのメッセージを取得する権限がありません。", ephemeral=True
+                )
+                return
+        else:
+            await interaction.response.send_message(
+                "このコンテキストではメッセージID指定の返信を利用できません。", ephemeral=True
+            )
+            return
+
+    try:
+        if interaction.guild:
+            # サーバー内: Botがチャンネルへの通常アクセス権を持っているため、
+            # 従来通りチャンネル送信・メッセージへのリプライを行う
+            if target_message:
+                await target_message.reply(embed=embed, mention_author=False)
+            else:
+                channel = interaction.channel
+                if channel is None:
+                    try:
+                        channel = await interaction.client.fetch_channel(interaction.channel_id)
+                    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                        channel = None
+
+                if channel is not None:
+                    await channel.send(embed=embed)
+                else:
+                    await interaction.response.send_message(embed=embed)
+                    return
+
+            await interaction.response.send_message("Embedメッセージを送信しました。", ephemeral=True)
+
+        else:
+            # DM・グループDM: Botはチャンネルへの直接アクセス権限を持たないため、
+            # インタラクションの応答（Webhook経由）のみを使って発言する
+            await interaction.response.send_message(embed=embed)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"メッセージの送信に失敗しました: {e}", ephemeral=True
+        )
 async def my_scan_channels(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
@@ -6163,7 +6293,9 @@ async def slowmode(
 # /poll — リアクション投票パネル
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="poll", description="【管理者専用】絵文字ボタン付きの投票パネルを作成します")
+@bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作成します（管理者/許可ユーザー専用、DM・グループDMはBotオーナーのみ）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def poll(
     interaction: discord.Interaction,
     質問: str,
@@ -6174,8 +6306,6 @@ async def poll(
     選択肢5: str = None,
 ):
     if not await is_admin_or_allowed(interaction):
-        return
-    if not interaction.guild:
         return
 
     choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
