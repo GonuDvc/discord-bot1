@@ -4193,6 +4193,70 @@ async def sync_command_error(ctx, error):
         await ctx.send("このコマンドはBotの所有者（オーナー）のみ実行できます。")
 
 
+# --------------------------------------------------------------------
+# /sync — !sync のスラッシュコマンド版。サーバー内・DM・グループDMいずれでも
+# 実行可能（オーナー限定）。DM・グループDMではサーバーに紐付かないため
+# 「グローバル同期」のみ利用できる。
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="sync", description="【オーナー限定】スラッシュコマンドの同期を行います")
+@app_commands.describe(範囲="同期の範囲を選択してください（省略時はサーバーへ即時同期）")
+@app_commands.choices(範囲=[
+    app_commands.Choice(name="このサーバーへ即時同期（テスト用・数秒で反映）", value="guild"),
+    app_commands.Choice(name="全サーバーへグローバル同期（反映まで最大1時間）", value="global"),
+    app_commands.Choice(name="このサーバーのギルドコマンドをクリア", value="clear"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def sync_slash(interaction: discord.Interaction, 範囲: app_commands.Choice[str] = None):
+    if not await is_owner_check(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    scope = 範囲.value if 範囲 else "guild"
+
+    if scope == "global":
+        try:
+            synced = await bot.tree.sync()
+            await interaction.followup.send(
+                f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。反映まで最大1時間かかります。",
+                ephemeral=True
+            )
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`", ephemeral=True
+            )
+        return
+
+    # guild / clear はサーバーに紐付くため、DM・グループDMでは実行不可
+    if not interaction.guild:
+        await interaction.followup.send(
+            "サーバー内で実行してください。DM・グループDMでは「グローバル同期」のみ利用できます。",
+            ephemeral=True
+        )
+        return
+
+    if scope == "clear":
+        bot.tree.clear_commands(guild=interaction.guild)
+        await bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send(
+            "このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。", ephemeral=True
+        )
+        return
+
+    # guild（即時同期）
+    try:
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send(
+            f"このサーバーへの即時同期が完了しました（{len(synced)}個）。すぐに `/` で確認できます。\n"
+            "全サーバーへ反映したい場合は 範囲=グローバル同期 を指定してください（最大1時間）。",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"同期に失敗しました。\n`{e}`", ephemeral=True)
+
+
 # ====================================================================
 # セクション 8: スラッシュコマンド
 # ====================================================================
