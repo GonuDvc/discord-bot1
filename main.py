@@ -168,9 +168,38 @@ current_custom_status = None
 # ====================================================================
 # セクション 1: データベース・設定処理
 # ====================================================================
+#
+# [修正メモ]
+# 以前は load_data()/save_data() が同期I/O（open/json.load/json.dump）を
+# 直接イベントループ上で実行しており、JSONファイルが肥大化するほど
+# 処理時間が延びてイベントループ全体をブロックしていました。
+# これにより giveaway の「参加する」ボタンをはじめ、あらゆるインタラクションが
+# Discordの3秒応答制限に間に合わず「このインタラクションは失敗しました」に
+# なる不具合が発生していました（サーバー運用が進みデータが増えるほど＝
+# 「しばらく時間が経つと」再現しやすくなっていました）。
+#
+# 対策:
+#   1. インメモリキャッシュを持たせ、読み込みは基本キャッシュから返す
+#      （ファイルの読み込み自体も高コストなため回数を削減）。
+#   2. 実際のファイルI/Oは asyncio の別スレッドにオフロードする
+#      非同期版 (aload_data / asave_data) を用意。
+#   3. 呼び出し側の書き換えを最小限にするため、同期版 load_data/save_data の
+#      シグネチャ・戻り値は従来通りに維持しつつ、内部实装のみ強化。
+#   4. 書き込みは一時ファイル→os.replace によるアトミック書き込みにし、
+#      書き込み中のクラッシュや同時書き込みによるファイル破損を防止。
+#   5. 簡易ファイルロック（threading.Lock）で同時書き込みによる
+#      レースコンディション（例: giveaway参加者リストの取りこぼし）を防止。
 
-def load_data() -> dict:
-    """JSONファイルから設定データを読み込みます。"""
+import threading
+import functools
+
+_data_lock = threading.Lock()
+_data_cache: dict | None = None
+_data_cache_mtime: float | None = None
+
+
+def _read_json_file_sync() -> dict:
+    """実際にJSONファイルを読み込む同期処理（内部専用）。"""
     if os.path.exists(JSON_FILE):
         try:
             with open(JSON_FILE, "r", encoding="utf-8") as f:
@@ -181,18 +210,66 @@ def load_data() -> dict:
     return {}
 
 
-def save_data(data: dict):
-    """設定データをJSONファイルに書き込みます。ディレクトリが存在しない場合は作成します。"""
+def _write_json_file_sync(data: dict):
+    """実際にJSONファイルへ書き込む同期処理（内部専用）。アトミック書き込み対応。"""
     try:
         dir_name = os.path.dirname(JSON_FILE)
         if dir_name and not os.path.exists(dir_name):
             os.makedirs(dir_name, exist_ok=True)
             print(f"[システム] 保存先フォルダを作成しました: {dir_name}")
 
-        with open(JSON_FILE, "w", encoding="utf-8") as f:
+        tmp_path = f"{JSON_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, JSON_FILE)  # アトミックに置き換え、書き込み途中のファイル破損を防止
     except Exception as e:
         print(f"[JSON保存エラー] {e}")
+
+
+def load_data() -> dict:
+    """設定データを取得します（同期版・互換維持用）。
+    可能な限りインメモリキャッシュを使い、ディスクI/Oの回数を削減します。"""
+    global _data_cache, _data_cache_mtime
+    with _data_lock:
+        try:
+            mtime = os.path.getmtime(JSON_FILE) if os.path.exists(JSON_FILE) else None
+        except OSError:
+            mtime = None
+
+        if _data_cache is not None and mtime == _data_cache_mtime:
+            # ファイルが前回読み込み時から変わっていなければキャッシュを返す
+            return _data_cache
+
+        data = _read_json_file_sync()
+        _data_cache = data
+        _data_cache_mtime = mtime
+        return data
+
+
+def save_data(data: dict):
+    """設定データを保存します（同期版・互換維持用）。
+    書き込み後はキャッシュを即座に更新するので、直後の load_data() は
+    ファイルI/Oを待たずに最新データを返します。"""
+    global _data_cache, _data_cache_mtime
+    with _data_lock:
+        _write_json_file_sync(data)
+        _data_cache = data
+        try:
+            _data_cache_mtime = os.path.getmtime(JSON_FILE) if os.path.exists(JSON_FILE) else None
+        except OSError:
+            _data_cache_mtime = None
+
+
+async def aload_data() -> dict:
+    """load_data() の非同期版。イベントループをブロックせずに読み込みたい場合に使用します。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, load_data)
+
+
+async def asave_data(data: dict):
+    """save_data() の非同期版。イベントループをブロックせずに書き込みたい場合に使用します。"""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, functools.partial(save_data, data))
 
 
 def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
@@ -346,6 +423,59 @@ bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
+
+
+# --------------------------------------------------------------------
+# [修正] スラッシュコマンド／ボタン等のコンポーネント共通エラーハンドラ
+# --------------------------------------------------------------------
+# 以前はこのBotに bot.tree.error のグローバルエラーハンドラが一切登録されて
+# いませんでした。そのため、コマンドやボタンのコールバック内で未処理の例外
+# （discord.NotFound、KeyError、JSON破損によるエラー等）が発生すると、
+# discord.py 側で例外がログに出力されるだけで、Discord側のインタラクションには
+# 何も応答が返らず、ユーザーからは「このインタラクションは失敗しました」
+# としか見えない状態になっていました。
+# 特に /giveaway の「参加する」ボタンのように長期間有効なコンポーネントは、
+# サーバー運用が進み保存データが増えるほど、まれな例外に遭遇する機会が増え
+# 「しばらく時間が経つと失敗する」という報告につながっていました。
+# ここでグローバルハンドラを設けることで、
+#   1. 例外を確実にログへ出力し、原因調査を可能にする
+#   2. ユーザーには常に何らかの応答を返し、「反応なし」を防ぐ
+# という2点を保証します。
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
+    # クールダウンや権限不足など、ユーザー起因のエラーは分かりやすいメッセージに変換
+    if isinstance(error, discord.app_commands.CommandOnCooldown):
+        message = f"このコマンドはクールダウン中です。あと{error.retry_after:.1f}秒お待ちください。"
+    elif isinstance(error, discord.app_commands.MissingPermissions):
+        message = "このコマンドを実行する権限がありません。"
+    elif isinstance(error, discord.app_commands.CommandInvokeError) and isinstance(error.original, discord.Forbidden):
+        message = "Botの権限が不足しているため、この操作を実行できませんでした。"
+    else:
+        message = "コマンドの実行中に予期しないエラーが発生しました。時間をおいて再度お試しください。"
+
+    print(f"[app_command_error] コマンド '{getattr(interaction.command, 'name', '不明')}' でエラー: {error!r}")
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        # インタラクショントークンが失効済み（15分超過など）の場合はここに来る。
+        # ユーザーへの通知はできないが、少なくともログには原因が残る。
+        pass
+
+
+@bot.event
+async def on_error(event_method: str, *args, **kwargs):
+    """discord.py の on_xxx イベントハンドラ内で発生した未処理例外を捕捉し、
+    Botプロセス全体が停止しないようにログへ出力するだけに留めます。
+    以前はこのハンドラが無く、イベントハンドラ内の例外はコンソールに
+    トレースバックが出力されるのみで、原因追跡が難しい状態でした。"""
+    import traceback
+    print(f"[on_error] イベント '{event_method}' で未処理の例外が発生しました:")
+    traceback.print_exc()
+
 
 # --------------------------------------------------------------------
 # コマンドグループ（add/remove/list 等のCRUD系コマンドをサブコマンドにまとめ、
@@ -3097,6 +3227,15 @@ async def on_ready():
             print("  > 統計ループ: 再起動しました")
 
         # 進行中プレゼントのタスクを再起動
+        # [修正] on_ready はDiscordとの再接続のたびに複数回呼び出される可能性があり、
+        # 以前はここで無条件に asyncio.create_task していたため、再接続が起きるたびに
+        # 同一giveawayに対して複数のタスクが重複して起動していました。
+        # 複数タスクが同時に走ると、片方が抽選・データ削除・メッセージ編集を終えた後、
+        # もう片方が既に存在しないデータや編集済みメッセージへアクセスして失敗し、
+        # 「giveawayがしばらく時間が経つとインタラクションに失敗する」不具合の
+        # 直接的な原因になっていました。
+        # _cancel_giveaway_task() で同一msg_idの既存タスクを必ずキャンセルしてから
+        # 新しいタスクを起動することで、重複起動を防止します。
         giveaways = config.get("giveaways", {})
         now_utc = discord.utils.utcnow()
         for msg_id_str, gw in list(giveaways.items()):
@@ -3106,8 +3245,9 @@ async def on_ready():
                     end_dt = end_dt.replace(tzinfo=datetime.timezone.utc)
                 ch_id = gw.get("channel_id")
                 ch = guild.get_channel(ch_id) if guild and ch_id else None
+                msg_id = int(msg_id_str)
                 if ch and end_dt > now_utc:
-                    msg_id = int(msg_id_str)
+                    _cancel_giveaway_task(msg_id)  # 既存タスクがあれば必ずキャンセルしてから再起動
                     task = asyncio.create_task(_run_giveaway(ch, msg_id, guild_id_int, end_dt))
                     _giveaway_tasks[msg_id] = task
                     print(f"  > プレゼントタスク: msg_id={msg_id_str} を再起動しました")
@@ -3115,8 +3255,9 @@ async def on_ready():
                     # 期限切れのプレゼントを即時処理
                     ch2 = guild.get_channel(gw.get("channel_id")) if guild else None
                     if ch2:
-                        msg_id = int(msg_id_str)
-                        asyncio.create_task(_run_giveaway(ch2, msg_id, guild_id_int, now_utc))
+                        _cancel_giveaway_task(msg_id)
+                        task = asyncio.create_task(_run_giveaway(ch2, msg_id, guild_id_int, now_utc))
+                        _giveaway_tasks[msg_id] = task
             except Exception as e:
                 print(f"  > [警告] プレゼントタスク復元に失敗: {e}")
     print("---------------------------------------")
@@ -8185,49 +8326,105 @@ class GiveawayJoinView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        # [修正] View内のコールバックで想定外の例外が発生した場合の最終防御ライン。
+        # join() 内は既にtry/exceptで保護しているが、万一discord.py内部やdiscord側の
+        # 挙動変化で例外が漏れてもBotが応答不能に見えないようにする。
+        print(f"[GiveawayJoinView] コンポーネントエラー: {error!r}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("エラーが発生しました。もう一度お試しください。", ephemeral=True)
+            else:
+                await interaction.response.send_message("エラーが発生しました。もう一度お試しください。", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     @discord.ui.button(
         label="[*] 参加する",
         style=discord.ButtonStyle.success,
         custom_id="giveaway_join"
     )
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # [修正] 以前はこの関数全体が try/except で保護されておらず、
+        # 予期しない例外（KeyError, discord.NotFound 等）が発生すると
+        # interaction への応答が一切返らないまま終了し、Discord側で
+        # 「このインタラクションは失敗しました」と表示される原因になっていました。
+        # また load_data() が同期I/Oでブロッキングするため、データが増えるほど
+        # 3秒の応答制限に間に合わなくなる問題もありました（aload_data/asave_data で解消）。
+        try:
+            await self._handle_join(interaction)
+        except Exception as e:
+            print(f"[giveaway] 参加処理中にエラーが発生しました: {e}")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "処理中にエラーが発生しました。もう一度お試しください。", ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "処理中にエラーが発生しました。もう一度お試しください。", ephemeral=True
+                    )
+            except Exception:
+                pass  # ここまで失敗した場合は静かに諦める（ユーザーへの通知はできないが、Bot自体は継続稼働）
+
+    async def _handle_join(self, interaction: discord.Interaction):
         if not interaction.guild:
             return
 
-        all_data = load_data()
+        msg_id_str = str(interaction.message.id)
+        uid = interaction.user.id
+
+        # イベントループをブロックしないよう非同期版でファイルI/Oを行う
+        all_data = await aload_data()
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         giveaways = cfg.get("giveaways", {})
-        msg_id_str = str(interaction.message.id)
 
         if msg_id_str not in giveaways:
             await interaction.response.send_message("このプレゼント企画は終了または削除されました。", ephemeral=True)
             return
 
         gw = giveaways[msg_id_str]
-        participants = gw.get("participants", [])
-        uid = interaction.user.id
+        participants = gw.setdefault("participants", [])
+        joined = uid not in participants
 
-        if uid in participants:
-            # 参加取消
-            participants.remove(uid)
-            gw["participants"] = participants
-            save_data(all_data)
-            await interaction.response.send_message("プレゼント企画への参加を取り消しました。", ephemeral=True)
+        # [修正] 複数人がほぼ同時にボタンを押した際、
+        # 「読み込み→変更→保存」の間に他の参加登録が上書きされて消える
+        # レースコンディションが起こり得ました。
+        # 保存直前に最新データを読み直し、対象giveawayの参加者リストのみを
+        # マージしてから保存することで、同時押しによる取りこぼしを防ぎます。
+        latest_data = await aload_data()
+        latest_cfg = get_guild_config(latest_data, str(interaction.guild.id))
+        latest_giveaways = latest_cfg.get("giveaways", {})
+        if msg_id_str in latest_giveaways:
+            latest_gw = latest_giveaways[msg_id_str]
+            latest_participants = set(latest_gw.get("participants", []))
+            if joined:
+                latest_participants.add(uid)
+            else:
+                latest_participants.discard(uid)
+            latest_gw["participants"] = list(latest_participants)
+            participants = latest_gw["participants"]
+        all_data = latest_data
+
+        await asave_data(all_data)
+
+        if joined:
+            await interaction.response.send_message(
+                "[*] プレゼント企画に参加しました！もう一度押すと取り消せます。", ephemeral=True
+            )
         else:
-            participants.append(uid)
-            gw["participants"] = participants
-            save_data(all_data)
-            await interaction.response.send_message("[*] プレゼント企画に参加しました！もう一度押すと取り消せます。", ephemeral=True)
+            await interaction.response.send_message("プレゼント企画への参加を取り消しました。", ephemeral=True)
 
-        # Embed の参加者数を更新
+        # Embed の参加者数を更新（失敗してもユーザーへの応答自体は既に完了しているので致命的ではない）
         try:
-            embed = interaction.message.embeds[0]
-            for i, field in enumerate(embed.fields):
-                if "参加者" in field.name:
-                    embed.set_field_at(i, name="参加者数", value=f"{len(participants)}人", inline=True)
-                    break
-            await interaction.message.edit(embed=embed)
-        except Exception:
+            if interaction.message.embeds:
+                embed = interaction.message.embeds[0]
+                for i, field in enumerate(embed.fields):
+                    if field.name and "参加者" in field.name:
+                        embed.set_field_at(i, name="参加者数", value=f"{len(participants)}人", inline=True)
+                        break
+                await interaction.message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
 
@@ -8246,71 +8443,95 @@ def _build_giveaway_embed(prize: str, host: discord.Member, end_dt: datetime.dat
     return embed
 
 
+def _cancel_giveaway_task(message_id: int):
+    """指定メッセージIDの実行中giveawayタスクがあればキャンセルして辞書から除去します。
+    [修正] on_ready は再接続のたびに複数回呼ばれる可能性があり、以前は
+    同一giveawayに対して重複してタスクを起動する保護がありませんでした。
+    重複タスクが走ると、片方が抽選・データ削除・メッセージ編集を行った後、
+    もう片方が既に消えたデータへアクセスして失敗したり、
+    メッセージへの二重編集で discord.HTTPException が発生する原因になっていました。"""
+    old_task = _giveaway_tasks.pop(message_id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+
 async def _run_giveaway(channel: discord.TextChannel, message_id: int, guild_id: int, end_dt: datetime.datetime):
     """指定時刻まで待機し、抽選を実行します。"""
-    now = discord.utils.utcnow()
-    wait_seconds = (end_dt - now).total_seconds()
-    if wait_seconds > 0:
-        await asyncio.sleep(wait_seconds)
-
-    # 抽選実行
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(guild_id))
-    giveaways = cfg.get("giveaways", {})
-    msg_id_str = str(message_id)
-
-    if msg_id_str not in giveaways:
-        return
-
-    gw = giveaways[msg_id_str]
-    participants = gw.get("participants", [])
-    winner_count = gw.get("winners", 1)
-    prize = gw.get("prize", "景品")
-
-    import random
-    if not participants:
-        result_embed = discord.Embed(
-            title="[*] プレゼント企画 終了",
-            description=f"**{prize}**\n\n参加者がいなかったため、当選者なしで終了しました。",
-            color=discord.Color.greyple()
-        )
-    else:
-        actual_winners = min(winner_count, len(participants))
-        chosen = random.sample(participants, actual_winners)
-        mentions = " ".join(f"<@{uid}>" for uid in chosen)
-        result_embed = discord.Embed(
-            title="[*] プレゼント企画 終了！",
-            description=f"**景品: {prize}**\n\n[WIN] 当選者: {mentions}\nおめでとうございます！",
-            color=discord.Color.gold()
-        )
-        result_embed.add_field(name="参加者数", value=f"{len(participants)}人", inline=True)
-        result_embed.add_field(name="当選人数", value=f"{actual_winners}人", inline=True)
-
-    result_embed.timestamp = discord.utils.utcnow()
-
-    # 元メッセージを更新してボタンを無効化
     try:
-        msg = await channel.fetch_message(message_id)
-        disabled_view = discord.ui.View()
-        disabled_btn = discord.ui.Button(
-            label="[*] 終了（参加受付終了）",
-            style=discord.ButtonStyle.secondary,
-            disabled=True
-        )
-        disabled_view.add_item(disabled_btn)
-        await msg.edit(view=disabled_view)
-    except Exception:
-        pass
+        now = discord.utils.utcnow()
+        wait_seconds = (end_dt - now).total_seconds()
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
 
-    try:
-        await channel.send(embed=result_embed)
-    except Exception:
-        pass
+        # 抽選実行（非同期I/Oでイベントループのブロッキングを回避）
+        all_data = await aload_data()
+        cfg = get_guild_config(all_data, str(guild_id))
+        giveaways = cfg.get("giveaways", {})
+        msg_id_str = str(message_id)
 
-    # データから削除
-    del giveaways[msg_id_str]
-    save_data(all_data)
-    _giveaway_tasks.pop(message_id, None)
+        if msg_id_str not in giveaways:
+            return
+
+        gw = giveaways[msg_id_str]
+        participants = gw.get("participants", [])
+        winner_count = gw.get("winners", 1)
+        prize = gw.get("prize", "景品")
+
+        if not participants:
+            result_embed = discord.Embed(
+                title="[*] プレゼント企画 終了",
+                description=f"**{prize}**\n\n参加者がいなかったため、当選者なしで終了しました。",
+                color=discord.Color.greyple()
+            )
+        else:
+            actual_winners = min(winner_count, len(participants))
+            chosen = random.sample(participants, actual_winners)
+            mentions = " ".join(f"<@{uid}>" for uid in chosen)
+            result_embed = discord.Embed(
+                title="[*] プレゼント企画 終了！",
+                description=f"**景品: {prize}**\n\n[WIN] 当選者: {mentions}\nおめでとうございます！",
+                color=discord.Color.gold()
+            )
+            result_embed.add_field(name="参加者数", value=f"{len(participants)}人", inline=True)
+            result_embed.add_field(name="当選人数", value=f"{actual_winners}人", inline=True)
+
+        result_embed.timestamp = discord.utils.utcnow()
+
+        # 元メッセージを更新してボタンを無効化
+        try:
+            msg = await channel.fetch_message(message_id)
+            disabled_view = discord.ui.View()
+            disabled_btn = discord.ui.Button(
+                label="[*] 終了（参加受付終了）",
+                style=discord.ButtonStyle.secondary,
+                disabled=True
+            )
+            disabled_view.add_item(disabled_btn)
+            await msg.edit(view=disabled_view)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        try:
+            await channel.send(embed=result_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # データから削除（再読込してから削除することで、待機中に他の変更が
+        # 保存されていた場合でも上書きしてしまわないようにする）
+        final_data = await aload_data()
+        final_cfg = get_guild_config(final_data, str(guild_id))
+        final_giveaways = final_cfg.get("giveaways", {})
+        final_giveaways.pop(msg_id_str, None)
+        await asave_data(final_data)
+    except asyncio.CancelledError:
+        # [修正] 再接続時に重複タスクをキャンセルする際、ここで静かに終了する。
+        # 送出しないと再送出扱いになりタスクの例外ログに残るため、意図した
+        # キャンセルであることを明示して握りつぶす。
+        raise
+    except Exception as e:
+        print(f"[giveaway] 抽選処理中にエラーが発生しました (message_id={message_id}): {e}")
+    finally:
+        _giveaway_tasks.pop(message_id, None)
 
 
 @bot.tree.command(name="giveaway", description="【管理者専用】プレゼント企画を開始します")
@@ -8332,7 +8553,7 @@ async def giveaway(
         return
 
     if 操作.value == "list":
-        all_data = load_data()
+        all_data = await aload_data()
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         giveaways = cfg.get("giveaways", {})
         if not giveaways:
@@ -8355,7 +8576,7 @@ async def giveaway(
         return
 
     if 操作.value == "end":
-        all_data = load_data()
+        all_data = await aload_data()
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         giveaways = cfg.get("giveaways", {})
         if not giveaways:
@@ -8363,15 +8584,14 @@ async def giveaway(
             return
         # 最新のプレゼントを即時終了
         latest_id = int(list(giveaways.keys())[-1])
-        task = _giveaway_tasks.pop(latest_id, None)
-        if task and not task.done():
-            task.cancel()
+        _cancel_giveaway_task(latest_id)  # [修正] 既存タスクの重複起動を確実に防止
         gw = giveaways[str(latest_id)]
         ch = interaction.guild.get_channel(gw.get("channel_id", interaction.channel.id))
         if ch:
             gw["end_at"] = discord.utils.utcnow().isoformat()
-            save_data(all_data)
-            asyncio.create_task(_run_giveaway(ch, latest_id, interaction.guild.id, discord.utils.utcnow()))
+            await asave_data(all_data)
+            new_task = asyncio.create_task(_run_giveaway(ch, latest_id, interaction.guild.id, discord.utils.utcnow()))
+            _giveaway_tasks[latest_id] = new_task
         await interaction.response.send_message("プレゼント企画を即時終了して抽選を実行します。", ephemeral=True)
         return
 
@@ -8392,9 +8612,13 @@ async def giveaway(
     embed = _build_giveaway_embed(景品, interaction.user, end_dt, 当選人数, 0)
     view = GiveawayJoinView()
 
-    msg = await interaction.channel.send(embed=embed, view=view)
+    try:
+        msg = await interaction.channel.send(embed=embed, view=view)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await interaction.followup.send(f"プレゼント企画の投稿に失敗しました: {e}", ephemeral=True)
+        return
 
-    all_data = load_data()
+    all_data = await aload_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg.setdefault("giveaways", {})[str(msg.id)] = {
         "prize": 景品,
@@ -8404,7 +8628,7 @@ async def giveaway(
         "host_id": interaction.user.id,
         "participants": [],
     }
-    save_data(all_data)
+    await asave_data(all_data)
 
     task = asyncio.create_task(_run_giveaway(interaction.channel, msg.id, interaction.guild.id, end_dt))
     _giveaway_tasks[msg.id] = task
