@@ -5061,6 +5061,112 @@ async def server_list_users(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
+# /dm_command_user_add — DMコマンド（/dm_user 等）を使える許可ユーザーを追加
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="dm_command_user_add",
+    description="【管理者専用】/dm_user などのコマンド許可ユーザーに指定ユーザーを追加します"
+)
+async def dm_command_user_add(interaction: discord.Interaction, ユーザー: discord.User):
+    """
+    指定したユーザーを、このサーバーの『コマンド使用許可ユーザー』（allowed_users）に追加します。
+    このリストに登録されたユーザーは /dm_user をはじめとする「管理者・許可ユーザー専用」コマンドを
+    使用できるようになります（is_admin_or_allowed / is_moderator が参照するリストと共通です）。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    g_id = str(interaction.guild.id)
+    all_data = load_data()
+    config = get_guild_config(all_data, g_id)
+    allowed_users = config.setdefault("allowed_users", [])
+
+    if ユーザー.id in allowed_users:
+        await interaction.response.send_message(
+            f"{ユーザー.mention} は既にコマンド許可ユーザーに登録されています。", ephemeral=True
+        )
+        return
+
+    allowed_users.append(ユーザー.id)
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="[OK] DMコマンド許可ユーザーを追加しました",
+        description=f"{ユーザー.mention}（`{ユーザー.id}`）が /dm_user などの許可ユーザーに追加されました。",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"現在の登録人数: {len(allowed_users)}名 | /server_list_users で一覧・削除も可能です")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # モデレーションログにも記録
+    log_embed = discord.Embed(
+        title="[ログ] コマンド許可ユーザー追加",
+        color=discord.Color.purple()
+    )
+    log_embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+    log_embed.add_field(name="追加されたユーザー", value=f"{ユーザー.mention} (`{ユーザー.id}`)", inline=True)
+    log_embed.timestamp = discord.utils.utcnow()
+    try:
+        await _send_mod_log(interaction.guild, log_embed)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------
+# /dm_command_user_remove — DMコマンドの許可ユーザーから除外
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="dm_command_user_remove",
+    description="【管理者専用】/dm_user などのコマンド許可ユーザーから指定ユーザーを削除します"
+)
+async def dm_command_user_remove(interaction: discord.Interaction, ユーザー: discord.User):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    g_id = str(interaction.guild.id)
+    all_data = load_data()
+    config = get_guild_config(all_data, g_id)
+    allowed_users = config.setdefault("allowed_users", [])
+
+    if ユーザー.id not in allowed_users:
+        await interaction.response.send_message(
+            f"{ユーザー.mention} はコマンド許可ユーザーに登録されていません。", ephemeral=True
+        )
+        return
+
+    allowed_users.remove(ユーザー.id)
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="[OK] DMコマンド許可ユーザーを削除しました",
+        description=f"{ユーザー.mention}（`{ユーザー.id}`）を許可ユーザーから削除しました。",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"現在の登録人数: {len(allowed_users)}名")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="[ログ] コマンド許可ユーザー削除",
+        color=discord.Color.purple()
+    )
+    log_embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+    log_embed.add_field(name="削除されたユーザー", value=f"{ユーザー.mention} (`{ユーザー.id}`)", inline=True)
+    log_embed.timestamp = discord.utils.utcnow()
+    try:
+        await _send_mod_log(interaction.guild, log_embed)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------
 # /role_permission_add — ロールへのサーバー管理コマンド権限付与
 # --------------------------------------------------------------------
 
