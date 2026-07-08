@@ -6052,6 +6052,71 @@ async def antinuke_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="role_channel_mute", description="【管理者専用】指定ロールの、指定した複数チャンネルでの発言・スレッド作成権限をまとめてOFFにします")
+@discord.app_commands.describe(
+    role="発言・スレッド作成を禁止するロール",
+    channel1="対象チャンネル1（必須）",
+    channel2="対象チャンネル2（任意）",
+    channel3="対象チャンネル3（任意）",
+    channel4="対象チャンネル4（任意）",
+    channel5="対象チャンネル5（任意）",
+)
+async def role_channel_mute(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    channel1: discord.abc.GuildChannel,
+    channel2: discord.abc.GuildChannel = None,
+    channel3: discord.abc.GuildChannel = None,
+    channel4: discord.abc.GuildChannel = None,
+    channel5: discord.abc.GuildChannel = None,
+):
+    if not await is_guild_admin(interaction):
+        return
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    target_channels = [c for c in (channel1, channel2, channel3, channel4, channel5) if c is not None]
+
+    success_channels = []
+    failed_channels = []
+
+    for channel in target_channels:
+        if isinstance(channel, discord.CategoryChannel):
+            failed_channels.append(f"{channel.name}（カテゴリは対象外）")
+            continue
+        try:
+            await channel.set_permissions(
+                role,
+                send_messages=False,
+                send_messages_in_threads=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                reason=f"/role_channel_mute によりロール「{role.name}」の発言・スレッド作成権限をOFF（実行者: {interaction.user}）"
+            )
+            success_channels.append(channel.mention)
+        except discord.Forbidden:
+            failed_channels.append(f"{channel.mention}（Botに権限がありません）")
+        except discord.HTTPException as e:
+            failed_channels.append(f"{channel.mention}（エラー: {e}）")
+
+    embed = discord.Embed(
+        title="[OK] チャンネル発言権限の一括OFFが完了しました",
+        description=f"対象ロール: {role.mention}\n\n"
+                     f"発言（メッセージ送信・スレッド内発言）とスレッド作成の権限をOFFにしました。",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+    if success_channels:
+        embed.add_field(name=f"[OK] 成功（{len(success_channels)}件）", value="\n".join(success_channels), inline=False)
+    if failed_channels:
+        embed.add_field(name=f"[NG] 失敗（{len(failed_channels)}件）", value="\n".join(failed_channels), inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="arasi_setup", description="【管理者専用】荒らし対策：隔離ロール作成＋新規ロールの権限自動制限を設定します")
 @discord.app_commands.describe(
     隔離ロール名="作成する隔離ロールの名前（未指定時は「隔離」）。既に同名ロールがあれば再利用します",
