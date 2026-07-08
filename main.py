@@ -19,12 +19,16 @@ import io
 import datetime
 import collections
 import time
+from typing import Union, Optional
 import discord
 from discord.ext import commands
 import aiohttp
 import aiohttp.web
 # import io  # 重複インポートを削除
 from discord import app_commands
+
+# role_channel_mute コマンド等で使う、発言/スレッド権限を持つチャンネル型のUnion
+MuteTargetChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel]
 
 # .env ファイルからの環境変数読み込み (ローカル開発用)
 try:
@@ -6064,11 +6068,11 @@ async def antinuke_status(interaction: discord.Interaction):
 async def role_channel_mute(
     interaction: discord.Interaction,
     role: discord.Role,
-    channel1: discord.abc.GuildChannel,
-    channel2: discord.abc.GuildChannel = None,
-    channel3: discord.abc.GuildChannel = None,
-    channel4: discord.abc.GuildChannel = None,
-    channel5: discord.abc.GuildChannel = None,
+    channel1: MuteTargetChannel,
+    channel2: Optional[MuteTargetChannel] = None,
+    channel3: Optional[MuteTargetChannel] = None,
+    channel4: Optional[MuteTargetChannel] = None,
+    channel5: Optional[MuteTargetChannel] = None,
 ):
     if not await is_guild_admin(interaction):
         return
@@ -9436,7 +9440,15 @@ class EmbedBuilderView(discord.ui.View):
             else:
                 await self.target_channel.send(embed=embed)
         except discord.Forbidden:
-            await interaction.response.send_message("送信権限がありません。", ephemeral=True)
+            await interaction.response.send_message(
+                f"[NG] {self.target_channel.mention} への送信権限がBotにありません。\n\n"
+                f"**対処法**\n"
+                f"1. {self.target_channel.mention} の「チャンネル設定」→「権限」を開く\n"
+                f"2. 役職の一覧にBotのロール（例: MAKUMAKUBOT）を追加する\n"
+                f"3. そのロールの「メッセージを送信」を許可（✓）にする\n\n"
+                f"（`@everyone` の送信権限がOFFのチャンネルでは、Bot用ロールに個別で許可を出す必要があります）",
+                ephemeral=True
+            )
             return
         except Exception as e:
             await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
