@@ -498,6 +498,17 @@ ticket_group = app_commands.Group(name="ticket", description="問い合わせチ
 interview_group = app_commands.Group(name="interview", description="【管理者専用】面接（応募）システムの管理")
 interview_question_group = app_commands.Group(name="question", description="【管理者専用】面接の質問リストを管理", parent=interview_group)
 
+# server_* 系コマンド統合用グループ（旧: server_status, server_backup 等の
+# トップレベルコマンド20個を /server 配下のサブコマンドへ集約）
+server_group = app_commands.Group(name="server", description="【管理者専用】サーバー設定・管理関連コマンド")
+server_forward_group = app_commands.Group(name="forward", description="メッセージ転送設定の管理", parent=server_group)
+server_announce_group = app_commands.Group(name="announce", description="お知らせ機能の管理", parent=server_group)
+server_verify_group = app_commands.Group(name="verify", description="認証機能の管理", parent=server_group)
+server_mention_group = app_commands.Group(name="mention", description="自動ロールメンション返信機能の管理", parent=server_group)
+server_hiroyuki_group = app_commands.Group(name="hiroyuki", description="ひろゆき構文機能の管理", parent=server_group)
+server_config_group = app_commands.Group(name="config", description="サーバー構成のバックアップ・復元・コピー", parent=server_group)
+
+
 bot.tree.add_command(owner_trust_group)
 bot.tree.add_command(customtrigger_group)
 bot.tree.add_command(customcmd_manage_group)
@@ -506,6 +517,7 @@ bot.tree.add_command(roleshop_group)
 bot.tree.add_command(vendingmachine_group)
 bot.tree.add_command(ticket_group)
 bot.tree.add_command(interview_group)
+bot.tree.add_command(server_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -4691,7 +4703,7 @@ async def help_command(interaction: discord.Interaction):
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/warnings` : 指定ユーザーの警告履歴を確認します\n"
-            "`/server_stats` : サーバーの統計情報を表示します\n"
+            "`/server stats` : サーバーの統計情報を表示します\n"
             "`/iplogger_check` : URLがIPロガーでないかチェックします\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
             "`/gift` : 自分のコインを他のユーザーに贈ります\n"
@@ -4736,18 +4748,18 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(
             name="サーバー管理者専用コマンド (1/2)",
             value=(
-                "`/server_status` : 現在の各種機能の設定状況を確認します\n"
-                "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
-                "`/server_create_channel` : 新しいテキストチャンネルを作成します\n"
-                "`/server_copy` : チャンネルをコピーして複製します\n"
-                "`/server_role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
-                "`/server_forward_setup` / `/server_forward_reset` : メッセージ自動転送の設定・解除を行います\n"
-                "`/server_announce_setup` / `/server_announce_send` : 配信お知らせ機能の設定と送信を行います\n"
-                "`/server_verify_setup` / `/server_verify_btn` : メンバー認証用パネルを設置します\n"
-                "`/server_mention_setup` / `/server_mention_reset` : 自動返信ロールメンションの設定と解除を行います\n"
-                "`/server_stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
-                "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server_restore` : バックアップJSONからサーバー構成を復元します\n"
+                "`/server status` : 現在の各種機能の設定状況を確認します\n"
+                "`/server list_users` : コマンド使用許可リストの確認・編集を行います\n"
+                "`/server create_channel` : 新しいテキストチャンネルを作成します\n"
+                "`/server config copy` : チャンネルをコピーして複製します\n"
+                "`/server role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
+                "`/server forward setup` / `/server forward reset` : メッセージ自動転送の設定・解除を行います\n"
+                "`/server announce setup` / `/server announce send` : 配信お知らせ機能の設定と送信を行います\n"
+                "`/server verify setup` / `/server verify btn` : メンバー認証用パネルを設置します\n"
+                "`/server mention setup` / `/server mention reset` : 自動返信ロールメンションの設定と解除を行います\n"
+                "`/server stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
+                "`/server config backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
+                "`/server config restore` : バックアップJSONからサーバー構成を復元します\n"
                 "`/ticket setup` : このチャンネルに問い合わせチケットパネルを設置します\n"
                 "`/ticket close` : 現在のチケットチャンネルをクローズします\n"
                 "`/interview setup` : 面接システムの実施方式・結果通知先などを設定します\n"
@@ -4813,8 +4825,8 @@ async def help_command(interaction: discord.Interaction):
         ("work", "💼 働く (/work)", "働いてMコインを稼ぎます", work.callback),
     ]
     admin_actions = [
-        ("server_status", "⚙️ サーバー設定確認 (/server_status)", "各種機能の設定状況を確認します", server_status.callback),
-        ("server_list_users", "👥 許可ユーザー管理 (/server_list_users)", "コマンド使用許可リストを確認・編集します", server_list_users.callback),
+        ("server_status", "⚙️ サーバー設定確認 (/server status)", "各種機能の設定状況を確認します", server_status.callback),
+        ("server_list_users", "👥 許可ユーザー管理 (/server list_users)", "コマンド使用許可リストを確認・編集します", server_list_users.callback),
         ("role_permission_list", "🔐 権限一覧 (/role_permission_list)", "管理コマンドの許可ロール/ユーザー一覧を見ます", role_permission_list.callback),
         ("antinuke_status", "🛡️ antinuke状況 (/antinuke_status)", "antinukeの設定状況を確認します", antinuke_status.callback),
         ("dashboard", "📊 管理ダッシュボード (/dashboard)", "サーバーの統計・設定をまとめて確認します", dashboard_command.callback),
@@ -5195,7 +5207,7 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_status", description="現在の各種機能の設定状況を確認します")
+@server_group.command(name="status", description="現在の各種機能の設定状況を確認します")
 async def server_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5234,7 +5246,7 @@ async def server_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="server_list_users", description="使用許可リストの確認・編集を行います")
+@server_group.command(name="list_users", description="使用許可リストの確認・編集を行います")
 async def server_list_users(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5284,7 +5296,7 @@ async def dm_command_user_add(interaction: discord.Interaction, ユーザー: di
         description=f"{ユーザー.mention}（`{ユーザー.id}`）が /dm_user などの許可ユーザーに追加されました。",
         color=discord.Color.green()
     )
-    embed.set_footer(text=f"現在の登録人数: {len(allowed_users)}名 | /server_list_users で一覧・削除も可能です")
+    embed.set_footer(text=f"現在の登録人数: {len(allowed_users)}名 | /server list_users で一覧・削除も可能です")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # モデレーションログにも記録
@@ -5521,11 +5533,11 @@ async def role_permission_list(interaction: discord.Interaction):
     else:
         embed.add_field(name="👤 許可ユーザー", value="登録なし", inline=False)
 
-    embed.set_footer(text="/role_permission_add でロール追加 | /server_list_users でユーザー管理")
+    embed.set_footer(text="/role_permission_add でロール追加 | /server list_users でユーザー管理")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="server_create_channel", description="新しいテキストチャンネルを作成します")
+@server_group.command(name="create_channel", description="新しいテキストチャンネルを作成します")
 async def server_create_channel(interaction: discord.Interaction, name: str, category: discord.CategoryChannel = None):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5537,7 +5549,7 @@ async def server_create_channel(interaction: discord.Interaction, name: str, cat
         await interaction.followup.send(f"作成失敗: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_role_bulk_create", description="【管理者専用】複数のロールをカンマ区切りで一気に作成します")
+@server_group.command(name="role_bulk_create", description="【管理者専用】複数のロールをカンマ区切りで一気に作成します")
 @app_commands.describe(
     role_names="作成したいロール名をカンマ（,）区切りで入力してください（例: 初心者,中級者,上級者）",
     color="作成する全ロールに適用する色（16進数カラーコード、例: ff0000）。省略時はデフォルト色",
@@ -5617,7 +5629,7 @@ async def server_role_bulk_create(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="server_disable_external_apps", description="【管理者専用】サーバー内すべてのロールの『外部アプリの使用』権限をOFFにします")
+@server_group.command(name="disable_external_apps", description="【管理者専用】サーバー内すべてのロールの『外部アプリの使用』権限をOFFにします")
 async def server_disable_external_apps(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5672,7 +5684,7 @@ async def server_disable_external_apps(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="server_role_panel", description="指定したロール（最大23個）を取得できるセレクトメニュー付きパネルを送信します")
+@server_group.command(name="role_panel", description="指定したロール（最大23個）を取得できるセレクトメニュー付きパネルを送信します")
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
     role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
@@ -5703,7 +5715,7 @@ async def server_role_panel(
     await interaction.followup.send(f"ロールパネルを設置しました（{len(roles)}個のロール）。", ephemeral=True)
 
 
-@bot.tree.command(name="server_forward_setup", description="メッセージ転送元のチャンネルと転送先を設定します")
+@server_forward_group.command(name="setup", description="メッセージ転送元のチャンネルと転送先を設定します")
 async def server_forward_setup(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5714,7 +5726,7 @@ async def server_forward_setup(interaction: discord.Interaction, from_channel: d
     await interaction.response.send_message("転送設定を保存しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_forward_reset", description="チャンネルの転送設定を解除します")
+@server_forward_group.command(name="reset", description="チャンネルの転送設定を解除します")
 async def server_forward_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5725,7 +5737,7 @@ async def server_forward_reset(interaction: discord.Interaction):
     await interaction.response.send_message("転送設定を解除しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_announce_setup", description="お知らせ用のチャンネルとロールを設定します")
+@server_announce_group.command(name="setup", description="お知らせ用のチャンネルとロールを設定します")
 async def server_announce_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5736,7 +5748,7 @@ async def server_announce_setup(interaction: discord.Interaction, channel: disco
     await interaction.response.send_message("お知らせ設定を保存しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_announce_send", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
+@server_announce_group.command(name="send", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
 async def server_announce_send(interaction: discord.Interaction, message: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5751,7 +5763,7 @@ async def server_announce_send(interaction: discord.Interaction, message: str):
         await interaction.response.send_message("設定が不完全です。", ephemeral=True)
 
 
-@bot.tree.command(name="server_verify_setup", description="認証用ロールと送信チャンネルを設定します")
+@server_verify_group.command(name="setup", description="認証用ロールと送信チャンネルを設定します")
 async def server_verify_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5762,7 +5774,7 @@ async def server_verify_setup(interaction: discord.Interaction, channel: discord
     await interaction.response.send_message("認証設定を保存しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_verify_btn", description="設定されたチャンネルに認証用ボタンパネルを送信します")
+@server_verify_group.command(name="btn", description="設定されたチャンネルに認証用ボタンパネルを送信します")
 async def server_verify_btn(interaction: discord.Interaction, title: str = "サーバー認証", description: str = "ボタンを押すと認証が完了します。", image_file: discord.Attachment = None):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5787,7 +5799,7 @@ async def server_verify_btn(interaction: discord.Interaction, title: str = "サ�
     await interaction.followup.send("認証パネルを送信しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_mention_setup", description="指定chへの投稿時、指定メッセージ＆指定ロールで元の文章を含めて返信（Reply）します")
+@server_mention_group.command(name="setup", description="指定chへの投稿時、指定メッセージ＆指定ロールで元の文章を含めて返信（Reply）します")
 async def server_mention_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role, text: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5811,7 +5823,7 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_mention_reset", description="自動ロールメンションの監視・返信設定を解除します")
+@server_mention_group.command(name="reset", description="自動ロールメンションの監視・返信設定を解除します")
 async def server_mention_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5828,7 +5840,7 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_hiroyuki_setup", description="【管理者専用】指定チャンネルでひろゆき構文が発動するように設定します")
+@server_hiroyuki_group.command(name="setup", description="【管理者専用】指定チャンネルでひろゆき構文が発動するように設定します")
 @app_commands.describe(
     channel="ひろゆき構文の対象にするチャンネル",
     mode="発動モード（ランダム発動 / NGワード検知時のみ発動）",
@@ -5882,7 +5894,7 @@ async def server_hiroyuki_setup(
         await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="server_hiroyuki_reset", description="【管理者専用】ひろゆき構文（全モード）の設定を解除（OFF）します")
+@server_hiroyuki_group.command(name="reset", description="【管理者専用】ひろゆき構文（全モード）の設定を解除（OFF）します")
 async def server_hiroyuki_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5960,7 +5972,7 @@ async def hiroyuki_ngword_setreply(interaction: discord.Interaction, text: str):
 bot.tree.add_command(hiroyuki_ngword_group)
 
 
-@bot.tree.command(name="server_backup", description="サーバーのロール・チャンネル構成・権限設定をJSONファイルとしてバックアップします")
+@server_config_group.command(name="backup", description="サーバーのロール・チャンネル構成・権限設定をJSONファイルとしてバックアップします")
 async def server_backup(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -5995,7 +6007,7 @@ async def server_backup(interaction: discord.Interaction):
         name="使い方",
         value=(
             "このJSONファイルを大切に保管してください。\n"
-            "サーバーが破壊された場合は `/server_restore` にこのファイルを添付すると復元できます。"
+            "サーバーが破壊された場合は `/server config restore` にこのファイルを添付すると復元できます。"
         ),
         inline=False
     )
@@ -6008,7 +6020,7 @@ async def server_backup(interaction: discord.Interaction):
     print(f"[バックアップ] {interaction.guild.name} のバックアップを作成しました (by {interaction.user})")
 
 
-@bot.tree.command(name="server_restore", description="バックアップJSONを添付してサーバー構成を復元します")
+@server_config_group.command(name="restore", description="バックアップJSONを添付してサーバー構成を復元します")
 async def server_restore(interaction: discord.Interaction, backup_file: discord.Attachment):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -6067,7 +6079,7 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
     print(f"[リストア確認] {interaction.guild.name} でリストア確認画面を表示 (by {interaction.user})")
 
 
-@bot.tree.command(name="server_copy", description="【許可制】指定した別のサーバーの構成（ロール・チャンネル等）をこのサーバーに上書きコピーします")
+@server_config_group.command(name="copy", description="【許可制】指定した別のサーバーの構成（ロール・チャンネル等）をこのサーバーに上書きコピーします")
 async def server_copy(interaction: discord.Interaction, コピー元のサーバーid: str):
     if not await is_trusted_user(interaction):
         return
@@ -6834,7 +6846,7 @@ async def owner_set_avatar(
 
 # ====================================================================
 # セクション 8-EX: 追加機能コマンド群
-# /slowmode / /poll / /welcome_setup / /server_stats / /dm_user
+# /slowmode / /poll / /welcome_setup / /server stats / /dm_user
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -7219,7 +7231,7 @@ async def welcome_setup(
 
 
 # --------------------------------------------------------------------
-# /server_stats — リアルタイム統計チャンネル
+# /server stats — リアルタイム統計チャンネル
 # --------------------------------------------------------------------
 
 # 統計更新タスクの管理（guild_id -> task）
@@ -7269,7 +7281,7 @@ async def _stats_loop(guild: discord.Guild):
         await asyncio.sleep(300)  # 5分ごとに更新
 
 
-@bot.tree.command(name="server_stats", description="【管理者専用】サーバー統計をリアルタイムでチャンネル名に表示します")
+@server_group.command(name="stats", description="【管理者専用】サーバー統計をリアルタイムでチャンネル名に表示します")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="設定する（カテゴリを指定）", value="set"),
     discord.app_commands.Choice(name="解除する", value="reset"),
@@ -7424,7 +7436,7 @@ async def server_stats(
     embed.add_field(name="メンバー数",     value=member_ch.mention,    inline=True)
     embed.add_field(name="オンライン人数", value=online_ch.mention,     inline=True)
     embed.add_field(name="Bot数",          value=bot_ch.mention,        inline=True)
-    embed.set_footer(text="5分ごとに自動更新されます。Bot再起動後は /server_stats 設定する を再実行してください。")
+    embed.set_footer(text="5分ごとに自動更新されます。Bot再起動後は /server stats 設定する を再実行してください。")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
