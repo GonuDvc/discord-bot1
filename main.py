@@ -367,7 +367,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
         ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
         ("web_auth_mode", "panel"),                 # 認証誘導方式: "panel"（パネル設置）/ "dm"（参加時DM自動送信）
-        # --- 荒らし対策：隔離ロール・新規ロール自動制限（/arasi_setup） ---
+        # --- 荒らし対策：隔離ロール・新規ロール自動制限（/server protect arasi_setup） ---
         ("arasi_quarantine_role_id", None),      # 隔離ロールのID
         ("arasi_quarantine_role_name", "隔離"),   # 隔離ロールの名前（表示用）
         ("arasi_verify_channel_id", None),       # 認証チャンネル（隔離ロールでも閲覧可能にするチャンネル）
@@ -507,13 +507,14 @@ server_verify_group = app_commands.Group(name="verify", description="認証機�
 server_mention_group = app_commands.Group(name="mention", description="自動ロールメンション返信機能の管理", parent=server_group)
 server_hiroyuki_group = app_commands.Group(name="hiroyuki", description="ひろゆき構文機能の管理", parent=server_group)
 server_config_group = app_commands.Group(name="config", description="サーバー構成のバックアップ・復元・コピー", parent=server_group)
+server_protect_group = app_commands.Group(name="protect", description="荒らし対策・参加者保護（隔離ロール・ウェルカム・垢BAN逃れ検知・IPロガー検知等）の設定", parent=server_group)
 
 # --------------------------------------------------------------------
 # 追加のコマンドグループ（似た単体コマンド群をサブコマンド化してトップレベルの
 # スラッシュコマンド数をさらに削減するための定義。処理内容・ロジックは
 # 従来の各コマンドから一切変更していない）
 # --------------------------------------------------------------------
-moderation_group = app_commands.Group(name="moderation", description="【モデレーター専用】warn/moderation mute/ban/moderation kick/moderation purge/moderation slowmode 等のモデレーション操作")
+moderation_group = app_commands.Group(name="moderation", description="【モデレーター専用】warn/mute/ban/kick/purge/slowmode 等のモデレーション操作")
 automod_group = app_commands.Group(name="automod", description="【モデレーター専用】自動モデレーション・NGワード・監査ログ出力先の設定")
 antinuke_group = app_commands.Group(name="antinuke", description="不審な連続操作の自動検出（antinuke）の設定")
 owner_group = app_commands.Group(name="owner", description="【オーナー限定】Botオーナー向けの各種管理コマンド")
@@ -524,6 +525,9 @@ voice_group = app_commands.Group(name="voice", description="ボイスチャン�
 troll_group = app_commands.Group(name="troll", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）の管理")
 board_group = app_commands.Group(name="board", description="サーバー掲示板の表示・管理・上位表示（bump）")
 newspaper_group = app_commands.Group(name="newspaper", description="帝国新聞の発行・発行設定")
+say_group = app_commands.Group(name="say", description="Botに代わりに発言させます（テキスト / Embed）")
+embed_group = app_commands.Group(name="embed", description="Embedメッセージの作成・送信")
+my_group = app_commands.Group(name="my", description="サーバー・権限・URLなどの各種スキャン・確認機能")
 
 
 bot.tree.add_command(owner_trust_group)
@@ -546,6 +550,9 @@ bot.tree.add_command(voice_group)
 bot.tree.add_command(troll_group)
 bot.tree.add_command(board_group)
 bot.tree.add_command(newspaper_group)
+bot.tree.add_command(say_group)
+bot.tree.add_command(embed_group)
+bot.tree.add_command(my_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -4427,7 +4434,7 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
 
 @bot.event
 async def on_guild_role_create(role: discord.Role):
-    """荒らし対策（/arasi_setup）: 新規作成されたロールの『@everyoneメンション』
+    """荒らし対策（/server protect arasi_setup）: 新規作成されたロールの『@everyoneメンション』
     『外部アプリのスラッシュコマンド使用』権限を自動でOFFにします。"""
     guild = role.guild
     all_data = load_data()
@@ -4455,7 +4462,7 @@ async def on_guild_role_create(role: discord.Role):
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    """荒らし対策（/arasi_setup）: 新規作成されたチャンネルを隔離ロールから見えないようにします。
+    """荒らし対策（/server protect arasi_setup）: 新規作成されたチャンネルを隔離ロールから見えないようにします。
     認証チャンネルとして設定されているチャンネルのみ、閲覧を許可します。
     カテゴリーチャンネルは対象外（個々のテキスト/ボイス等チャンネルのみ処理）です。"""
     if isinstance(channel, discord.CategoryChannel):
@@ -4498,7 +4505,7 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
 
 
 async def _grant_arasi_quarantine_role(member: discord.Member, cfg: dict):
-    """荒らし対策（/arasi_setup）: 新規参加者に隔離ロールを自動付与します。
+    """荒らし対策（/server protect arasi_setup）: 新規参加者に隔離ロールを自動付与します。
     隔離ロールが未設定・存在しない場合は何もしません（エラーにしません）。"""
     role_id = cfg.get("arasi_quarantine_role_id")
     if not role_id:
@@ -4515,7 +4522,7 @@ async def _grant_arasi_quarantine_role(member: discord.Member, cfg: dict):
 
 
 async def _remove_arasi_quarantine_role(member: discord.Member, cfg: dict):
-    """荒らし対策（/arasi_setup）: 認証完了時に隔離ロールを解除します。
+    """荒らし対策（/server protect arasi_setup）: 認証完了時に隔離ロールを解除します。
     隔離ロールが未設定・付与されていない場合は何もしません（エラーにしません）。
     ボタン認証・ウェブ認証の両方の完了処理から呼び出されます。"""
     role_id = cfg.get("arasi_quarantine_role_id")
@@ -4725,14 +4732,14 @@ async def help_command(interaction: discord.Interaction):
         name="一般ユーザー向け機能",
         value=(
             "`/help` : このコマンド一覧をあなただけに表示します\n"
-            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
+            "`/my scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
             "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
             "`/calc` : 数式を計算して結果を返します\n"
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
-            "`/iplogger_check` : URLがIPロガーでないかチェックします\n"
+            "`/server protect iplogger_check` : URLがIPロガーでないかチェックします\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
             "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
             "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
@@ -4756,12 +4763,12 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(
             name="管理者・許可ユーザー専用コマンド",
             value=(
-                "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
-                "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
-                "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
-                "`/say` : Botに指定したメッセージを代わりに発言させます\n"
+                "`/my scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
+                "`/my audit_perms` : @everyone の不適切な権限をスキャンします\n"
+                "`/my check_url` : URLの安全性をVirusTotalでチェックします\n"
+                "`/say text` : Botに指定したメッセージを代わりに発言させます\n"
                 "`/owner_dm send` : 指定ユーザーにDMを送信します\n"
-                "`/embed_builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
+                "`/embed builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
                 "`/moderation warn` : ユーザーに警告を付与します\n"
                 "`/moderation kick` : ユーザーをサーバーからキックします\n"
                 "`/moderation ban` : ユーザーをサーバーからBANします\n"
@@ -4800,11 +4807,11 @@ async def help_command(interaction: discord.Interaction):
         embed.add_field(
             name="サーバー管理者専用コマンド (2/2)",
             value=(
-                "`/welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
+                "`/server protect welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
                 "`/automod modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
                 "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
                 "`/automod ngword_add` / `/automod ngword_remove` : NGワードの追加・削除を行います\n"
-                "`/alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
+                "`/server protect alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
                 "`/antinuke toggle` : 不審な連続操作の自動検出を有効・無効にします\n"
                 "`/antinuke level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
                 "`/antinuke threshold` : 検出条件の操作回数・時間幅を設定します\n"
@@ -4846,7 +4853,7 @@ async def help_command(interaction: discord.Interaction):
     # --- 選択式クイック実行メニュー ---
     # 引数が不要（または全て省略可能）な代表的なコマンドのみを、権限に応じて表示する。
     general_actions = [
-        ("my_scan", "🔍 情報を見る (/my_scan)", "サーバー情報を表示します", my_scan.callback),
+        ("my_scan", "🔍 情報を見る (/my scan)", "サーバー情報を表示します", my_scan.callback),
         ("balance", "💰 残高確認 (/economy balance)", "自分のMコイン残高を確認します", balance.callback),
         ("board", "📋 掲示板を見る (/board list)", "サーバー掲示板ページのURLを表示します", board_command.callback),
         ("bump", "⬆️ bumpする (/board bump)", "サーバー掲示板の上位に上げます", bump_command.callback),
@@ -4872,7 +4879,7 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=HelpQuickActionView(quick_actions), ephemeral=True)
 
 
-@bot.tree.command(name="my_scan", description="サーバー情報、または指定ユーザーの基本情報を確認します")
+@my_group.command(name="scan", description="サーバー情報、または指定ユーザーの基本情報を確認します")
 async def my_scan(interaction: discord.Interaction, target_user: discord.User = None):
     if target_user:
         embed = discord.Embed(title="ユーザーデータスキャン結果", color=discord.Color.teal())
@@ -4917,7 +4924,7 @@ async def apology(interaction: discord.Interaction):
 
 
 
-@bot.tree.command(name="say", description="Botに指定したメッセージを代わりに発言させます")
+@say_group.command(name="text", description="Botに指定したメッセージを代わりに発言させます")
 @app_commands.describe(
     message="Botに発言させる内容",
     reply_to_message_id="このメッセージID宛に返信（リプライ）形式で送信したい場合に指定します（省略時は通常送信）"
@@ -5013,8 +5020,8 @@ async def say(interaction: discord.Interaction, message: str, reply_to_message_i
 
 
 # --------------------------------------------------------------------
-# /say_embed — /say のEmbed版（タイトル・本文・色などを指定して代わりに発言）
-# サーバー内・DM・グループDM いずれでも利用可能（権限は/sayと同様）
+# /say embed — /say text のEmbed版（タイトル・本文・色などを指定して代わりに発言）
+# サーバー内・DM・グループDM いずれでも利用可能（権限は/say textと同様）
 # --------------------------------------------------------------------
 
 _SAY_EMBED_COLORS = {
@@ -5031,7 +5038,7 @@ _SAY_EMBED_COLORS = {
 }
 
 
-@bot.tree.command(name="say_embed", description="Botに指定した内容でEmbedメッセージを代わりに発言させます")
+@say_group.command(name="embed", description="Botに指定した内容でEmbedメッセージを代わりに発言させます")
 @app_commands.describe(
     本文="Embedの本文（説明文）",
     タイトル="Embedのタイトル（省略可）",
@@ -5141,6 +5148,9 @@ async def say_embed(
         await interaction.response.send_message(
             f"メッセージの送信に失敗しました: {e}", ephemeral=True
         )
+
+
+@my_group.command(name="scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャンします")
 async def my_scan_channels(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
@@ -5174,7 +5184,7 @@ async def my_scan_channels(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="my_audit_perms", description="@everyoneの権限設定をスキャンします")
+@my_group.command(name="audit_perms", description="@everyoneの権限設定をスキャンします")
 async def my_audit_perms(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
@@ -5200,7 +5210,7 @@ async def my_audit_perms(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed, ephemeral=False)
 
 
-@bot.tree.command(name="my_check_url", description="URLの安全性をVirusTotalでチェックします")
+@my_group.command(name="check_url", description="URLの安全性をVirusTotalでチェックします")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def my_check_url(interaction: discord.Interaction, url: str):
@@ -6277,7 +6287,7 @@ async def antinuke_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="role_channel_mute", description="【管理者専用】指定ロールの、指定した複数チャンネルでの発言・スレッド作成権限をまとめてOFFにします")
+@server_protect_group.command(name="role_channel_mute", description="【管理者専用】指定ロールの、指定した複数チャンネルでの発言・スレッド作成権限をまとめてOFFにします")
 @discord.app_commands.describe(
     role="発言・スレッド作成を禁止するロール",
     channel1="対象チャンネル1（必須）",
@@ -6319,7 +6329,7 @@ async def role_channel_mute(
                 send_messages_in_threads=False,
                 create_public_threads=False,
                 create_private_threads=False,
-                reason=f"/role_channel_mute によりロール「{role.name}」の発言・スレッド作成権限をOFF（実行者: {interaction.user}）"
+                reason=f"/server protect role_channel_mute によりロール「{role.name}」の発言・スレッド作成権限をOFF（実行者: {interaction.user}）"
             )
             success_channels.append(channel.mention)
         except discord.Forbidden:
@@ -6342,7 +6352,7 @@ async def role_channel_mute(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="arasi_setup", description="【管理者専用】荒らし対策：隔離ロール作成＋新規ロールの権限自動制限を設定します")
+@server_protect_group.command(name="arasi_setup", description="【管理者専用】荒らし対策：隔離ロール作成＋新規ロールの権限自動制限を設定します")
 @discord.app_commands.describe(
     隔離ロール名="作成する隔離ロールの名前（未指定時は「隔離」）。既に同名ロールがあれば再利用します",
     認証チャンネル="隔離ロールでも閲覧を許可するチャンネル（認証用チャンネルなど。任意）",
@@ -6381,7 +6391,7 @@ async def arasi_setup(
             quarantine_role = await guild.create_role(
                 name=隔離ロール名,
                 permissions=discord.Permissions.none(),
-                reason="荒らし対策(/arasi_setup): 隔離ロールを作成"
+                reason="荒らし対策(/server protect arasi_setup): 隔離ロールを作成"
             )
             created_new_role = True
         except discord.Forbidden:
@@ -6403,14 +6413,14 @@ async def arasi_setup(
                     view_channel=True,
                     send_messages=False,
                     add_reactions=False,
-                    reason="荒らし対策(/arasi_setup): 認証チャンネルのみ隔離ロールに閲覧を許可"
+                    reason="荒らし対策(/server protect arasi_setup): 認証チャンネルのみ隔離ロールに閲覧を許可"
                 )
             else:
                 await channel.set_permissions(
                     quarantine_role,
                     view_channel=False,
                     send_messages=False,
-                    reason="荒らし対策(/arasi_setup): 隔離ロールを全チャンネル非表示に設定"
+                    reason="荒らし対策(/server protect arasi_setup): 隔離ロールを全チャンネル非表示に設定"
                 )
         except discord.Forbidden:
             channel_update_errors.append(channel.mention)
@@ -6874,7 +6884,7 @@ async def owner_set_avatar(
 
 # ====================================================================
 # セクション 8-EX: 追加機能コマンド群
-# /moderation slowmode / /poll / /welcome_setup / /server stats / /owner_dm send
+# /moderation slowmode / /poll / /server protect welcome_setup / /server stats / /owner_dm send
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -7172,10 +7182,10 @@ class PollView(discord.ui.View):
 
 
 # --------------------------------------------------------------------
-# /welcome_setup — ウェルカムメッセージ設定
+# /server protect welcome_setup — ウェルカムメッセージ設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="welcome_setup", description="【管理者専用】メンバー参加時のウェルカムメッセージを設定します")
+@server_protect_group.command(name="welcome_setup", description="【管理者専用】メンバー参加時のウェルカムメッセージを設定します")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="設定する", value="set"),
     discord.app_commands.Choice(name="解除する", value="reset"),
@@ -8472,7 +8482,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # セクション 11: eval コマンド（オーナー限定・コード実行）
 # ====================================================================
 
-@bot.tree.command(name="eval", description="【オーナー限定】Pythonコードを実行して結果を返します")
+@owner_group.command(name="eval", description="【オーナー限定】Pythonコードを実行して結果を返します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def eval_command(interaction: discord.Interaction, コード: str):
@@ -8592,7 +8602,7 @@ async def eval_command(interaction: discord.Interaction, コード: str):
 
 # ====================================================================
 # セクション 13: 追加機能コマンド群
-# /calc / /giveaway / /alt_check / /iplogger_check / /embed_builder
+# /calc / /giveaway / /server protect alt_check / /server protect iplogger_check / /embed builder
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -9036,10 +9046,10 @@ async def giveaway(
 
 
 # --------------------------------------------------------------------
-# /alt_check — 新規アカウント検知設定
+# /server protect alt_check — 新規アカウント検知設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="alt_check", description="【管理者専用】新規アカウント（垢BAN逃れ）の自動検知を設定します")
+@server_protect_group.command(name="alt_check", description="【管理者専用】新規アカウント（垢BAN逃れ）の自動検知を設定します")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -9099,10 +9109,10 @@ async def alt_check(
 
 
 # --------------------------------------------------------------------
-# /iplogger_check — IPロガー自動検知設定
+# /server protect iplogger_check — IPロガー自動検知設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="iplogger_check", description="【管理者専用】IPロガー・フィッシングリンクの自動検知・削除を設定します")
+@server_protect_group.command(name="iplogger_check", description="【管理者専用】IPロガー・フィッシングリンクの自動検知・削除を設定します")
 @discord.app_commands.choices(状態=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -9131,7 +9141,7 @@ async def iplogger_check(interaction: discord.Interaction, 状態: discord.app_c
 
 
 # --------------------------------------------------------------------
-# /embed_builder — GUIでEmbedを作成して送信（任意でModal付き回答パネルにできる）
+# /embed builder — GUIでEmbedを作成して送信（任意でModal付き回答パネルにできる）
 # --------------------------------------------------------------------
 
 class EmbedBuilderModal(discord.ui.Modal, title="Embed内容を入力"):
@@ -9728,7 +9738,7 @@ class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
         await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
 
 
-@bot.tree.command(name="embed_builder", description="【管理者専用】GUIでEmbedメッセージを作成してチャンネルに送信します")
+@embed_group.command(name="builder", description="【管理者専用】GUIでEmbedメッセージを作成してチャンネルに送信します")
 async def embed_builder(
     interaction: discord.Interaction,
     送信先チャンネル: discord.TextChannel = None,
@@ -11016,8 +11026,8 @@ async def sbl_role_clear(interaction: discord.Interaction):
 bot.tree.add_command(server_blacklist_group)
 
 
-@bot.tree.command(
-    name="admin_dashboard_link",
+@owner_group.command(
+    name="dashboard_link",
     description="【オーナー限定】荒らしサーバー一覧・荒らしユーザー一覧を表示するダッシュボードの秘密リンクを取得します"
 )
 async def admin_dashboard_link(interaction: discord.Interaction):
