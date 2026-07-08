@@ -287,6 +287,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "announce_role": None,
             "verify_channel": None,
             "verify_role": None,
+            "newspaper_role": None,
             "panel_roles": [],
             "mention_trigger_channel": None,
             "mention_target_role": None,
@@ -313,6 +314,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("custom_triggers", []),
         ("custom_commands", {}),
         ("allowed_roles", []),
+        ("newspaper_role", None),
+        ("newspaper_next_number", 1),
         ("welcome_channel_id", None),
         ("welcome_message", None),
         ("welcome_role_id", None),
@@ -1243,6 +1246,184 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message("認証が完了しました。", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+
+
+async def _is_newspaper_publisher(interaction: discord.Interaction) -> bool:
+    """実行者がサーバー管理者、または「新聞係」ロール保持者かどうかを判定します。"""
+    owner_id = await resolve_owner_id(interaction.client)
+    if interaction.user.id == owner_id:
+        return True
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return False
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    role_id = guild_config.get("newspaper_role")
+    if role_id:
+        role = interaction.guild.get_role(role_id)
+        if role and role in interaction.user.roles:
+            return True
+
+    await interaction.response.send_message(
+        "このコマンドはサーバー管理者、または「新聞係」ロールを持つ人のみ使用できます。",
+        ephemeral=True
+    )
+    return False
+
+
+class NewspaperModal(discord.ui.Modal, title="帝国新聞の内容を入力"):
+    """新聞発行用の入力フォーム（出来事・人事・お知らせ・新規入国者）。"""
+    newcomers = discord.ui.TextInput(
+        label="新規入国者（任意・改行区切りで複数可）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\nたろう さんが入国しました。",
+        required=False,
+        max_length=1000
+    )
+    events = discord.ui.TextInput(
+        label="帝国内の出来事（任意・改行区切りで複数可）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\n新しいイベント企画が始動しました。",
+        required=False,
+        max_length=1000
+    )
+    personnel = discord.ui.TextInput(
+        label="人事（任意・改行区切りで複数可）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\n○○ さんが「大臣」に就任しました。",
+        required=False,
+        max_length=1000
+    )
+    notices = discord.ui.TextInput(
+        label="お知らせ（任意・改行区切りで複数可）",
+        style=discord.TextStyle.paragraph,
+        placeholder="例:\n次回イベントは来週開催予定です。",
+        required=False,
+        max_length=1000
+    )
+
+    def __init__(self, target_channel: discord.TextChannel, issue_number: str):
+        super().__init__()
+        self.target_channel = target_channel
+        self.issue_number = issue_number
+
+    @staticmethod
+    def _format_section(raw_text: str) -> str:
+        """改行区切りの入力を「・」箇条書きに整形します。空欄なら「特になし」を返します。"""
+        raw_text = (raw_text or "").strip()
+        if not raw_text:
+            return "特になし"
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if not lines:
+            return "特になし"
+        return "\n".join(f"・{line}" for line in lines)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        member_count = guild.member_count
+        role_count = len(guild.roles)
+        publish_date = discord.utils.utcnow().strftime("%Y年%m月%d日")
+
+        newcomers_text = self._format_section(self.newcomers.value)
+        events_text = self._format_section(self.events.value)
+        personnel_text = self._format_section(self.personnel.value)
+        notices_text = self._format_section(self.notices.value)
+
+        embed = discord.Embed(
+            title=f"帝国新聞　第{self.issue_number}号",
+            color=discord.Color.dark_gold(),
+        )
+        embed.add_field(name="発行日", value=publish_date, inline=False)
+        embed.add_field(
+            name="【 建国・国勢 】",
+            value=(
+                f"・帝国国民：{member_count}名\n"
+                f"・新規入国者：\n{newcomers_text}\n"
+                f"・総ロール数：{role_count}個"
+            ),
+            inline=False
+        )
+        embed.add_field(name="【 帝国内の出来事 】", value=events_text, inline=False)
+        embed.add_field(name="【 人事 】", value=personnel_text, inline=False)
+        embed.add_field(name="【 お知らせ 】", value=notices_text, inline=False)
+        embed.add_field(
+            name="【 編集後記 】",
+            value="帝国新聞は、当帝国で起きた出来事を記録する広報誌です。次号もお楽しみに。",
+            inline=False
+        )
+        embed.set_footer(text=f"編集: {interaction.user.display_name}")
+
+        try:
+            await self.target_channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"[NG] {self.target_channel.mention} への送信権限がBotにありません。\n"
+                f"チャンネルの権限設定でBotロールに「メッセージを送信」を許可してください。",
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"送信に失敗しました: {e}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"[OK] {self.target_channel.mention} に帝国新聞　第{self.issue_number}号を発行しました。",
+            ephemeral=True
+        )
+
+
+class NewspaperPublishView(discord.ui.View):
+    """新聞発行用モーダルを開くためのボタン。"""
+    def __init__(self, target_channel: discord.TextChannel, issue_number: str, author_id: int):
+        super().__init__(timeout=300)
+        self.target_channel = target_channel
+        self.issue_number = issue_number
+        self.author_id = author_id
+
+    @discord.ui.button(label="内容を入力する", style=discord.ButtonStyle.primary, emoji="📰")
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("このボタンはコマンド実行者のみ使用できます。", ephemeral=True)
+            return
+        await interaction.response.send_modal(NewspaperModal(self.target_channel, self.issue_number))
+
+
+@bot.tree.command(name="newspaper_setup", description="【管理者専用】帝国新聞を発行できる「新聞係」ロールを設定します")
+@discord.app_commands.describe(role="新聞発行を許可するロール")
+async def newspaper_setup(interaction: discord.Interaction, role: discord.Role):
+    if not await is_guild_admin(interaction):
+        return
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["newspaper_role"] = role.id
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"[OK] {role.mention} を「新聞係」ロールに設定しました。このロールを持つ人は /newspaper で新聞を発行できます。",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="newspaper", description="【管理者・新聞係専用】帝国新聞を発行します")
+@discord.app_commands.describe(
+    channel="発行先チャンネル",
+    号数="新聞の号数（例: 3）"
+)
+async def newspaper(interaction: discord.Interaction, channel: discord.TextChannel, 号数: str):
+    if not await _is_newspaper_publisher(interaction):
+        return
+    await interaction.response.send_message(
+        f"「内容を入力する」を押して、出来事・人事・お知らせなどを入力してください。\n"
+        f"（発行先: {channel.mention} / 第{号数}号）",
+        view=NewspaperPublishView(channel, 号数, interaction.user.id),
+        ephemeral=True
+    )
 
 
 def _main_oauth_redirect_uri() -> str:
