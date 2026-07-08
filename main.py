@@ -508,6 +508,23 @@ server_mention_group = app_commands.Group(name="mention", description="自動ロ
 server_hiroyuki_group = app_commands.Group(name="hiroyuki", description="ひろゆき構文機能の管理", parent=server_group)
 server_config_group = app_commands.Group(name="config", description="サーバー構成のバックアップ・復元・コピー", parent=server_group)
 
+# --------------------------------------------------------------------
+# 追加のコマンドグループ（似た単体コマンド群をサブコマンド化してトップレベルの
+# スラッシュコマンド数をさらに削減するための定義。処理内容・ロジックは
+# 従来の各コマンドから一切変更していない）
+# --------------------------------------------------------------------
+moderation_group = app_commands.Group(name="moderation", description="【モデレーター専用】warn/moderation mute/ban/moderation kick/moderation purge/moderation slowmode 等のモデレーション操作")
+automod_group = app_commands.Group(name="automod", description="【モデレーター専用】自動モデレーション・NGワード・監査ログ出力先の設定")
+antinuke_group = app_commands.Group(name="antinuke", description="不審な連続操作の自動検出（antinuke）の設定")
+owner_group = app_commands.Group(name="owner", description="【オーナー限定】Botオーナー向けの各種管理コマンド")
+owner_dm_group = app_commands.Group(name="owner_dm", description="【オーナー・許可ユーザー専用】DM送信許可ユーザーの管理・DM送信")
+role_permission_group = app_commands.Group(name="role_permission", description="ロールごとの許可コマンド設定を管理")
+economy_group = app_commands.Group(name="economy", description="Mコイン（サーバー内通貨）の設定・確認・操作")
+voice_group = app_commands.Group(name="voice", description="ボイスチャンネルへの参加・退出・音声再生")
+troll_group = app_commands.Group(name="troll", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）の管理")
+board_group = app_commands.Group(name="board", description="サーバー掲示板の表示・管理・上位表示（bump）")
+newspaper_group = app_commands.Group(name="newspaper", description="帝国新聞の発行・発行設定")
+
 
 bot.tree.add_command(owner_trust_group)
 bot.tree.add_command(customtrigger_group)
@@ -518,6 +535,17 @@ bot.tree.add_command(vendingmachine_group)
 bot.tree.add_command(ticket_group)
 bot.tree.add_command(interview_group)
 bot.tree.add_command(server_group)
+bot.tree.add_command(moderation_group)
+bot.tree.add_command(automod_group)
+bot.tree.add_command(antinuke_group)
+bot.tree.add_command(owner_group)
+bot.tree.add_command(owner_dm_group)
+bot.tree.add_command(role_permission_group)
+bot.tree.add_command(economy_group)
+bot.tree.add_command(voice_group)
+bot.tree.add_command(troll_group)
+bot.tree.add_command(board_group)
+bot.tree.add_command(newspaper_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -1407,7 +1435,7 @@ class NewspaperPublishView(discord.ui.View):
         await interaction.response.send_modal(NewspaperModal(self.target_channel, self.issue_number))
 
 
-@bot.tree.command(name="newspaper_setup", description="【管理者専用】帝国新聞を発行できる「新聞係」ロールを設定します")
+@newspaper_group.command(name="setup", description="【管理者専用】帝国新聞を発行できる「新聞係」ロールを設定します")
 @discord.app_commands.describe(role="新聞発行を許可するロール")
 async def newspaper_setup(interaction: discord.Interaction, role: discord.Role):
     if not await is_guild_admin(interaction):
@@ -1417,12 +1445,12 @@ async def newspaper_setup(interaction: discord.Interaction, role: discord.Role):
     guild_config["newspaper_role"] = role.id
     save_data(all_data)
     await interaction.response.send_message(
-        f"[OK] {role.mention} を「新聞係」ロールに設定しました。このロールを持つ人は /newspaper で新聞を発行できます。",
+        f"[OK] {role.mention} を「新聞係」ロールに設定しました。このロールを持つ人は /newspaper publish で新聞を発行できます。",
         ephemeral=True
     )
 
 
-@bot.tree.command(name="newspaper", description="【管理者・新聞係専用】帝国新聞を発行します")
+@newspaper_group.command(name="publish", description="【管理者・新聞係専用】帝国新聞を発行します")
 @discord.app_commands.describe(
     channel="発行先チャンネル",
     号数="新聞の号数（例: 3）"
@@ -4702,11 +4730,11 @@ async def help_command(interaction: discord.Interaction):
             "`/calc` : 数式を計算して結果を返します\n"
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
-            "`/warnings` : 指定ユーザーの警告履歴を確認します\n"
+            "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
             "`/iplogger_check` : URLがIPロガーでないかチェックします\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
-            "`/gift` : 自分のコインを他のユーザーに贈ります\n"
+            "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
             "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
         ),
         inline=False
@@ -4714,9 +4742,9 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="ボイスチャンネル再生機能",
         value=(
-            "`/voice_join` : あなたのいるボイスチャンネルにBotを参加させます\n"
-            "`/voice_leave` : ボイスチャンネルから退出させます\n"
-            "`/voice_play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
+            "`/voice join` : あなたのいるボイスチャンネルにBotを参加させます\n"
+            "`/voice leave` : ボイスチャンネルから退出させます\n"
+            "`/voice play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
             "`/voice_sound list` : 登録済み音源の一覧を表示します\n"
             "`/voice_sound add` : 音源ファイルを名前付きで登録します（誰でも使用可能）\n"
             "`/voice_sound remove` : 登録済み音源を削除します（オーナー限定）"
@@ -4732,15 +4760,15 @@ async def help_command(interaction: discord.Interaction):
                 "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
                 "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
                 "`/say` : Botに指定したメッセージを代わりに発言させます\n"
-                "`/dm_user` : 指定ユーザーにDMを送信します\n"
+                "`/owner_dm send` : 指定ユーザーにDMを送信します\n"
                 "`/embed_builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
-                "`/warn` : ユーザーに警告を付与します\n"
-                "`/kick` : ユーザーをサーバーからキックします\n"
-                "`/ban` : ユーザーをサーバーからBANします\n"
-                "`/mute` : ユーザーをタイムアウト（ミュート）します\n"
-                "`/purge` : 指定件数のメッセージを一括削除します\n"
-                "`/slowmode` : チャンネルの低速モードを設定します\n"
-                "`/role_permission_add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
+                "`/moderation warn` : ユーザーに警告を付与します\n"
+                "`/moderation kick` : ユーザーをサーバーからキックします\n"
+                "`/moderation ban` : ユーザーをサーバーからBANします\n"
+                "`/moderation mute` : ユーザーをタイムアウト（ミュート）します\n"
+                "`/moderation purge` : 指定件数のメッセージを一括削除します\n"
+                "`/moderation slowmode` : チャンネルの低速モードを設定します\n"
+                "`/role_permission add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
             ),
             inline=False
         )
@@ -4773,15 +4801,15 @@ async def help_command(interaction: discord.Interaction):
             name="サーバー管理者専用コマンド (2/2)",
             value=(
                 "`/welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
-                "`/modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
-                "`/automod_toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
-                "`/automod_ngword_add` / `/automod_ngword_remove` : NGワードの追加・削除を行います\n"
+                "`/automod modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
+                "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
+                "`/automod ngword_add` / `/automod ngword_remove` : NGワードの追加・削除を行います\n"
                 "`/alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
-                "`/antinuke` : 不審な連続操作の自動検出を有効・無効にします\n"
-                "`/antinuke_level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
-                "`/antinuke_threshold` : 検出条件の操作回数・時間幅を設定します\n"
-                "`/antinuke_notify` : 通知先チャンネルと免除ロールを設定します\n"
-                "`/antinuke_status` : 現在の設定状況を確認します"
+                "`/antinuke toggle` : 不審な連続操作の自動検出を有効・無効にします\n"
+                "`/antinuke level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
+                "`/antinuke threshold` : 検出条件の操作回数・時間幅を設定します\n"
+                "`/antinuke notify` : 通知先チャンネルと免除ロールを設定します\n"
+                "`/antinuke status` : 現在の設定状況を確認します"
             ),
             inline=False
         )
@@ -4790,11 +4818,11 @@ async def help_command(interaction: discord.Interaction):
             name="BOT所有者専用コマンド",
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
-                "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
-                "`/owner_set_avatar` : BOTのプロフィール画像を変更します（画像添付またはURL指定）\n"
-                "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
-                "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
-                "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
+                "`/owner status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
+                "`/owner set_avatar` : BOTのプロフィール画像を変更します（画像添付またはURL指定）\n"
+                "`/owner guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
+                "`/owner guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
+                "`/owner broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
                 "`/owner_trust add` / `/owner_trust remove` / `/owner_trust list` : 信頼ユーザーの追加・削除・一覧管理を行います\n"
                 "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
             ),
@@ -4819,20 +4847,20 @@ async def help_command(interaction: discord.Interaction):
     # 引数が不要（または全て省略可能）な代表的なコマンドのみを、権限に応じて表示する。
     general_actions = [
         ("my_scan", "🔍 情報を見る (/my_scan)", "サーバー情報を表示します", my_scan.callback),
-        ("balance", "💰 残高確認 (/balance)", "自分のMコイン残高を確認します", balance.callback),
-        ("board", "📋 掲示板を見る (/board)", "サーバー掲示板ページのURLを表示します", board_command.callback),
-        ("bump", "⬆️ bumpする (/bump)", "サーバー掲示板の上位に上げます", bump_command.callback),
-        ("work", "💼 働く (/work)", "働いてMコインを稼ぎます", work.callback),
+        ("balance", "💰 残高確認 (/economy balance)", "自分のMコイン残高を確認します", balance.callback),
+        ("board", "📋 掲示板を見る (/board list)", "サーバー掲示板ページのURLを表示します", board_command.callback),
+        ("bump", "⬆️ bumpする (/board bump)", "サーバー掲示板の上位に上げます", bump_command.callback),
+        ("work", "💼 働く (/economy work)", "働いてMコインを稼ぎます", work.callback),
     ]
     admin_actions = [
         ("server_status", "⚙️ サーバー設定確認 (/server status)", "各種機能の設定状況を確認します", server_status.callback),
         ("server_list_users", "👥 許可ユーザー管理 (/server list_users)", "コマンド使用許可リストを確認・編集します", server_list_users.callback),
-        ("role_permission_list", "🔐 権限一覧 (/role_permission_list)", "管理コマンドの許可ロール/ユーザー一覧を見ます", role_permission_list.callback),
-        ("antinuke_status", "🛡️ antinuke状況 (/antinuke_status)", "antinukeの設定状況を確認します", antinuke_status.callback),
+        ("role_permission_list", "🔐 権限一覧 (/role_permission list)", "管理コマンドの許可ロール/ユーザー一覧を見ます", role_permission_list.callback),
+        ("antinuke_status", "🛡️ antinuke状況 (/antinuke status)", "antinukeの設定状況を確認します", antinuke_status.callback),
         ("dashboard", "📊 管理ダッシュボード (/dashboard)", "サーバーの統計・設定をまとめて確認します", dashboard_command.callback),
     ]
     owner_actions = [
-        ("owner_guilds", "🌐 導入サーバー一覧 (/owner_guilds)", "Bot導入中のサーバー一覧を表示します", owner_guilds.callback),
+        ("owner_guilds", "🌐 導入サーバー一覧 (/owner guilds)", "Bot導入中のサーバー一覧を表示します", owner_guilds.callback),
     ]
 
     quick_actions = list(general_actions)
@@ -5258,17 +5286,17 @@ async def server_list_users(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /dm_command_user_add — DMコマンド（/dm_user 等）を使える許可ユーザーを追加
+# /owner_dm user_add — DMコマンド（/owner_dm send 等）を使える許可ユーザーを追加
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="dm_command_user_add",
-    description="【管理者専用】/dm_user などのコマンド許可ユーザーに指定ユーザーを追加します"
+@owner_dm_group.command(
+    name="user_add",
+    description="【管理者専用】/owner_dm send などのコマンド許可ユーザーに指定ユーザーを追加します"
 )
 async def dm_command_user_add(interaction: discord.Interaction, ユーザー: discord.User):
     """
     指定したユーザーを、このサーバーの『コマンド使用許可ユーザー』（allowed_users）に追加します。
-    このリストに登録されたユーザーは /dm_user をはじめとする「管理者・許可ユーザー専用」コマンドを
+    このリストに登録されたユーザーは /owner_dm send をはじめとする「管理者・許可ユーザー専用」コマンドを
     使用できるようになります（is_admin_or_allowed / is_moderator が参照するリストと共通です）。
     """
     if not await is_guild_admin(interaction):
@@ -5293,7 +5321,7 @@ async def dm_command_user_add(interaction: discord.Interaction, ユーザー: di
 
     embed = discord.Embed(
         title="[OK] DMコマンド許可ユーザーを追加しました",
-        description=f"{ユーザー.mention}（`{ユーザー.id}`）が /dm_user などの許可ユーザーに追加されました。",
+        description=f"{ユーザー.mention}（`{ユーザー.id}`）が /owner_dm send などの許可ユーザーに追加されました。",
         color=discord.Color.green()
     )
     embed.set_footer(text=f"現在の登録人数: {len(allowed_users)}名 | /server list_users で一覧・削除も可能です")
@@ -5314,12 +5342,12 @@ async def dm_command_user_add(interaction: discord.Interaction, ユーザー: di
 
 
 # --------------------------------------------------------------------
-# /dm_command_user_remove — DMコマンドの許可ユーザーから除外
+# /owner_dm user_remove — DMコマンドの許可ユーザーから除外
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="dm_command_user_remove",
-    description="【管理者専用】/dm_user などのコマンド許可ユーザーから指定ユーザーを削除します"
+@owner_dm_group.command(
+    name="user_remove",
+    description="【管理者専用】/owner_dm send などのコマンド許可ユーザーから指定ユーザーを削除します"
 )
 async def dm_command_user_remove(interaction: discord.Interaction, ユーザー: discord.User):
     if not await is_guild_admin(interaction):
@@ -5364,11 +5392,11 @@ async def dm_command_user_remove(interaction: discord.Interaction, ユーザー:
 
 
 # --------------------------------------------------------------------
-# /role_permission_add — ロールへのサーバー管理コマンド権限付与
+# /role_permission add — ロールへのサーバー管理コマンド権限付与
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="role_permission_add",
+@role_permission_group.command(
+    name="add",
     description="【管理者専用】指定ロールにサーバー管理コマンドの使用権限を付与します"
 )
 @discord.app_commands.describe(
@@ -5416,16 +5444,16 @@ async def role_permission_add(interaction: discord.Interaction, role: discord.Ro
         value="\n".join([f"・<@&{rid}>" for rid in allowed_roles]) or "なし",
         inline=False
     )
-    embed.set_footer(text="/role_permission_list で確認 | /role_permission_remove で削除")
+    embed.set_footer(text="/role_permission list で確認 | /role_permission remove で削除")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------
-# /role_permission_remove — ロールの管理コマンド権限を剥奪
+# /role_permission remove — ロールの管理コマンド権限を剥奪
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="role_permission_remove",
+@role_permission_group.command(
+    name="remove",
     description="【管理者専用】指定ロールからサーバー管理コマンドの使用権限を削除します"
 )
 @discord.app_commands.describe(
@@ -5472,16 +5500,16 @@ async def role_permission_remove(interaction: discord.Interaction, role: discord
         value="\n".join([f"・<@&{rid}>" for rid in remaining]) or "なし（管理者のみ使用可能）",
         inline=False
     )
-    embed.set_footer(text="/role_permission_list で確認")
+    embed.set_footer(text="/role_permission list で確認")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------
-# /role_permission_list — 許可ロール一覧の確認
+# /role_permission list — 許可ロール一覧の確認
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="role_permission_list",
+@role_permission_group.command(
+    name="list",
     description="【管理者専用】管理コマンドの使用権限が付与されているロール一覧を確認します"
 )
 async def role_permission_list(interaction: discord.Interaction):
@@ -5533,7 +5561,7 @@ async def role_permission_list(interaction: discord.Interaction):
     else:
         embed.add_field(name="👤 許可ユーザー", value="登録なし", inline=False)
 
-    embed.set_footer(text="/role_permission_add でロール追加 | /server list_users でユーザー管理")
+    embed.set_footer(text="/role_permission add でロール追加 | /server list_users でユーザー管理")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -6134,7 +6162,7 @@ async def server_copy(interaction: discord.Interaction, コピー元のサーバ
     print(f"[サーバーコピー確認] {interaction.guild.name} でコピー確認画面を表示 (by {interaction.user})")
 
 
-@bot.tree.command(name="antinuke", description="不審な連続操作の自動検出をON/OFFします")
+@antinuke_group.command(name="toggle", description="不審な連続操作の自動検出をON/OFFします")
 @discord.app_commands.choices(状態=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -6152,14 +6180,14 @@ async def antinuke(interaction: discord.Interaction, 状態: discord.app_command
         msg = (
             "antinukeを有効にしました。\n"
             f"現在の検出条件: {cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回の不審な操作で発動します。\n"
-            "設定変更は /antinuke_level /antinuke_threshold /antinuke_notify で行えます。"
+            "設定変更は /antinuke level /antinuke threshold /antinuke notify で行えます。"
         )
     else:
         msg = "antinukeを無効にしました。"
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="antinuke_level", description="検出時の対応レベルを設定します（ロール剥奪 or BAN）")
+@antinuke_group.command(name="level", description="検出時の対応レベルを設定します（ロール剥奪 or BAN）")
 @discord.app_commands.choices(対応=[
     discord.app_commands.Choice(name="ロール剥奪のみ（推奨）", value="role_strip"),
     discord.app_commands.Choice(name="BANを試行する", value="ban"),
@@ -6176,7 +6204,7 @@ async def antinuke_level(interaction: discord.Interaction, 対応: discord.app_c
     await interaction.response.send_message(f"対応レベルを「{対応.name}」に設定しました。", ephemeral=True)
 
 
-@bot.tree.command(name="antinuke_threshold", description="何秒間に何回の操作で検出するかを設定します（デフォルト: 10秒で3回）")
+@antinuke_group.command(name="threshold", description="何秒間に何回の操作で検出するかを設定します（デフォルト: 10秒で3回）")
 async def antinuke_threshold(
     interaction: discord.Interaction,
     回数: app_commands.Range[int, 1, 50],
@@ -6198,7 +6226,7 @@ async def antinuke_threshold(
     )
 
 
-@bot.tree.command(name="antinuke_notify", description="通知先チャンネルと、検出から除外するロールを設定します")
+@antinuke_group.command(name="notify", description="通知先チャンネルと、検出から除外するロールを設定します")
 async def antinuke_notify(
     interaction: discord.Interaction,
     通知先チャンネル: discord.TextChannel = None,
@@ -6228,7 +6256,7 @@ async def antinuke_notify(
     if not changed:
         await interaction.response.send_message(
             "変更するパラメータを1つ以上指定してください（通知先チャンネル / 免除ロール / 免除ロール解除）。\n"
-            "現在の設定は /antinuke_status で確認できます。",
+            "現在の設定は /antinuke status で確認できます。",
             ephemeral=True
         )
         return
@@ -6236,7 +6264,7 @@ async def antinuke_notify(
     await interaction.response.send_message("\n".join(changed), ephemeral=True)
 
 
-@bot.tree.command(name="antinuke_status", description="現在のantinuke設定状況を確認します")
+@antinuke_group.command(name="status", description="現在のantinuke設定状況を確認します")
 async def antinuke_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction):
         return
@@ -6245,7 +6273,7 @@ async def antinuke_status(interaction: discord.Interaction):
     all_data = load_data()
     cfg = get_antinuke_config(all_data, str(interaction.guild.id))
     embed = _build_antinuke_status_embed(interaction.guild, cfg)
-    embed.set_footer(text="設定変更: /antinuke /antinuke_level /antinuke_threshold /antinuke_notify")
+    embed.set_footer(text="設定変更: /antinuke toggle /antinuke level /antinuke threshold /antinuke notify")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -6419,7 +6447,7 @@ async def arasi_setup(
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="warn", description="【モデレーター専用】ユーザーに警告を与えます")
+@moderation_group.command(name="warn", description="【モデレーター専用】ユーザーに警告を与えます")
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -6436,7 +6464,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
         pass
 
 
-@bot.tree.command(name="warnings", description="【モデレーター専用】ユーザーの警告履歴を確認します")
+@moderation_group.command(name="warnings", description="【モデレーター専用】ユーザーの警告履歴を確認します")
 async def warnings(interaction: discord.Interaction, user: discord.Member):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -6452,7 +6480,7 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="mute", description="【モデレーター専用】ユーザーを一時的にミュート（タイムアウト）します")
+@moderation_group.command(name="mute", description="【モデレーター専用】ユーザーを一時的にミュート（タイムアウト）します")
 async def mute(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -6477,7 +6505,7 @@ class BanTrollListView(discord.ui.View):
     async def add_to_list(self, interaction: discord.Interaction, button: discord.ui.Button):
         all_data = load_data()
         uid_str = str(self.member.id)
-        add_to_troll_list(all_data, self.member, self.guild, reason=f"/ban コマンド: {self.reason}")
+        add_to_troll_list(all_data, self.member, self.guild, reason=f"/moderation ban コマンド: {self.reason}")
         save_data(all_data)
         await _post_troll_board(all_data, uid_str)
         for item in self.children:
@@ -6504,7 +6532,7 @@ class BanTrollListView(discord.ui.View):
         )
 
 
-@bot.tree.command(name="ban", description="【モデレーター専用】ユーザーをBANします")
+@moderation_group.command(name="ban", description="【モデレーター専用】ユーザーをBANします")
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -6520,7 +6548,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
         await interaction.response.send_message("権限が不足しているためBANできません。", ephemeral=True)
 
 
-@bot.tree.command(name="kick", description="【モデレーター専用】ユーザーをキックします")
+@moderation_group.command(name="kick", description="【モデレーター専用】ユーザーをキックします")
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -6530,7 +6558,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: s
         await interaction.response.send_message("権限が不足しているためキックできません。", ephemeral=True)
 
 
-@bot.tree.command(name="purge", description="【モデレーター専用】現在のチャンネルのメッセージを一括削除します")
+@moderation_group.command(name="purge", description="【モデレーター専用】現在のチャンネルのメッセージを一括削除します")
 async def purge(interaction: discord.Interaction, amount: int):
     if not await is_moderator(interaction): return
     if amount < 1 or amount > 100:
@@ -6544,7 +6572,7 @@ async def purge(interaction: discord.Interaction, amount: int):
         await interaction.followup.send("権限が不足しているため削除できません。", ephemeral=True)
 
 
-@bot.tree.command(name="automod_toggle", description="【モデレーター専用】自動モデレーションのON/OFFを切り替えます")
+@automod_group.command(name="toggle", description="【モデレーター専用】自動モデレーションのON/OFFを切り替えます")
 @discord.app_commands.choices(機能=[
     discord.app_commands.Choice(name="スパム検知", value="spam"),
     discord.app_commands.Choice(name="招待リンク削除", value="invite"),
@@ -6563,7 +6591,7 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
     await interaction.response.send_message(f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。", ephemeral=True)
 
 
-@bot.tree.command(name="automod_ngword_add", description="【モデレーター専用】NGワードを追加します")
+@automod_group.command(name="ngword_add", description="【モデレーター専用】NGワードを追加します")
 async def automod_ngword_add(interaction: discord.Interaction, word: str):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -6575,7 +6603,7 @@ async def automod_ngword_add(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"[追加] NGワードに「{word}」を追加しました。", ephemeral=True)
 
 
-@bot.tree.command(name="automod_ngword_remove", description="【モデレーター専用】NGワードを削除します")
+@automod_group.command(name="ngword_remove", description="【モデレーター専用】NGワードを削除します")
 async def automod_ngword_remove(interaction: discord.Interaction, word: str):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -6587,7 +6615,7 @@ async def automod_ngword_remove(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"[削除] NGワードから「{word}」を削除しました。", ephemeral=True)
 
 
-@bot.tree.command(name="modlog_set", description="【モデレーター専用】監査ログの出力先チャンネルを設定します")
+@automod_group.command(name="modlog_set", description="【モデレーター専用】監査ログの出力先チャンネルを設定します")
 async def modlog_set(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -6602,7 +6630,7 @@ async def modlog_set(interaction: discord.Interaction, channel: discord.TextChan
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="owner_status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
+@owner_group.command(name="status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
@@ -6618,7 +6646,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="owner_guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
+@owner_group.command(name="guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
 async def owner_guilds(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -6631,7 +6659,7 @@ async def owner_guilds(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="owner_guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
+@owner_group.command(name="guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
 async def owner_guild_detail(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -6648,7 +6676,7 @@ async def owner_guild_detail(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="owner_broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します")
+@owner_group.command(name="broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します")
 async def owner_broadcast(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -6714,13 +6742,13 @@ async def owner_trust_list(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /owner_set_avatar — サーバープロフィール画像を変更する（オーナー専用）
+# /owner set_avatar — サーバープロフィール画像を変更する（オーナー専用）
 # Discord の PATCH /applications/@me/guilds/{guild_id} を使い、
 # そのサーバー内でのみ表示されるアバターを設定します。
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="owner_set_avatar",
+@owner_group.command(
+    name="set_avatar",
     description="【オーナー限定】このサーバー専用のBOTプロフィール画像を設定します（サーバープロフィール）"
 )
 @discord.app_commands.describe(
@@ -6846,14 +6874,14 @@ async def owner_set_avatar(
 
 # ====================================================================
 # セクション 8-EX: 追加機能コマンド群
-# /slowmode / /poll / /welcome_setup / /server stats / /dm_user
+# /moderation slowmode / /poll / /welcome_setup / /server stats / /owner_dm send
 # ====================================================================
 
 # --------------------------------------------------------------------
-# /slowmode
+# /moderation slowmode
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="slowmode", description="【モデレーター専用】チャンネルのスロウモードを設定・解除します")
+@moderation_group.command(name="slowmode", description="【モデレーター専用】チャンネルのスロウモードを設定・解除します")
 async def slowmode(
     interaction: discord.Interaction,
     秒数: app_commands.Range[int, 0, 21600],
@@ -7441,10 +7469,10 @@ async def server_stats(
 
 
 # --------------------------------------------------------------------
-# /dm_user — 特定ユーザーへのDM送信
+# /owner_dm send — 特定ユーザーへのDM送信
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="dm_user", description="【オーナー・許可ユーザー専用】指定したユーザーにBotからDMを送信します")
+@owner_dm_group.command(name="send", description="【オーナー・許可ユーザー専用】指定したユーザーにBotからDMを送信します")
 async def dm_user(
     interaction: discord.Interaction,
     ユーザー: discord.User,
@@ -7733,9 +7761,9 @@ async def customcmd(interaction: discord.Interaction, 名前: str):
 # ====================================================================
 # セクション 10: ボイスチャンネル再生機能
 # ====================================================================
-# ① /voice_join  : ボイスチャンネルに参加
-# ② /voice_leave : ボイスチャンネルから退出
-# ③ /voice_play  : 添付ファイルまたは登録済み音源を再生（コントロールパネル付き）
+# ① /voice join  : ボイスチャンネルに参加
+# ② /voice leave : ボイスチャンネルから退出
+# ③ /voice play  : 添付ファイルまたは登録済み音源を再生（コントロールパネル付き）
 # ④ /voice_sound add / remove / list : サーバーごとの登録済み音源管理（オーナー限定）
 # ====================================================================
 
@@ -7766,7 +7794,7 @@ def get_registered_sounds(all_data: dict, guild_id_str: str) -> dict:
 
 class VoicePlayApprovalView(discord.ui.View):
     """
-    /voice_play 実行時にオーナーのDMへ送る「再生許可申請」ビューです。
+    /voice play 実行時にオーナーのDMへ送る「再生許可申請」ビューです。
     オーナーが許可すると実際の再生が開始されます。
     """
     def __init__(
@@ -8132,7 +8160,7 @@ async def _ensure_voice_connected(interaction: discord.Interaction) -> discord.V
     return voice_client
 
 
-@bot.tree.command(name="voice_join", description="あなたが参加しているボイスチャンネルにBotを参加させます")
+@voice_group.command(name="join", description="あなたが参加しているボイスチャンネルにBotを参加させます")
 async def voice_join(interaction: discord.Interaction):
     voice_client = await _ensure_voice_connected(interaction)
     if voice_client is None:
@@ -8140,7 +8168,7 @@ async def voice_join(interaction: discord.Interaction):
     await interaction.response.send_message(f"{voice_client.channel.mention} に参加しました。", ephemeral=True)
 
 
-@bot.tree.command(name="voice_leave", description="ボイスチャンネルからBotを退出させます")
+@voice_group.command(name="leave", description="ボイスチャンネルからBotを退出させます")
 async def voice_leave(interaction: discord.Interaction):
     if not interaction.guild or not interaction.guild.voice_client:
         await interaction.response.send_message("Botは現在どのボイスチャンネルにも参加していません。", ephemeral=True)
@@ -8150,7 +8178,7 @@ async def voice_leave(interaction: discord.Interaction):
     await interaction.response.send_message(f"「{channel_name}」から退出しました。", ephemeral=True)
 
 
-@bot.tree.command(name="voice_play", description="ボイスチャンネルで音声ファイルを再生します（添付または登録済み音源）")
+@voice_group.command(name="play", description="ボイスチャンネルで音声ファイルを再生します（添付または登録済み音源）")
 async def voice_play(
     interaction: discord.Interaction,
     添付ファイル: discord.Attachment = None,
@@ -8352,7 +8380,7 @@ async def voice_sound_add(interaction: discord.Interaction, 登録名: str, フ�
         await interaction.followup.send(f"登録名「{登録名}」の音源を更新しました。", ephemeral=True)
     else:
         await interaction.followup.send(
-            f"音源を登録しました。\n`/voice_play 登録名:{登録名}` で再生できます。",
+            f"音源を登録しました。\n`/voice play 登録名:{登録名}` で再生できます。",
             ephemeral=True
         )
 
@@ -8399,7 +8427,7 @@ async def voice_sound_list(interaction: discord.Interaction):
         embed.description = "登録されている音源はありません。\n`/voice_sound add` で登録できます。"
     else:
         embed.description = "\n".join([f"・`{name}`" for name in sounds.keys()])
-        embed.set_footer(text=f"登録数: {len(sounds)}件 | /voice_play 登録名:<名前> で再生できます")
+        embed.set_footer(text=f"登録数: {len(sounds)}件 | /voice play 登録名:<名前> で再生できます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -9065,7 +9093,7 @@ async def alt_check(
         f"alt_check を有効にしました。\n"
         f"・閾値: アカウント作成から **{cfg['alt_check_days']}日未満** で反応\n"
         f"・アクション: **{action_label}**\n"
-        "ログチャンネルを設定していない場合は通知が届きません（`/modlog_set` で設定してください）。",
+        "ログチャンネルを設定していない場合は通知が届きません（`/automod modlog_set` で設定してください）。",
         ephemeral=True
     )
 
@@ -9737,7 +9765,7 @@ async def embed_builder(
 # 注意:
 #   ・通貨の稼ぎ方は「メッセージ送信」のみで、クールダウン（既定60秒）を必ず挟みます。
 #     これにより連投・自動送信スクリプトによる無制限な稼ぎを防止します。
-#   ・管理者は /economy_give で手動付与・没収ができますが、乱用防止のため
+#   ・管理者は /economy give で手動付与・没収ができますが、乱用防止のため
 #     実行ログ（コマンド実行者）が Embed のフッターに残るようにしています。
 # --------------------------------------------------------------------
 
@@ -9748,10 +9776,10 @@ def _format_currency(guild_config: dict, amount: int) -> str:
 
 
 # --------------------------------------------------------------------
-# /economy_setup — 経済システムの有効化・各種パラメータ設定
+# /economy setup — 経済システムの有効化・各種パラメータ設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="economy_setup", description="【管理者専用】通貨システム（メッセージ報酬・workコマンド）を設定します")
+@economy_group.command(name="setup", description="【管理者専用】通貨システム（メッセージ報酬・workコマンド）を設定します")
 @discord.app_commands.describe(
     有効化="経済システムを有効化するか",
     通貨名="表示する通貨の名前（例: コイン、ポイント）",
@@ -9846,7 +9874,7 @@ async def economy_setup(
 # /balance — 所持金確認（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="balance", description="自分または指定したユーザーのMコイン所持金（財布・銀行）を確認します")
+@economy_group.command(name="balance", description="自分または指定したユーザーのMコイン所持金（財布・銀行）を確認します")
 async def balance(interaction: discord.Interaction, ユーザー: discord.Member = None):
     target = ユーザー or interaction.user
     all_data = load_data()
@@ -9870,7 +9898,7 @@ async def balance(interaction: discord.Interaction, ユーザー: discord.Member
 # /work — 全サーバー共通クールダウンでMコインを稼ぐ
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="work", description="働いてMコインを稼ぎます（2時間ごとに1回・全サーバー共通）")
+@economy_group.command(name="work", description="働いてMコインを稼ぎます（2時間ごとに1回・全サーバー共通）")
 async def work(interaction: discord.Interaction):
     all_data = load_data()
 
@@ -9879,7 +9907,7 @@ async def work(interaction: discord.Interaction):
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         if not cfg.get("economy_enabled", False):
             await interaction.response.send_message(
-                "このサーバーでは経済システムが有効になっていません。管理者に /economy_setup での有効化を依頼してください。",
+                "このサーバーでは経済システムが有効になっていません。管理者に /economy setup での有効化を依頼してください。",
                 ephemeral=True
             )
             return
@@ -9940,10 +9968,10 @@ async def work(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /economy_give — オーナーによる手動付与・没収（グローバルMコイン対応）
+# /economy give — オーナーによる手動付与・没収（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="economy_give", description="【オーナー専用】指定ユーザーのMコイン（財布）を増減させます")
+@economy_group.command(name="give", description="【オーナー専用】指定ユーザーのMコイン（財布）を増減させます")
 @discord.app_commands.describe(
     ユーザー="対象ユーザー",
     金額="増減させる金額（負の数を指定すると没収）"
@@ -9977,7 +10005,7 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
 # /gift — 他のユーザーへコインをギフト
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="gift", description="自分のコインを他のユーザーに贈ります")
+@economy_group.command(name="gift", description="自分のコインを他のユーザーに贈ります")
 @discord.app_commands.describe(
     ユーザー="贈り先のユーザー",
     金額="贈る金額（1以上）",
@@ -12483,7 +12511,7 @@ async def _start_web_server():
 # 銀行機能 (/bank) — 預け入れ・引き出し・残高確認
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="bank", description="Mコインの銀行機能（預け入れ・引き出し）を使います")
+@economy_group.command(name="bank", description="Mコインの銀行機能（預け入れ・引き出し）を使います")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(操作=[
@@ -12567,10 +12595,10 @@ async def bank(
 
 
 # --------------------------------------------------------------------
-# Mコイン設定（オーナー専用） — /owner_mcoin_setup
+# Mコイン設定（オーナー専用） — /owner mcoin_setup
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="owner_mcoin_setup", description="【オーナー限定】グローバルMコインの設定を変更します（全サーバー共通）")
+@owner_group.command(name="mcoin_setup", description="【オーナー限定】グローバルMコインの設定を変更します（全サーバー共通）")
 @discord.app_commands.describe(
     コイン名="コインの名前（デフォルト: Mコイン）",
     work最小報酬="/workコマンドの最小報酬",
@@ -12642,10 +12670,10 @@ async def owner_mcoin_setup(
 
 
 # --------------------------------------------------------------------
-# 荒らしリスト — /troll_list
+# 荒らしリスト — /troll list
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="troll_list", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）を確認します")
+@troll_group.command(name="list", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）を確認します")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name=" 一覧表示", value="list"),
     discord.app_commands.Choice(name=" ユーザー検索", value="search"),
@@ -12660,7 +12688,7 @@ async def troll_list(
     理由: str = None,
 ):
     """
-    サーバーBLによるBANや /ban コマンドでBANされたユーザーを全サーバーで共有するリストです。
+    サーバーBLによるBANや /moderation ban コマンドでBANされたユーザーを全サーバーで共有するリストです。
     ユーザー名・ID・プロフィール画像・BAN理由・登録日・BAN済みサーバーを保存します。
     """
     if not await is_moderator(interaction):
@@ -12770,11 +12798,11 @@ async def troll_list(
 
 
 # --------------------------------------------------------------------
-# AutoMod バッジ取得支援コマンド — /automod_badge_setup
+# AutoMod バッジ取得支援コマンド — /automod badge_setup
 # Discord AutoMod バッジ: https://support-dev.discord.com/hc/ja/articles/13847462843543
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="automod_badge_setup", description="【管理者専用】DiscordのAutoModバッジを取得するための設定をガイドします")
+@automod_group.command(name="badge_setup", description="【管理者専用】DiscordのAutoModバッジを取得するための設定をガイドします")
 async def automod_badge_setup(interaction: discord.Interaction):
     """
     Discord AutoModバッジ（開発者バッジ）を取得するための設定を自動化します。
@@ -12920,7 +12948,7 @@ async def automod_badge_setup(interaction: discord.Interaction):
 
 SELL_COOLDOWN_SECONDS = 7 * 24 * 3600  # 1週間
 
-@bot.tree.command(name="sell", description="週に一回、Mコインを売ってポイントを受け取ります")
+@economy_group.command(name="sell", description="週に一回、Mコインを売ってポイントを受け取ります")
 @discord.app_commands.describe(amount="売るMコインの枚数（1以上）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
@@ -12984,11 +13012,11 @@ async def sell(interaction: discord.Interaction, amount: int):
 
 
 # --------------------------------------------------------------------
-# /troll_autoban_toggle — 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF
+# /troll autoban_toggle — 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="troll_autoban_toggle",
+@troll_group.command(
+    name="autoban_toggle",
     description="【管理者専用】荒らしリスト（ブラックリスト）に登録済みのユーザーが参加した際に自動BANする機能のON/OFFを切り替えます"
 )
 async def troll_autoban_toggle(interaction: discord.Interaction):
@@ -13010,7 +13038,7 @@ async def troll_autoban_toggle(interaction: discord.Interaction):
         desc = (
             "荒らしリスト（ブラックリスト）登録済みユーザーの**自動BAN**を有効にしました。\n"
             "今後、登録済みユーザーが参加すると即座にBANされます。\n"
-            "（通知先はモデレーションログチャンネルの設定に従います。`/modlog_set` で未設定の場合は通知されません）"
+            "（通知先はモデレーションログチャンネルの設定に従います。`/automod modlog_set` で未設定の場合は通知されません）"
         )
         color = discord.Color.green()
     else:
@@ -13022,11 +13050,11 @@ async def troll_autoban_toggle(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /troll_board_set — ブラックリスト情報掲載チャンネルの設定
+# /troll board_set — ブラックリスト情報掲載チャンネルの設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(
-    name="troll_board_set",
+@troll_group.command(
+    name="board_set",
     description="【管理者専用】荒らしリスト（ブラックリスト）情報を自動投稿するチャンネルを設定します"
 )
 @discord.app_commands.describe(
@@ -13524,11 +13552,11 @@ async def _guild_dashboard_toggle_handler(request):
 
 # --------------------------------------------------------------------
 # サーバー掲示板：データ永続化・URL/トークン生成ヘルパー
-# （/board, /board_manage, /bump および Webの各ハンドラから参照される）
+# （/board, /board manage, /bump および Webの各ハンドラから参照される）
 # --------------------------------------------------------------------
 
 SERVER_BOARD_BUMP_COOLDOWN_SECONDS = 3600  # bumpの再実行までのクールダウン（秒）= 1時間
-BOARD_MANAGE_TOKEN_TTL = 1800   # /board_manage の本人専用リンクの有効期限（秒）= 30分
+BOARD_MANAGE_TOKEN_TTL = 1800   # /board manage の本人専用リンクの有効期限（秒）= 30分
 BOARD_SESSION_TOKEN_TTL = 1800  # 掲示板Webログインのセッション有効期限（秒）= 30分
 
 if os.path.exists("/app/data"):
@@ -13697,7 +13725,7 @@ def _verify_board_session_token(session_token: str):
 
 
 def _generate_board_manage_token(guild_id: int, user_id: int) -> str:
-    """/board_manage コマンドが発行する、本人専用の掲示板管理リンク用トークンを生成します。"""
+    """/board manage コマンドが発行する、本人専用の掲示板管理リンク用トークンを生成します。"""
     import hmac
     import hashlib
     expiry = int(time.time()) + BOARD_MANAGE_TOKEN_TTL
@@ -13725,7 +13753,7 @@ def _verify_board_manage_token(token: str):
 
 
 def _build_board_manage_url(guild_id: int, user_id: int) -> str:
-    """/board_manage コマンド用の、本人専用掲示板管理ページURLを生成します。"""
+    """/board manage コマンド用の、本人専用掲示板管理ページURLを生成します。"""
     parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
     base = f"{parsed.scheme}://{parsed.netloc}"
     token = _generate_board_manage_token(guild_id, user_id)
@@ -13751,7 +13779,7 @@ async def _board_bump_reminder_task(user_id: int, guild_id: int, guild_name: str
         print(f"[サーバー掲示板] bumpリマインダーDM送信失敗: {e}")
 
 
-@bot.tree.command(name="board_manage", description="【管理者専用】サーバー掲示板の登録・編集ページへの本人専用リンクを発行します")
+@board_group.command(name="manage", description="【管理者専用】サーバー掲示板の登録・編集ページへの本人専用リンクを発行します")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def board_manage_command(interaction: discord.Interaction):
@@ -13783,7 +13811,7 @@ async def board_manage_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="board", description="サーバー掲示板の一覧ページのURLを表示します")
+@board_group.command(name="list", description="サーバー掲示板の一覧ページのURLを表示します")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def board_command(interaction: discord.Interaction):
@@ -13803,7 +13831,7 @@ async def board_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="bump", description="このサーバーをサーバー掲示板の上位に上げます（1時間に1回）")
+@board_group.command(name="bump", description="このサーバーをサーバー掲示板の上位に上げます（1時間に1回）")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def bump_command(interaction: discord.Interaction):
@@ -13822,7 +13850,7 @@ async def bump_command(interaction: discord.Interaction):
 
     if entry is None:
         await interaction.response.send_message(
-            "このサーバーはまだサーバー掲示板に登録されていません。管理者が /board_manage コマンド、または掲示板ページから登録してください。",
+            "このサーバーはまだサーバー掲示板に登録されていません。管理者が /board manage コマンド、または掲示板ページから登録してください。",
             ephemeral=True
         )
         return
@@ -14321,7 +14349,7 @@ def _resolve_board_manage_request(request):
     """
     /board/manage への GET/POST 両方に対応するアクセス解決処理です。
     次の2方式のいずれかで guild_id / user_id / access_query（再利用用クエリ文字列）を解決します。
-      (a) token 方式: /board_manage コマンドで発行した本人専用リンク（guild固定）
+      (a) token 方式: /board manage コマンドで発行した本人専用リンク（guild固定）
       (b) session 方式: 掲示板ページからのログイン後、guild_id をクエリで指定
     戻り値: (guild_id, user_id, access_query, error_message)
     """
@@ -14329,7 +14357,7 @@ def _resolve_board_manage_request(request):
     if token:
         result = _verify_board_manage_token(token)
         if result is None:
-            return None, None, None, "このリンクは無効か、有効期限（発行から30分）が切れています。Discordで /board_manage を再実行してください。"
+            return None, None, None, "このリンクは無効か、有効期限（発行から30分）が切れています。Discordで /board manage を再実行してください。"
         guild_id, user_id = result
         access_query = urllib.parse.urlencode({"token": token})
         return guild_id, user_id, access_query, None
@@ -14347,7 +14375,7 @@ def _resolve_board_manage_request(request):
         access_query = urllib.parse.urlencode({"session": session_token, "guild_id": guild_id})
         return guild_id, user_id, access_query, None
 
-    return None, None, None, "アクセス情報が不足しています。Discordで /board_manage を実行するか、サーバー掲示板ページからログインしてください。"
+    return None, None, None, "アクセス情報が不足しています。Discordで /board manage を実行するか、サーバー掲示板ページからログインしてください。"
 
 
 async def _board_manage_handler(request):
