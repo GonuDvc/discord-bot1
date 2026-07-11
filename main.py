@@ -4774,6 +4774,7 @@ async def help_command(interaction: discord.Interaction):
                 "`/moderation ban` : ユーザーをサーバーからBANします\n"
                 "`/moderation mute` : ユーザーをタイムアウト（ミュート）します\n"
                 "`/moderation purge` : 指定件数のメッセージを一括削除します\n"
+                "`/moderation purge_user` : 指定チャンネル内の指定メンバーのメッセージのみ一括削除します\n"
                 "`/moderation slowmode` : チャンネルの低速モードを設定します\n"
                 "`/role_permission add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
             ),
@@ -6580,6 +6581,50 @@ async def purge(interaction: discord.Interaction, amount: int):
         await interaction.followup.send(f"[一括削除] {len(deleted)} 件のメッセージを削除しました。", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send("権限が不足しているため削除できません。", ephemeral=True)
+
+
+@moderation_group.command(name="purge_user", description="【モデレーター専用】指定チャンネル内の指定メンバーのメッセージを一括削除します")
+@app_commands.describe(
+    member="メッセージを削除する対象メンバー",
+    channel="対象チャンネル（省略時は現在のチャンネル）",
+    amount="遡って確認するメッセージ件数（1〜1000、既定200）。この件数の中から対象メンバーの発言のみ削除します"
+)
+async def purge_user(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    channel: Optional[MuteTargetChannel] = None,
+    amount: app_commands.Range[int, 1, 1000] = 200
+):
+    if not await is_moderator(interaction): return
+
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.Thread)):
+        await interaction.response.send_message("このコマンドはテキスト系チャンネルでのみ使用できます。", ephemeral=True)
+        return
+
+    perms = target_channel.permissions_for(interaction.guild.me)
+    if not perms.manage_messages or not perms.read_message_history:
+        await interaction.response.send_message(
+            f"Botに {target_channel.mention} でのメッセージ管理権限（メッセージの管理・メッセージ履歴の閲覧）がありません。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = await target_channel.purge(
+            limit=amount,
+            check=lambda m: m.author.id == member.id
+        )
+        await interaction.followup.send(
+            f"[一括削除] {target_channel.mention} 内の {member.mention} のメッセージを "
+            f"{len(deleted)} 件削除しました（直近{amount}件を確認）。",
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("権限が不足しているため削除できません。", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"削除中にエラーが発生しました: {e}", ephemeral=True)
 
 
 @automod_group.command(name="toggle", description="【モデレーター専用】自動モデレーションのON/OFFを切り替えます")
