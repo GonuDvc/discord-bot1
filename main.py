@@ -59,7 +59,7 @@ GROQ_FALLBACK_MODELS = [
 ]
 # 画像添付メッセージの解釈に使用するVision対応モデル。
 # 通常モデルは画像入力に対応していないため、画像添付時のみこのモデルに切り替えて呼び出す。
-# 例: "llama-3.3-70b-versatile" や "meta-llama/llama-4-scout-17b-16e-instruct" など
+# 例: "qwen/qwen3.6-27b" や "meta-llama/llama-4-scout-17b-16e-instruct" など
 # Groqがサポートするvisionモデルを指定してください。未設定時は画像添付を無視してテキストのみ処理する。
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "")
 
