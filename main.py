@@ -43,6 +43,8 @@ except ImportError:
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
@@ -528,6 +530,7 @@ newspaper_group = app_commands.Group(name="newspaper", description="帝国新聞
 say_group = app_commands.Group(name="say", description="Botに代わりに発言させます（テキスト / Embed）")
 embed_group = app_commands.Group(name="embed", description="Embedメッセージの作成・送信")
 my_group = app_commands.Group(name="my", description="サーバー・権限・URLなどの各種スキャン・確認機能")
+ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット機能（Groq）の設定・管理")
 
 
 bot.tree.add_command(owner_trust_group)
@@ -553,6 +556,7 @@ bot.tree.add_command(newspaper_group)
 bot.tree.add_command(say_group)
 bot.tree.add_command(embed_group)
 bot.tree.add_command(my_group)
+bot.tree.add_command(ai_chat_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -4038,6 +4042,12 @@ async def on_message(message: discord.Message):
         if guild_config.get("economy_enabled", False):
             _grant_message_reward(all_data, guild_config, message)
 
+        # 7. AIチャット（Groq）: 専用チャンネルでの発言に自動応答
+        ai_chat_channel_id = guild_config.get("ai_chat_channel_id")
+        if ai_chat_channel_id and message.channel.id == ai_chat_channel_id:
+            await _handle_ai_chat_message(message, guild_config)
+            return  # AIチャットチャンネルでは他のコマンド解釈を行わない
+
     await bot.process_commands(message)
 
 
@@ -4103,6 +4113,136 @@ async def _send_mod_log(guild: discord.Guild, embed: discord.Embed):
                 await ch.send(embed=embed)
             except Exception:
                 pass
+
+
+# ====================================================================
+# AIチャット機能（Groq API）
+# ====================================================================
+# ・オーナーが /ai_chat set_channel で指定したチャンネルに発言すると、
+#   Botが自動でGroq（Llama等）モデルを使って応答します。
+# ・会話履歴はメモリ上のみで保持し（プロセス再起動で消えます）、
+#   「チャンネルID + ユーザーID」単位で直近のやり取りを保持します。
+#   永続化していないのは、DBに大量の会話ログを溜めない方針にするためです。
+# ====================================================================
+
+AI_CHAT_HISTORY_MAX_TURNS = 10          # 保持するユーザー発言+AI応答の往復数
+AI_CHAT_HISTORY_TTL_SECONDS = 60 * 60   # 1時間発言がなければ履歴を破棄
+AI_CHAT_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバー内で動作するフレンドリーなAIアシスタントです。"
+    "日本語で、簡潔かつ丁寧に回答してください。Discordのメッセージとして自然な長さを意識してください。"
+)
+
+# {(channel_id, user_id): {"messages": [{"role":..., "content":...}, ...], "last_used": epoch_seconds}}
+_ai_chat_histories: dict = {}
+
+
+def _ai_chat_get_history(channel_id: int, user_id: int) -> list:
+    """指定チャンネル・ユーザーの会話履歴（Groq messages形式）を取得します。TTLを過ぎていれば破棄します。"""
+    key = (channel_id, user_id)
+    entry = _ai_chat_histories.get(key)
+    now = time.time()
+    if entry is None:
+        return []
+    if now - entry.get("last_used", 0) > AI_CHAT_HISTORY_TTL_SECONDS:
+        _ai_chat_histories.pop(key, None)
+        return []
+    return entry["messages"]
+
+
+def _ai_chat_append_history(channel_id: int, user_id: int, user_content: str, assistant_content: str):
+    """会話の往復を履歴に追加し、最大往復数を超えた分は古い方から切り捨てます。"""
+    key = (channel_id, user_id)
+    entry = _ai_chat_histories.setdefault(key, {"messages": [], "last_used": time.time()})
+    entry["messages"].append({"role": "user", "content": user_content})
+    entry["messages"].append({"role": "assistant", "content": assistant_content})
+    entry["last_used"] = time.time()
+
+    # 往復数（user+assistantで1往復=2メッセージ）が上限を超えたら古い分から削除
+    max_messages = AI_CHAT_HISTORY_MAX_TURNS * 2
+    if len(entry["messages"]) > max_messages:
+        entry["messages"] = entry["messages"][-max_messages:]
+
+
+def _ai_chat_clear_history(channel_id: int, user_id: Optional[int] = None):
+    """履歴をクリアします。user_idを指定しない場合はそのチャンネルの全ユーザー分をクリアします。"""
+    if user_id is not None:
+        _ai_chat_histories.pop((channel_id, user_id), None)
+        return
+    for key in [k for k in _ai_chat_histories.keys() if k[0] == channel_id]:
+        _ai_chat_histories.pop(key, None)
+
+
+async def _ai_chat_call_groq(messages: list) -> str:
+    """
+    Groq Chat Completions APIを呼び出し、応答テキストを返します。
+    失敗時は例外を送出するので、呼び出し側でtry/exceptしてください。
+    """
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                raise RuntimeError(f"Groq APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Groq APIの応答形式が想定と異なります: {data}")
+
+
+async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
+    """AIチャット専用チャンネルでのメッセージを処理し、Groq経由で応答します。"""
+    if not GROQ_API_KEY:
+        return  # APIキー未設定時は無反応（オーナーが気付けるようログにだけ出す）
+
+    content = message.content.strip()
+    if not content:
+        return  # 添付ファイルのみ等、テキストが無い場合はスキップ
+
+    history = _ai_chat_get_history(message.channel.id, message.author.id)
+    messages = [{"role": "system", "content": AI_CHAT_SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": content}
+    ]
+
+    try:
+        async with message.channel.typing():
+            reply_text = await _ai_chat_call_groq(messages)
+    except Exception as e:
+        try:
+            await message.reply(f"[AIチャット] 応答生成に失敗しました: {e}", mention_author=False)
+        except Exception:
+            pass
+        return
+
+    _ai_chat_append_history(message.channel.id, message.author.id, content, reply_text)
+
+    # Discordの1メッセージ2000文字制限に合わせて分割送信
+    chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
+    try:
+        await message.reply(chunks[0], mention_author=False)
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
+    except discord.Forbidden:
+        pass
 
 
 @bot.event
@@ -5791,7 +5931,82 @@ async def server_role_lockdown_channels(interaction: discord.Interaction, role: 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@server_group.command(name="role_panel", description="指定したロール（最大23個）を取得できるセレクトメニュー付きパネルを送信します")
+@ai_chat_group.command(name="set_channel", description="【オーナー限定】このサーバーでAIチャット（Groq）を自動応答させるチャンネルを設定します")
+@app_commands.describe(channel="AIチャット専用にするチャンネル")
+async def ai_chat_set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていません。Botの環境変数に設定してから再度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.send_messages or not perms.view_channel:
+        await interaction.response.send_message(
+            f"Botに {channel.mention} での発言権限がありません。チャンネル権限を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_channel_id"] = channel.id
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[設定完了] {channel.mention} をAIチャット専用チャンネルに設定しました。\n"
+        f"このチャンネルでの発言に、Groq（モデル: `{GROQ_MODEL}`）が自動応答します。",
+        ephemeral=True
+    )
+
+
+@ai_chat_group.command(name="unset_channel", description="【オーナー限定】このサーバーのAIチャット自動応答を無効化します")
+async def ai_chat_unset_channel(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    had_channel = guild_config.pop("ai_chat_channel_id", None)
+    save_data(all_data)
+
+    if had_channel:
+        await interaction.response.send_message("AIチャット機能を無効化しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("このサーバーではAIチャットは設定されていません。", ephemeral=True)
+
+
+@ai_chat_group.command(name="clear_history", description="AIチャットの会話履歴をクリアします（自分の履歴、または管理者は全員分）")
+@app_commands.describe(全員分="管理者権限がある場合、このチャンネルの全ユーザーの履歴をクリアします")
+async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: bool = False):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    ai_chat_channel_id = guild_config.get("ai_chat_channel_id")
+
+    if not ai_chat_channel_id or interaction.channel.id != ai_chat_channel_id:
+        await interaction.response.send_message("このチャンネルはAIチャット専用チャンネルに設定されていません。", ephemeral=True)
+        return
+
+    if 全員分:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("全員分の履歴クリアには管理者権限が必要です。", ephemeral=True)
+            return
+        _ai_chat_clear_history(interaction.channel.id)
+        await interaction.response.send_message("このチャンネルの全ユーザーのAIチャット履歴をクリアしました。", ephemeral=True)
+    else:
+        _ai_chat_clear_history(interaction.channel.id, interaction.user.id)
+        await interaction.response.send_message("あなたのAIチャット履歴をクリアしました。", ephemeral=True)
+
+
+
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
     role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
