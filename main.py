@@ -7317,6 +7317,18 @@ async def ai_chat_summary_status(interaction: discord.Interaction):
 
 
 
+@server_group.command(name="role_panel", description="【管理者専用】指定ロールを取得できるボタン付きパネルを設置します")
+@discord.app_commands.describe(
+    title="パネルのタイトル",
+    description="パネルの説明文",
+    role1="対象ロール1（必須）",
+    role2="対象ロール2（任意）", role3="対象ロール3（任意）", role4="対象ロール4（任意）", role5="対象ロール5（任意）",
+    role6="対象ロール6（任意）", role7="対象ロール7（任意）", role8="対象ロール8（任意）", role9="対象ロール9（任意）",
+    role10="対象ロール10（任意）", role11="対象ロール11（任意）", role12="対象ロール12（任意）", role13="対象ロール13（任意）",
+    role14="対象ロール14（任意）", role15="対象ロール15（任意）", role16="対象ロール16（任意）", role17="対象ロール17（任意）",
+    role18="対象ロール18（任意）", role19="対象ロール19（任意）", role20="対象ロール20（任意）", role21="対象ロール21（任意）",
+    role22="対象ロール22（任意）", role23="対象ロール23（任意）"
+)
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
     role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None,
