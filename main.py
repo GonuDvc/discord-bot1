@@ -329,6 +329,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("automod_invite_enabled", False),
         ("automod_ng_words_enabled", False),
         ("ng_words", []),
+        ("automod_ai_enabled", False),  # True: AIによる荒らし・誹謗中傷・遠回しな迷惑発言の自動検知を有効化
         ("mod_log_channel_id", None),
         ("custom_triggers", []),
         ("custom_commands", {}),
@@ -3534,6 +3535,12 @@ async def on_ready():
         _ai_summary_loop_task = asyncio.create_task(_ai_summary_scheduler_loop())
         print("  > AIサマリースケジューラ: 起動しました")
 
+    # AI自動モデレーションのバッチ判定ループを起動（再接続時の重複起動を防止）
+    global _ai_automod_loop_task
+    if _ai_automod_loop_task is None or _ai_automod_loop_task.done():
+        _ai_automod_loop_task = asyncio.create_task(_ai_automod_loop())
+        print("  > AI自動モデレーションループ: 起動しました")
+
     # 起動時にスラッシュコマンドを自動同期（コマンド候補欄に表示されない問題の対策）
     try:
         synced = await bot.tree.sync()
@@ -3988,6 +3995,10 @@ async def on_message(message: discord.Message):
             # 2. 招待リンク・NGワード削除（共通ヘルパー呼び出し）
             if await _run_automod_checks(message, guild_config):
                 return
+
+            # 2.5 AI自動モデレーション用キューへ登録（判定は別タスクでバッチ実行）
+            if guild_config.get("automod_ai_enabled", False):
+                _ai_automod_enqueue(message)
 
 
 
@@ -4808,6 +4819,220 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
             await message.channel.send(chunk)
     except discord.Forbidden:
         pass
+
+
+# ====================================================================
+# AI自動モデレーション機能
+# ====================================================================
+# ・既存のng_words（単純な文字列一致）では、言い換えや遠回しな表現による
+#   荒らし・誹謗中傷・迷惑勧誘をすり抜けられてしまう問題に対応します。
+# ・全テキストチャンネルの発言を対象に、一定間隔（既定30秒）でメッセージを
+#   まとめてGroqへ送りバッチ判定することで、リアルタイム判定に比べて
+#   API呼び出し回数・トークン消費を大きく抑えます。
+# ・不適切と判定された発言は削除し、既存の warnings システムに警告を1件
+#   追加します（担当者（moderator）はBot自身のIDとして記録されます）。
+# ====================================================================
+
+AI_AUTOMOD_BATCH_INTERVAL_SECONDS = 30   # バッチ判定の実行間隔
+AI_AUTOMOD_MAX_BATCH_SIZE = 30           # 1回のバッチで判定するメッセージの最大件数（トークン節約のため上限を設ける）
+AI_AUTOMOD_MAX_QUEUE_SIZE = 300          # キューの最大保持件数（あふれた場合は古いものから破棄）
+
+_AI_AUTOMOD_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバーの自動モデレーターです。"
+    "これから複数のメッセージ（連番付き）が提示されます。それぞれについて、"
+    "単純なNGワード一致では検出できない、以下のような不適切な発言かどうかを判定してください。\n"
+    "・遠回しな言い方や隠語・言い換えによる誹謗中傷・侮辱・嫌がらせ\n"
+    "・荒らし行為（意図的な妨害、挑発、スパム的な連投を想起させる内容）\n"
+    "・差別・ヘイトを助長する内容（直接的な表現でなくても）\n"
+    "・詐欺・違法な勧誘（遠回しな表現を含む）\n"
+    "通常の雑談、冗談、議論、感情表現（明確な誹謗中傷を伴わないもの）は不適切と判定しないでください。"
+    "判定に迷う場合は「不適切ではない」側に倒してください（過検知を避けるため）。\n\n"
+    "必ず次のJSON配列形式のみで出力してください。説明文やコードブロックは不要です。\n"
+    '[{"id": 連番, "flagged": true または false, "reason": "簡潔な理由（日本語、30文字以内。flagged=falseなら空文字でよい）"}, ...]\n'
+    "配列の要素数は必ず提示されたメッセージ数と一致させてください。"
+)
+
+# {(guild_id, channel_id, message_id): {"content": str, "author_id": int, "queued_at": epoch}}
+_ai_automod_queue: dict = {}
+_ai_automod_loop_task: Optional[asyncio.Task] = None
+
+
+def _ai_automod_enqueue(message: discord.Message):
+    """AIモデレーション判定用にメッセージをキューへ積みます。"""
+    if not message.content or not message.content.strip():
+        return  # 添付ファイルのみ等、判定対象テキストが無いものはスキップ
+
+    key = (message.guild.id, message.channel.id, message.id)
+    _ai_automod_queue[key] = {
+        "content": message.content[:800],  # 極端に長い発言はトークン節約のため切り詰める
+        "author_id": message.author.id,
+        "queued_at": time.time(),
+    }
+
+    # キューが上限を超えたら、古いものから破棄する（バッチ処理が追いつかない状況への保険）
+    if len(_ai_automod_queue) > AI_AUTOMOD_MAX_QUEUE_SIZE:
+        oldest_keys = sorted(_ai_automod_queue.keys(), key=lambda k: _ai_automod_queue[k]["queued_at"])
+        for old_key in oldest_keys[:len(_ai_automod_queue) - AI_AUTOMOD_MAX_QUEUE_SIZE]:
+            _ai_automod_queue.pop(old_key, None)
+
+
+async def _ai_automod_judge_batch(items: list) -> dict:
+    """
+    items: [(key, content), ...] 形式のバッチをGroqへ送り、判定結果を取得します。
+    戻り値: {index(int): (flagged: bool, reason: str)}
+    Groq呼び出しや解析に失敗した場合は空の辞書を返します（安全側＝何もしない）。
+    """
+    if not items:
+        return {}
+
+    numbered_lines = "\n".join(f"{i}. {content}" for i, (_key, content) in enumerate(items))
+    messages = [
+        {"role": "system", "content": _AI_AUTOMOD_SYSTEM_PROMPT},
+        {"role": "user", "content": numbered_lines},
+    ]
+
+    try:
+        raw = await _ai_chat_call_groq(messages)
+    except Exception as e:
+        print(f"[AI自動モデレーション] Groq呼び出しに失敗: {e}")
+        return {}
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, list):
+            raise ValueError("配列形式ではありません")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[AI自動モデレーション] 判定結果の解析に失敗: {e} / raw={cleaned[:200]}")
+        return {}
+
+    results = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("id"))
+        except (TypeError, ValueError):
+            continue
+        flagged = bool(entry.get("flagged", False))
+        reason = str(entry.get("reason", "")).strip() or "不適切な発言と判定されました"
+        results[idx] = (flagged, reason)
+
+    return results
+
+
+async def _ai_automod_process_batch():
+    """
+    キューに溜まったメッセージを、サーバーごとに（automod_ai_enabledが有効なサーバーのみ）
+    グループ化してバッチ判定し、フラグが立ったメッセージを削除・警告付与します。
+    """
+    if not _ai_automod_queue:
+        return
+    if not GROQ_API_KEY:
+        _ai_automod_queue.clear()
+        return
+
+    all_data = load_data()
+
+    # サーバーごとにグループ化
+    by_guild: dict = {}
+    for key, info in _ai_automod_queue.items():
+        guild_id = key[0]
+        by_guild.setdefault(guild_id, []).append((key, info))
+    _ai_automod_queue.clear()
+
+    for guild_id, entries in by_guild.items():
+        guild_config = all_data.get(str(guild_id))
+        if not isinstance(guild_config, dict) or not guild_config.get("automod_ai_enabled", False):
+            continue  # 機能が無効なサーバーのキューは判定せず破棄
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+
+        # 1回のバッチサイズ上限を超える場合は分割して処理（古い順）
+        entries.sort(key=lambda e: e[1]["queued_at"])
+        for batch_start in range(0, len(entries), AI_AUTOMOD_MAX_BATCH_SIZE):
+            batch = entries[batch_start:batch_start + AI_AUTOMOD_MAX_BATCH_SIZE]
+            items = [(key, info["content"]) for key, info in batch]
+            results = await _ai_automod_judge_batch(items)
+
+            for idx, (key, info) in enumerate(batch):
+                flagged, reason = results.get(idx, (False, ""))
+                if not flagged:
+                    continue
+
+                _guild_id, channel_id, message_id = key
+                channel = guild.get_channel(channel_id)
+                if channel is None:
+                    continue
+
+                member = guild.get_member(info["author_id"])
+                if member is None:
+                    continue
+
+                # モデレーター・管理者・許可ユーザー等は対象外（automod共通ルールを踏襲）
+                if not _is_automod_target(member, guild_config, all_data):
+                    continue
+
+                try:
+                    target_message = await channel.fetch_message(message_id)
+                    await target_message.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+                # 警告を1件追加（Bot自身を担当者として記録）
+                warnings_dict = guild_config.setdefault("warnings", {})
+                user_warnings = warnings_dict.setdefault(str(member.id), [])
+                user_warnings.append({
+                    "reason": f"[AI自動検知] {reason}",
+                    "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "moderator": bot.user.id if bot.user else 0,
+                })
+
+                try:
+                    await channel.send(
+                        f"[AI自動モデレーション] {member.mention} の発言を削除し、警告を追加しました。\n理由: {reason}",
+                        delete_after=10
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+                try:
+                    await member.send(
+                        f"[警告] **{guild.name}** でAI自動モデレーションにより発言が削除され、警告が追加されました。\n理由: {reason}"
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+                log_embed = discord.Embed(
+                    title="[ログ] AI自動モデレーション - 発言削除・警告",
+                    color=discord.Color.red()
+                )
+                log_embed.add_field(name="対象ユーザー", value=f"{member.mention} (`{member.id}`)", inline=False)
+                log_embed.add_field(name="チャンネル", value=channel.mention if hasattr(channel, "mention") else str(channel_id), inline=True)
+                log_embed.add_field(name="判定理由", value=reason, inline=False)
+                log_embed.timestamp = discord.utils.utcnow()
+                try:
+                    await _send_mod_log(guild, log_embed)
+                except Exception:
+                    pass
+
+        save_data(all_data)
+
+
+async def _ai_automod_loop():
+    """一定間隔でAIモデレーションのバッチ判定を実行するループタスクです。"""
+    await bot.wait_until_ready()
+    while True:
+        try:
+            await _ai_automod_process_batch()
+        except Exception as e:
+            print(f"[AI自動モデレーション] ループ内エラー: {e}")
+        await asyncio.sleep(AI_AUTOMOD_BATCH_INTERVAL_SECONDS)
 
 
 @bot.event
@@ -8178,7 +8403,8 @@ async def purge_external_apps(
 @discord.app_commands.choices(機能=[
     discord.app_commands.Choice(name="スパム検知", value="spam"),
     discord.app_commands.Choice(name="招待リンク削除", value="invite"),
-    discord.app_commands.Choice(name="NGワード検知", value="ngword")
+    discord.app_commands.Choice(name="NGワード検知", value="ngword"),
+    discord.app_commands.Choice(name="AI自動モデレーション（言い換え・遠回しな迷惑発言を検知）", value="ai"),
 ])
 async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_commands.Choice[str], 有効化: bool):
     if not await is_moderator(interaction): return
@@ -8187,10 +8413,24 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
     key = f"automod_{機能.value}_enabled"
     if 機能.value == "ngword":
         key = "automod_ng_words_enabled"
+
+    if 機能.value == "ai" and 有効化 and not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていないため、AI自動モデレーションを有効化できません。Botの環境変数を確認してください。",
+            ephemeral=True
+        )
+        return
+
     cfg[key] = 有効化
     save_data(all_data)
     status = "ON" if 有効化 else "OFF"
-    await interaction.response.send_message(f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。", ephemeral=True)
+    extra_note = ""
+    if 機能.value == "ai" and 有効化:
+        extra_note = f"\n（判定は{AI_AUTOMOD_BATCH_INTERVAL_SECONDS}秒間隔でまとめて実行されるため、削除まで多少のタイムラグがあります）"
+    await interaction.response.send_message(
+        f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。{extra_note}",
+        ephemeral=True
+    )
 
 
 @automod_group.command(name="ngword_add", description="【モデレーター専用】NGワードを追加します")
