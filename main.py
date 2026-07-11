@@ -57,6 +57,11 @@ GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "2048"))
 GROQ_FALLBACK_MODELS = [
     m.strip() for m in os.getenv("GROQ_FALLBACK_MODELS", "").split(",") if m.strip()
 ]
+# 画像添付メッセージの解釈に使用するVision対応モデル。
+# 通常モデルは画像入力に対応していないため、画像添付時のみこのモデルに切り替えて呼び出す。
+# 例: "llama-3.2-11b-vision-preview" や "meta-llama/llama-4-scout-17b-16e-instruct" など
+# Groqがサポートするvisionモデルを指定してください。未設定時は画像添付を無視してテキストのみ処理する。
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "")
 
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
@@ -418,6 +423,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # --- AIチャット：一時停止・ユーザー個別設定（オーナー専用） ---
         ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
+        ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -4188,6 +4194,33 @@ def _ai_chat_clear_history(channel_id: int, user_id: Optional[int] = None):
         _ai_chat_histories.pop(key, None)
 
 
+# {(guild_id, user_id): last_request_epoch_seconds} — クールダウン（連投制限）用の直近リクエスト時刻
+_ai_chat_last_request: dict = {}
+
+
+def _ai_chat_check_cooldown(guild_id: int, user_id: int, cooldown_seconds: int) -> Optional[float]:
+    """
+    クールダウン中かどうかを判定します。
+    cooldown_seconds が0以下（未設定）の場合は常にNoneを返します（制限なし）。
+    クールダウン中の場合は「あと何秒待てばよいか」を返し、そうでなければNoneを返します。
+    このチェックだけでは記録は更新しません。実際にリクエストを行う場合は
+    _ai_chat_record_request を別途呼び出してください。
+    """
+    if cooldown_seconds <= 0:
+        return None
+    last = _ai_chat_last_request.get((guild_id, user_id))
+    if last is None:
+        return None
+    elapsed = time.time() - last
+    remaining = cooldown_seconds - elapsed
+    return remaining if remaining > 0 else None
+
+
+def _ai_chat_record_request(guild_id: int, user_id: int):
+    """クールダウン判定用に、直近のリクエスト時刻を記録します。"""
+    _ai_chat_last_request[(guild_id, user_id)] = time.time()
+
+
 def _ai_chat_get_user_setting(guild_config: dict, user_id: int) -> dict:
     """
     指定ユーザーのAIチャット個別設定を取得します。
@@ -4267,8 +4300,8 @@ class GroqRateLimitError(GroqAPIError):
 
 
 def _format_duration(seconds: float) -> str:
-    """秒数を「7分7秒」のような日本語表記に変換します。"""
-    seconds = int(round(seconds))
+    """秒数を「7分7秒」のような日本語表記に変換します。0秒未満の端数は切り上げ、最低1秒として表示します。"""
+    seconds = max(1, math.ceil(seconds))
     if seconds < 60:
         return f"{seconds}秒"
     minutes, secs = divmod(seconds, 60)
@@ -4415,26 +4448,80 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     if user_setting["blocked"]:
         return  # ブロック済みユーザーには無反応
 
+    # 画像添付の検出（1枚のみ対応。対応拡張子の最初の1枚を使用し、それ以外は無視）
+    image_url: Optional[str] = None
+    _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    for attachment in message.attachments:
+        filename_lower = (attachment.filename or "").lower()
+        if filename_lower.endswith(_IMAGE_EXTENSIONS):
+            image_url = attachment.url
+            break
+
     content = message.content.strip()
-    if not content:
-        return  # 添付ファイルのみ等、テキストが無い場合はスキップ
+    if not content and image_url is None:
+        return  # テキストも画像も無い場合はスキップ
+
+    if image_url is not None and not GROQ_VISION_MODEL:
+        # Vision対応モデルが未設定の場合、画像添付には対応できない旨を伝える
+        if not content:
+            try:
+                await message.reply(
+                    "[AIチャット] 画像を確認しましたが、この機能は現在利用できません"
+                    "（Botの画像認識モデルが設定されていません）。テキストで質問してください。",
+                    mention_author=False
+                )
+            except Exception:
+                pass
+            return
+        image_url = None  # テキストがあれば画像を無視してテキストのみで続行
+
+    # クールダウン（連投制限）チェック（オーナーが /ai_chat set_cooldown で設定）
+    cooldown_seconds = guild_config.get("ai_chat_cooldown_seconds", 0)
+    remaining = _ai_chat_check_cooldown(message.guild.id, message.author.id, cooldown_seconds)
+    if remaining is not None:
+        try:
+            await message.reply(
+                f"[AIチャット] 連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。",
+                mention_author=False
+            )
+        except Exception:
+            pass
+        return
 
     system_prompt = user_setting["system_prompt"] or AI_CHAT_SYSTEM_PROMPT
     model = user_setting["model"] or None  # Noneなら _ai_chat_call_groq側でGROQ_MODELが使われる
 
     history = _ai_chat_get_history(message.channel.id, message.author.id)
+
+    if image_url is not None:
+        # マルチモーダル形式（テキスト＋画像）でユーザーメッセージを構築
+        user_message_content = [
+            {"type": "text", "text": content or "この画像について説明してください。"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+    else:
+        user_message_content = content
+
     messages = [{"role": "system", "content": system_prompt}] + history + [
-        {"role": "user", "content": content}
+        {"role": "user", "content": user_message_content}
     ]
 
     # 試行するモデルの候補列を構築（メインモデル → フォールバックモデルの順）。
     # ユーザー個別モデル設定がある場合はそれを最優先の「メイン」として扱い、
     # それがTPD（日次上限）に達した場合のみフォールバック候補を順に試します。
-    candidate_models = [model] + GROQ_FALLBACK_MODELS
+    # 画像添付時はVision対応モデルのみを使用します（通常モデルは画像を処理できないため）。
+    if image_url is not None:
+        candidate_models = [GROQ_VISION_MODEL]
+    else:
+        candidate_models = [model] + GROQ_FALLBACK_MODELS
 
     reply_text: Optional[str] = None
     used_model: Optional[str] = None
     last_error: Optional[Exception] = None
+
+    # クールダウンはAPI呼び出しの成否に関わらず「利用した」時点で記録する
+    # （エラー時に即座に連投できてしまうと日次上限の浪費を防げないため）
+    _ai_chat_record_request(message.guild.id, message.author.id)
 
     try:
         async with message.channel.typing():
@@ -4487,7 +4574,10 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     if used_model and used_model != primary_model:
         reply_text += f"\n\n*（本日の利用上限のため、フォールバックモデル `{used_model}` で応答しました）*"
 
-    _ai_chat_append_history(message.channel.id, message.author.id, content, reply_text)
+    # 履歴には画像URLそのものではなくテキストのみ保存する（画像のみ送信時はプレースホルダーを使用）。
+    # 添付画像のURLは時間経過で失効するため、履歴として持ち回らせない設計。
+    history_user_content = content if content else "（画像を送信）"
+    _ai_chat_append_history(message.channel.id, message.author.id, history_user_content, reply_text)
 
     # Discordの1メッセージ2000文字制限に合わせて分割送信
     chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
@@ -6300,6 +6390,27 @@ async def ai_chat_resume(interaction: discord.Interaction):
     await interaction.response.send_message("[再開] このサーバーのAIチャット自動応答を再開しました。", ephemeral=True)
 
 
+@ai_chat_group.command(name="set_cooldown", description="【オーナー限定】このサーバーのAIチャット連投制限（クールダウン秒数）を設定します")
+@app_commands.describe(seconds="1リクエストあたりのクールダウン秒数（0を指定すると制限を無効化）")
+async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 3600]):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_cooldown_seconds"] = seconds
+    save_data(all_data)
+
+    if seconds == 0:
+        await interaction.response.send_message("[設定完了] AIチャットの連投制限を無効化しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"[設定完了] AIチャットの連投制限を{seconds}秒に設定しました。\n"
+            f"以降、ユーザーは同じサーバー内で{seconds}秒間隔を空けないとAIチャットを利用できません。",
+            ephemeral=True
+        )
+
+
 @ai_chat_group.command(name="user_config", description="【オーナー限定】特定ユーザーのAIチャット設定（使用モデル・システムプロンプト）をカスタマイズします")
 @app_commands.describe(
     user="設定を変更するユーザー",
@@ -6454,6 +6565,12 @@ async def ai_chat_user_status(interaction: discord.Interaction, user: discord.Us
         value="一時停止中" if guild_config.get("ai_chat_paused", False) else "稼働中",
         inline=False
     )
+    cooldown = guild_config.get("ai_chat_cooldown_seconds", 0)
+    embed.add_field(
+        name="このサーバーの連投制限（クールダウン）",
+        value=f"{cooldown}秒" if cooldown > 0 else "無効",
+        inline=False
+    )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -6461,18 +6578,14 @@ async def ai_chat_user_status(interaction: discord.Interaction, user: discord.Us
 AI_CHAT_USER_PROMPT_MAX_LENGTH = 500  # 一般メンバーが自分で設定できるシステムプロンプトの最大文字数
 
 
-@ai_chat_my_prompt_group.command(name="set", description="自分専用のAIチャット人格設定（システムプロンプト）を登録します（最大500文字）")
-@app_commands.describe(text="AIに与える人格・対応方針の指示文（最大500文字）")
-async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: str):
+async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction, text: str):
+    """
+    一般メンバーが自分専用のシステムプロンプトを送信した際の共通処理。
+    スラッシュコマンド（text引数指定）とModal送信の両方から呼び出されます。
+    呼び出し前提: interaction.response がまだ行われていないこと（この関数内でdeferします）。
+    """
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
-        return
-
-    if not GROQ_API_KEY:
-        await interaction.response.send_message(
-            "GROQ_API_KEY が設定されていないため、この機能は利用できません。",
-            ephemeral=True
-        )
         return
 
     text = text.strip()
@@ -6521,6 +6634,45 @@ async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: str):
         "（※オーナーが個別に設定していた内容がある場合は上書きされました）",
         ephemeral=True
     )
+
+
+class AIChatMyPromptModal(discord.ui.Modal, title="あなた専用のAI人格設定"):
+    """
+    /ai_chat my_prompt set をtext引数なしで実行した際に開くModal。
+    複数行での入力・貼り付けがしやすいよう TextStyle.paragraph を使用します。
+    """
+    prompt_text = discord.ui.TextInput(
+        label="AIに与える人格・対応方針の指示文",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: あなたは丁寧な執事口調で応答するAIです。ユーザーを「ご主人様」と呼んでください。",
+        required=True,
+        max_length=AI_CHAT_USER_PROMPT_MAX_LENGTH
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _ai_chat_process_my_prompt_submission(interaction, self.prompt_text.value)
+
+
+@ai_chat_my_prompt_group.command(name="set", description="自分専用のAIチャット人格設定（システムプロンプト）を登録します（最大500文字）")
+@app_commands.describe(text="AIに与える人格・対応方針の指示文（最大500文字）。省略すると入力フォーム（Modal）が開きます")
+async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: Optional[str] = None):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていないため、この機能は利用できません。",
+            ephemeral=True
+        )
+        return
+
+    if text is None:
+        # text未指定時はModalを開いて複数行の入力を受け付ける
+        await interaction.response.send_modal(AIChatMyPromptModal())
+        return
+
+    await _ai_chat_process_my_prompt_submission(interaction, text)
 
 
 @ai_chat_my_prompt_group.command(name="reset", description="自分専用のAIチャット人格設定を削除し、既定のプロンプトに戻します")
