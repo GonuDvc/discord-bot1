@@ -5,6 +5,7 @@ Railway 動作対応 / 各種ビュー・永続化対応版
 
 import os
 import sys
+import re
 import json
 import math
 import random
@@ -4176,6 +4177,10 @@ async def _ai_chat_call_groq(messages: list) -> str:
     """
     Groq Chat Completions APIを呼び出し、応答テキストを返します。
     失敗時は例外を送出するので、呼び出し側でtry/exceptしてください。
+
+    DeepSeek-R1やQwen3など「推論(reasoning)モデル」は応答に <think>...</think> 形式で
+    思考過程を含めることがあります。reasoning_format="hidden" で抑制を試みつつ、
+    対応していないモデル向けに文字列側でも <think> タグを除去するフォールバックを行います。
     """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY が設定されていません。Botの環境変数を確認してください。")
@@ -4189,6 +4194,7 @@ async def _ai_chat_call_groq(messages: list) -> str:
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": 1024,
+        "reasoning_format": "hidden",  # 推論モデルの思考過程を応答本文に含めない（対応モデルのみ有効）
     }
 
     async with aiohttp.ClientSession() as session:
@@ -4204,9 +4210,30 @@ async def _ai_chat_call_groq(messages: list) -> str:
             data = await resp.json()
 
     try:
-        return data["choices"][0]["message"]["content"].strip()
+        raw_content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise RuntimeError(f"Groq APIの応答形式が想定と異なります: {data}")
+
+    return _strip_reasoning_tags(raw_content).strip()
+
+
+_THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_TAG_UNCLOSED_PATTERN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning_tags(text: str) -> str:
+    """
+    推論モデル（DeepSeek-R1, Qwen3等）が応答本文に含めることがある
+    <think>...</think> 形式の思考過程を除去します。
+    reasoning_format="hidden" が効かないモデル向けのフォールバック処理です。
+    途中でストリームが切れて閉じタグが無いケースにも対応します。
+    """
+    if not text:
+        return text
+    cleaned = _THINK_TAG_PATTERN.sub("", text)
+    # 閉じタグが無いまま <think> だけ残っている場合（生成が途中で切れた等）はそれ以降を丸ごと除去
+    cleaned = _THINK_TAG_UNCLOSED_PATTERN.sub("", cleaned)
+    return cleaned.strip()
 
 
 async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
@@ -4232,6 +4259,10 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         except Exception:
             pass
         return
+
+    if not reply_text:
+        # 思考過程のみが返って本文が空になった等のケース
+        reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
 
     _ai_chat_append_history(message.channel.id, message.author.id, content, reply_text)
 
