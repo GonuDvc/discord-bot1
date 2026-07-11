@@ -7836,6 +7836,74 @@ async def dm_user(
         await _send_mod_log(interaction.guild, log_embed)
 
 
+@owner_dm_group.command(name="purge", description="【オーナー・許可ユーザー専用】指定したユーザーとのDMでBotが送信したメッセージをすべて削除します")
+@app_commands.describe(
+    ユーザー="対象ユーザー（Botと過去にDMのやり取りがある相手のみ指定可能）",
+    件数="遡って確認するメッセージ件数（1〜1000、既定200）"
+)
+async def dm_purge(
+    interaction: discord.Interaction,
+    ユーザー: discord.User,
+    件数: app_commands.Range[int, 1, 1000] = 200
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        dm_channel = ユーザー.dm_channel or await ユーザー.create_dm()
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"DMチャンネルの取得に失敗しました: {e}", ephemeral=True)
+        return
+
+    bot_user_id = interaction.client.user.id
+    deleted_count = 0
+    failed_count = 0
+
+    try:
+        async for msg in dm_channel.history(limit=件数):
+            if msg.author.id != bot_user_id:
+                continue
+            try:
+                await msg.delete()
+                deleted_count += 1
+                await asyncio.sleep(0.5)  # レート制限対策（DMは一括削除APIがないため1件ずつ）
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                failed_count += 1
+            except discord.HTTPException:
+                failed_count += 1
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"{ユーザー.mention} とのDM履歴を取得できませんでした（DMが存在しないか、アクセスできません）。",
+            ephemeral=True
+        )
+        return
+
+    result_embed = discord.Embed(
+        title="[DM一括削除] 完了",
+        description=f"{ユーザー.mention} (`{ユーザー.id}`) とのDMで、Botが送信したメッセージを削除しました。",
+        color=discord.Color.green() if failed_count == 0 else discord.Color.orange()
+    )
+    result_embed.add_field(name="削除件数", value=f"{deleted_count}件", inline=True)
+    result_embed.add_field(name="失敗件数", value=f"{failed_count}件", inline=True)
+    result_embed.add_field(name="確認件数", value=f"直近{件数}件", inline=True)
+    await interaction.followup.send(embed=result_embed, ephemeral=True)
+
+    if interaction.guild:
+        log_embed = discord.Embed(
+            title="[ログ] Bot経由DM一括削除",
+            color=discord.Color.purple()
+        )
+        log_embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="対象ユーザー", value=f"{ユーザー.mention} (`{ユーザー.id}`)", inline=True)
+        log_embed.add_field(name="削除件数", value=f"{deleted_count}件", inline=True)
+        log_embed.timestamp = discord.utils.utcnow()
+        await _send_mod_log(interaction.guild, log_embed)
+
+
 # ====================================================================
 # セクション 9: カスタムコマンド機能（BOT所有者専用）
 # ====================================================================
