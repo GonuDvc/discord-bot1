@@ -424,6 +424,12 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
+        # --- サーバー活動のAIサマリー機能 ---
+        ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
+        ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
+        ("ai_summary_weekday", 0),            # 自動実行する曜日（0=月曜〜6=日曜、datetime.weekday()準拠）
+        ("ai_summary_hour", 9),               # 自動実行する時刻（0-23、UTC基準で扱う）
+        ("ai_summary_last_run", None),        # 最後に自動実行した日付（YYYY-MM-DD文字列）。二重実行防止用
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -553,6 +559,7 @@ embed_group = app_commands.Group(name="embed", description="Embedメッセージ
 my_group = app_commands.Group(name="my", description="サーバー・権限・URLなどの各種スキャン・確認機能")
 ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット機能（Groq）の設定・管理")
 ai_chat_my_prompt_group = app_commands.Group(name="my_prompt", description="自分専用のAIチャット人格設定（システムプロンプト）を管理します", parent=ai_chat_group)
+ai_chat_summary_group = app_commands.Group(name="weekly_summary", description="【オーナー限定】サーバー活動のAIサマリー機能の管理", parent=ai_chat_group)
 
 
 bot.tree.add_command(owner_trust_group)
@@ -3521,6 +3528,12 @@ async def on_ready():
     print("---------------------------------------")
     print(f"ログインユーザー: {bot.user.name} (ID: {bot.user.id})")
 
+    # サーバー活動AIサマリーの定期実行スケジューラを起動（再接続時の重複起動を防止）
+    global _ai_summary_loop_task
+    if _ai_summary_loop_task is None or _ai_summary_loop_task.done():
+        _ai_summary_loop_task = asyncio.create_task(_ai_summary_scheduler_loop())
+        print("  > AIサマリースケジューラ: 起動しました")
+
     # 起動時にスラッシュコマンドを自動同期（コマンド候補欄に表示されない問題の対策）
     try:
         synced = await bot.tree.sync()
@@ -4432,6 +4445,214 @@ def _strip_reasoning_tags(text: str) -> str:
     # 閉じタグが無いまま <think> だけ残っている場合（生成が途中で切れた等）はそれ以降を丸ごと除去
     cleaned = _THINK_TAG_UNCLOSED_PATTERN.sub("", cleaned)
     return cleaned.strip()
+
+
+# ====================================================================
+# サーバー活動のAIサマリー機能
+# ====================================================================
+
+AI_SUMMARY_PERIOD_DAYS = 7           # サマリー対象期間（固定7日間）
+AI_SUMMARY_MAX_MESSAGES_PER_CHANNEL = 300  # 1チャンネルあたり収集する最大メッセージ数（負荷制御）
+AI_SUMMARY_MAX_TOTAL_SAMPLE_CHARS = 12000  # AIに渡す発言サンプルの合計文字数上限（トークン節約）
+
+_AI_SUMMARY_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバーの活動を分析するアシスタントです。"
+    "これから提示されるチャンネルごとの発言サンプルと統計情報をもとに、"
+    "過去1週間のサーバー活動を日本語で要約してください。\n"
+    "以下の構成でまとめてください（Discordのメッセージとして自然な長さ、見出しは太字で）:\n"
+    "・**全体の傾向**: サーバー全体としてどんな1週間だったか（2〜3文程度）\n"
+    "・**よく話題になったこと**: 主なトピックを箇条書きで3〜5個\n"
+    "・**活発だったチャンネル**: 統計情報を参考に、特に活発だったチャンネルとその理由を簡潔に\n"
+    "個人を過度に特定するような書き方は避け、全体の雰囲気や傾向を伝えることを重視してください。"
+)
+
+
+async def _ai_summary_collect_guild_activity(guild: discord.Guild) -> dict:
+    """
+    サーバー内の全テキストチャンネルから過去7日分のメッセージを収集し、
+    チャンネルごとの統計情報と、AIに渡すための発言サンプルテキストを構築します。
+    Botが読み取り権限を持たないチャンネルはスキップします。
+    """
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=AI_SUMMARY_PERIOD_DAYS)
+
+    channel_stats = []  # [{"name": str, "message_count": int, "unique_authors": int}]
+    sample_lines = []   # AIに渡す発言サンプル（チャンネル名付き、Bot発言は除外）
+    total_messages = 0
+    total_sample_chars = 0
+
+    for channel in guild.text_channels:
+        perms = channel.permissions_for(guild.me)
+        if not (perms.read_messages and perms.read_message_history):
+            continue
+
+        message_count = 0
+        authors = set()
+        channel_samples = []
+
+        try:
+            async for msg in channel.history(limit=AI_SUMMARY_MAX_MESSAGES_PER_CHANNEL, after=since, oldest_first=False):
+                if msg.author.bot:
+                    continue
+                message_count += 1
+                authors.add(msg.author.id)
+                text = msg.content.strip()
+                if text and len(channel_samples) < 15:
+                    # 長すぎる発言は切り詰めてサンプルに含める
+                    channel_samples.append(text[:200])
+        except discord.Forbidden:
+            continue
+        except Exception as e:
+            print(f"[AIサマリー] チャンネル {channel.name} の履歴取得に失敗: {e}")
+            continue
+
+        if message_count == 0:
+            continue
+
+        channel_stats.append({
+            "name": channel.name,
+            "message_count": message_count,
+            "unique_authors": len(authors),
+        })
+        total_messages += message_count
+
+        if channel_samples and total_sample_chars < AI_SUMMARY_MAX_TOTAL_SAMPLE_CHARS:
+            block = f"# #{channel.name}（発言{message_count}件, 発言者{len(authors)}人）\n"
+            block += "\n".join(f"- {s}" for s in channel_samples[:8])
+            if total_sample_chars + len(block) <= AI_SUMMARY_MAX_TOTAL_SAMPLE_CHARS:
+                sample_lines.append(block)
+                total_sample_chars += len(block)
+
+    channel_stats.sort(key=lambda c: c["message_count"], reverse=True)
+
+    return {
+        "channel_stats": channel_stats,
+        "sample_text": "\n\n".join(sample_lines),
+        "total_messages": total_messages,
+        "period_days": AI_SUMMARY_PERIOD_DAYS,
+    }
+
+
+async def _ai_summary_generate(guild: discord.Guild) -> Tuple[Optional[str], dict]:
+    """
+    サーバー活動を収集し、Groqで自然文サマリーを生成します。
+    戻り値: (サマリー本文 or None, 収集した統計情報dict)
+    活動が無い、またはGROQ_API_KEY未設定の場合は summary=None を返します。
+    """
+    activity = await _ai_summary_collect_guild_activity(guild)
+
+    if not GROQ_API_KEY:
+        return None, activity
+
+    if activity["total_messages"] == 0:
+        return None, activity
+
+    stats_text = "\n".join(
+        f"- #{c['name']}: {c['message_count']}件（発言者{c['unique_authors']}人）"
+        for c in activity["channel_stats"][:15]
+    )
+
+    user_prompt = (
+        f"【集計期間】過去{activity['period_days']}日間\n"
+        f"【総発言数】{activity['total_messages']}件\n\n"
+        f"【チャンネル別統計（発言数上位）】\n{stats_text}\n\n"
+        f"【発言サンプル】\n{activity['sample_text'] or '（サンプルなし）'}"
+    )
+
+    messages = [
+        {"role": "system", "content": _AI_SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        summary_text = await _ai_chat_call_groq(messages)
+    except Exception as e:
+        print(f"[AIサマリー] Groq呼び出しに失敗: {e}")
+        return None, activity
+
+    return summary_text, activity
+
+
+def _ai_summary_build_embed(guild: discord.Guild, summary_text: str, activity: dict) -> discord.Embed:
+    """サマリー結果をEmbedに整形します。"""
+    embed = discord.Embed(
+        title=f"[サーバー活動レポート] 過去{activity['period_days']}日間",
+        description=summary_text[:4000],
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.add_field(name="総発言数", value=f"{activity['total_messages']}件", inline=True)
+    top_channels = activity["channel_stats"][:3]
+    if top_channels:
+        top_text = "\n".join(f"#{c['name']}（{c['message_count']}件）" for c in top_channels)
+        embed.add_field(name="活発だったチャンネル（上位）", value=top_text, inline=True)
+    embed.set_footer(text=f"{guild.name} のサーバー活動AIサマリー")
+    return embed
+
+
+_ai_summary_loop_task: Optional[asyncio.Task] = None
+
+
+async def _ai_summary_scheduler_loop():
+    """
+    全ギルドを対象に、1時間ごとに「定期自動実行の条件を満たしたギルドがないか」をチェックし、
+    条件を満たしていればサマリーを生成して投稿します。
+    条件: ai_summary_enabled=True かつ 現在のUTC曜日・時刻が設定と一致 かつ 本日まだ未実行。
+    """
+    await bot.wait_until_ready()
+    while True:
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+            all_data = load_data()
+            data_changed = False
+
+            for guild_id_str, guild_config in list(all_data.items()):
+                if not isinstance(guild_config, dict):
+                    continue
+                if not guild_config.get("ai_summary_enabled", False):
+                    continue
+                if guild_config.get("ai_summary_weekday", 0) != now.weekday():
+                    continue
+                if guild_config.get("ai_summary_hour", 9) != now.hour:
+                    continue
+                if guild_config.get("ai_summary_last_run") == today_str:
+                    continue  # 本日分は実行済み
+
+                channel_id = guild_config.get("ai_summary_channel_id")
+                if not channel_id:
+                    continue
+
+                try:
+                    guild_id_int = int(guild_id_str)
+                except (TypeError, ValueError):
+                    continue
+
+                guild = bot.get_guild(guild_id_int)
+                if guild is None:
+                    continue
+                channel = guild.get_channel(channel_id)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+
+                try:
+                    summary_text, activity = await _ai_summary_generate(guild)
+                    if summary_text is not None:
+                        embed = _ai_summary_build_embed(guild, summary_text, activity)
+                        await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[AIサマリー自動実行] {guild.name} でエラー: {e}")
+                finally:
+                    # 成否に関わらず「本日は試行済み」として記録し、同日中の再試行ループを防ぐ
+                    guild_config["ai_summary_last_run"] = today_str
+                    data_changed = True
+
+            if data_changed:
+                save_data(all_data)
+
+        except Exception as e:
+            print(f"[AIサマリースケジューラ] ループ内エラー: {e}")
+
+        await asyncio.sleep(3600)  # 1時間ごとにチェック
 
 
 async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
@@ -6721,6 +6942,151 @@ async def ai_chat_my_prompt_show(interaction: discord.Interaction):
     )
     if setting["blocked"]:
         embed.add_field(name="注意", value="あなたはこのサーバーのAIチャット利用を禁止（ブロック）されています。", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ai_chat_summary_group.command(name="run", description="【オーナー限定】サーバー活動のAIサマリーを今すぐ生成して投稿します")
+@app_commands.describe(channel="投稿先チャンネル（省略時はこのチャンネル）")
+async def ai_chat_summary_run(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていないため、この機能は利用できません。",
+            ephemeral=True
+        )
+        return
+
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("投稿先はテキストチャンネルを指定してください。", ephemeral=True)
+        return
+
+    # 全チャンネルの履歴取得には時間がかかるため、応答を保留する
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    summary_text, activity = await _ai_summary_generate(interaction.guild)
+
+    if summary_text is None:
+        if activity["total_messages"] == 0:
+            await interaction.followup.send(
+                f"過去{AI_SUMMARY_PERIOD_DAYS}日間に集計できる発言が見つかりませんでした。",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "サマリーの生成に失敗しました（Groq APIエラー）。時間をおいて再度お試しください。",
+                ephemeral=True
+            )
+        return
+
+    embed = _ai_summary_build_embed(interaction.guild, summary_text, activity)
+
+    try:
+        await target_channel.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(f"{target_channel.mention} への投稿権限がありません。", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"[完了] {target_channel.mention} にサーバー活動サマリーを投稿しました。", ephemeral=True)
+
+
+@ai_chat_summary_group.command(name="config", description="【オーナー限定】サーバー活動AIサマリーの定期自動実行を設定します")
+@app_commands.describe(
+    enabled="定期自動実行を有効にするか",
+    channel="投稿先チャンネル",
+    weekday="自動実行する曜日",
+    hour="自動実行する時刻（0-23、UTC基準）"
+)
+@app_commands.choices(weekday=[
+    app_commands.Choice(name="月曜日", value=0),
+    app_commands.Choice(name="火曜日", value=1),
+    app_commands.Choice(name="水曜日", value=2),
+    app_commands.Choice(name="木曜日", value=3),
+    app_commands.Choice(name="金曜日", value=4),
+    app_commands.Choice(name="土曜日", value=5),
+    app_commands.Choice(name="日曜日", value=6),
+])
+async def ai_chat_summary_config(
+    interaction: discord.Interaction,
+    enabled: Optional[bool] = None,
+    channel: Optional[discord.TextChannel] = None,
+    weekday: Optional[app_commands.Choice[int]] = None,
+    hour: Optional[app_commands.Range[int, 0, 23]] = None,
+):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    changed = []
+
+    if channel is not None:
+        guild_config["ai_summary_channel_id"] = channel.id
+        changed.append(f"投稿先チャンネルを {channel.mention} に設定しました")
+
+    if weekday is not None:
+        guild_config["ai_summary_weekday"] = weekday.value
+        changed.append(f"自動実行の曜日を「{weekday.name}」に設定しました")
+
+    if hour is not None:
+        guild_config["ai_summary_hour"] = hour
+        changed.append(f"自動実行の時刻を{hour}時（UTC基準）に設定しました")
+
+    if enabled is not None:
+        if enabled and not guild_config.get("ai_summary_channel_id"):
+            await interaction.response.send_message(
+                "定期自動実行を有効にするには、先に投稿先チャンネル（channel）を指定してください。",
+                ephemeral=True
+            )
+            return
+        guild_config["ai_summary_enabled"] = enabled
+        changed.append("定期自動実行を" + ("有効化しました" if enabled else "無効化しました"))
+
+    if not changed:
+        await interaction.response.send_message(
+            "変更点がありません。enabled / channel / weekday / hour のいずれかを指定してください。",
+            ephemeral=True
+        )
+        return
+
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="[AIサマリー] 定期自動実行の設定を更新しました",
+        description="\n".join(f"・{c}" for c in changed),
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ai_chat_summary_group.command(name="status", description="【オーナー限定】サーバー活動AIサマリーの現在の設定を確認します")
+async def ai_chat_summary_status(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    channel_id = guild_config.get("ai_summary_channel_id")
+    channel_obj = interaction.guild.get_channel(channel_id) if channel_id else None
+    weekday_names = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+    weekday_idx = guild_config.get("ai_summary_weekday", 0)
+    hour = guild_config.get("ai_summary_hour", 9)
+
+    embed = discord.Embed(title="[AIサマリー] 現在の設定", color=discord.Color.blue())
+    embed.add_field(
+        name="定期自動実行",
+        value="有効" if guild_config.get("ai_summary_enabled", False) else "無効",
+        inline=False
+    )
+    embed.add_field(name="投稿先チャンネル", value=channel_obj.mention if channel_obj else "未設定", inline=False)
+    embed.add_field(name="実行タイミング", value=f"毎週{weekday_names[weekday_idx]} {hour}時（UTC基準）", inline=False)
+    embed.add_field(name="最終自動実行日", value=guild_config.get("ai_summary_last_run") or "未実行", inline=False)
+    embed.add_field(name="対象期間", value=f"過去{AI_SUMMARY_PERIOD_DAYS}日間・サーバー内全テキストチャンネル", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
