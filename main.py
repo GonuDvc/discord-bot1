@@ -4775,7 +4775,7 @@ async def help_command(interaction: discord.Interaction):
                 "`/moderation mute` : ユーザーをタイムアウト（ミュート）します\n"
                 "`/moderation purge` : 指定件数のメッセージを一括削除します\n"
                 "`/moderation purge_user` : 指定チャンネル内の指定メンバーのメッセージのみ一括削除します\n"
-                "`/moderation purge_external_apps` : 外部アプリ（他Bot）のコマンド実行によるメッセージを一括削除します\n"
+                "`/moderation purge_external_apps` : 外部アプリ（他Bot）のコマンド実行によるメッセージを一括削除します（all_channelsで全チャンネル対象も可）\n"
                 "`/moderation slowmode` : チャンネルの低速モードを設定します\n"
                 "`/role_permission add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
             ),
@@ -6628,19 +6628,139 @@ async def purge_user(
         await interaction.followup.send(f"削除中にエラーが発生しました: {e}", ephemeral=True)
 
 
+class PurgeExternalAppsAllChannelsConfirmView(discord.ui.View):
+    """
+    「すべてのチャンネル」を対象にした外部アプリメッセージ一括削除の実行確認用ボタンビューです。
+    サーバー内の全テキスト系チャンネルを横断して処理するため、誤操作防止のためにボタン確認を挟みます。
+    """
+
+    def __init__(self, guild: discord.Guild, bot_user_id: int, app_filter: Optional[discord.Member], amount: int):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.bot_user_id = bot_user_id
+        self.app_filter = app_filter
+        self.amount = amount
+        self._running = False
+
+    def _is_external_app_message(self, m: discord.Message) -> bool:
+        meta = getattr(m, "interaction_metadata", None) or getattr(m, "interaction", None)
+        if meta is None:
+            return False
+        meta_user = getattr(meta, "user", None)
+        if meta_user is not None and meta_user.id == self.bot_user_id:
+            return False
+        if self.app_filter is not None and meta_user is not None and meta_user.id != self.app_filter.id:
+            return False
+        return True
+
+    @discord.ui.button(label="全チャンネルで実行する", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._running:
+            await interaction.response.send_message("すでに実行中です。しばらくお待ちください。", ephemeral=True)
+            return
+        self._running = True
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        target_channels = list(self.guild.text_channels)
+        total_deleted = 0
+        processed = []
+        skipped = []
+        failed = []
+
+        for ch in target_channels:
+            perms = ch.permissions_for(self.guild.me)
+            if not perms.manage_messages or not perms.read_message_history:
+                skipped.append(ch.name)
+                continue
+            try:
+                deleted = await ch.purge(limit=self.amount, check=self._is_external_app_message)
+                total_deleted += len(deleted)
+                if deleted:
+                    processed.append(f"{ch.mention}: {len(deleted)}件")
+            except discord.Forbidden:
+                failed.append(f"{ch.name}: 権限不足")
+            except discord.HTTPException as e:
+                failed.append(f"{ch.name}: {e}")
+            await asyncio.sleep(1)  # レート制限対策
+
+        target_desc = f"（{self.app_filter.mention} のみ）" if self.app_filter is not None else "（全ての外部アプリ）"
+        summary_lines = (
+            [f"[一括削除完了] 全 {len(target_channels)} チャンネルを確認し、外部アプリのメッセージ{target_desc}を合計 {total_deleted} 件削除しました。\n"]
+            + (["", "**削除があったチャンネル**"] + processed if processed else [])
+            + (["", "**スキップ（権限不足）**"] + skipped if skipped else [])
+            + (["", "**エラー**"] + failed if failed else [])
+        )
+        chunk = ""
+        messages = []
+        for line in summary_lines:
+            if len(chunk) + len(line) + 1 > 1900:
+                messages.append(chunk)
+                chunk = line + "\n"
+            else:
+                chunk += line + "\n"
+        if chunk:
+            messages.append(chunk)
+        for msg in messages:
+            await interaction.followup.send(msg, ephemeral=True)
+
+        self._running = False
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._running:
+            await interaction.response.send_message("すでに実行中のためキャンセルできません。", ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="キャンセルしました。", view=self)
+
+
 @moderation_group.command(name="purge_external_apps", description="【モデレーター専用】外部アプリ（他Bot）のコマンド実行によって送信されたメッセージを一括削除します")
 @app_commands.describe(
     channel="対象チャンネル（省略時は現在のチャンネル）",
+    all_channels="Trueにするとサーバー内の全テキストチャンネルを対象にします（channel指定より優先、実行前に確認あり）",
     app="削除対象を特定のアプリ/Botに絞り込む場合に指定（省略時は全ての外部アプリが対象）",
-    amount="遡って確認するメッセージ件数（1〜1000、既定200）"
+    amount="遡って確認するメッセージ件数（1〜1000、既定200）。全チャンネル対象時はチャンネルごとにこの件数を確認します"
 )
 async def purge_external_apps(
     interaction: discord.Interaction,
     channel: Optional[MuteTargetChannel] = None,
+    all_channels: bool = False,
     app: Optional[discord.Member] = None,
     amount: app_commands.Range[int, 1, 1000] = 200
 ):
     if not await is_moderator(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if app is not None and not app.bot:
+        await interaction.response.send_message("`app` にはBot/アプリのユーザーを指定してください。", ephemeral=True)
+        return
+
+    if all_channels:
+        target_desc = f"（{app.mention} のみ）" if app is not None else "（全ての外部アプリ）"
+        view = PurgeExternalAppsAllChannelsConfirmView(
+            guild=interaction.guild,
+            bot_user_id=interaction.client.user.id,
+            app_filter=app,
+            amount=amount
+        )
+        await interaction.response.send_message(
+            f"[確認] サーバー内の **すべてのテキストチャンネル（{len(interaction.guild.text_channels)}件）** を対象に、"
+            f"外部アプリのメッセージ{target_desc}を各チャンネル直近{amount}件から検索して削除します。\n"
+            "チャンネル数が多い場合、時間がかかることがあります。実行しますか？",
+            view=view,
+            ephemeral=True
+        )
+        return
 
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.Thread)):
@@ -6653,10 +6773,6 @@ async def purge_external_apps(
             f"Botに {target_channel.mention} でのメッセージ管理権限（メッセージの管理・メッセージ履歴の閲覧）がありません。",
             ephemeral=True
         )
-        return
-
-    if app is not None and not app.bot:
-        await interaction.response.send_message("`app` にはBot/アプリのユーザーを指定してください。", ephemeral=True)
         return
 
     def _is_external_app_message(m: discord.Message) -> bool:
