@@ -4206,16 +4206,49 @@ class GroqRateLimitError(GroqAPIError):
     Groq APIがレート制限（HTTP 429）を返した場合に送出される専用例外。
     呼び出し側でこれを個別にキャッチし、ユーザーに分かりやすい文言を表示するために使用します。
     """
-    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = "", limit_scope: Optional[str] = None):
         self.retry_after = retry_after
         self.raw_message = raw_message
-        suffix = f"（推定復帰まで約{retry_after:.0f}秒）" if retry_after else ""
+        self.limit_scope = limit_scope  # "TPM" / "TPD" / "RPM" / "RPD" / None（不明）
+        suffix = f"（推定復帰まで約{_format_duration(retry_after)}）" if retry_after else ""
         super().__init__(f"Groq APIのレート制限に達しました{suffix}")
 
 
-# Groqのレート制限エラーメッセージから "Please try again in 11.325s" のような
-# 待機秒数を抽出するための正規表現。
-_GROQ_RETRY_AFTER_PATTERN = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
+def _format_duration(seconds: float) -> str:
+    """秒数を「7分7秒」のような日本語表記に変換します。"""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分{secs}秒" if secs else f"{minutes}分"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}時間{minutes}分" if minutes else f"{hours}時間"
+
+
+# Groqのレート制限エラーメッセージから "Please try again in 11.325s" や
+# "Please try again in 7m7.248s" のような待機時間を抽出するための正規表現。
+# 時(h)・分(m)・秒(s)は任意の組み合わせで出現しうる（例: "1h2m3.4s", "7m7.248s", "11.325s"）。
+_GROQ_RETRY_AFTER_PATTERN = re.compile(
+    r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?",
+    re.IGNORECASE
+)
+
+# エラーメッセージ中の "on tokens per day (TPD)" / "on tokens per minute (TPM)" 等から
+# どの種類の制限に達したかを判定するための正規表現。
+_GROQ_LIMIT_SCOPE_PATTERN = re.compile(r"\(([A-Z]{3})\)")
+
+
+def _parse_groq_retry_after(err_text: str) -> Optional[float]:
+    """Groqのエラーメッセージから待機秒数を抽出します（時/分/秒の混在に対応）。"""
+    m = _GROQ_RETRY_AFTER_PATTERN.search(err_text)
+    if not m or not any(m.groups()):
+        return None
+    hours = float(m.group(1)) if m.group(1) else 0.0
+    minutes = float(m.group(2)) if m.group(2) else 0.0
+    secs = float(m.group(3)) if m.group(3) else 0.0
+    total = hours * 3600 + minutes * 60 + secs
+    return total if total > 0 else None
 
 
 async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str:
@@ -4267,13 +4300,14 @@ async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str
                     except ValueError:
                         retry_after = None
                 if retry_after is None:
-                    m = _GROQ_RETRY_AFTER_PATTERN.search(err_text)
-                    if m:
-                        try:
-                            retry_after = float(m.group(1))
-                        except ValueError:
-                            retry_after = None
-                raise GroqRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+                    retry_after = _parse_groq_retry_after(err_text)
+
+                limit_scope: Optional[str] = None
+                scope_m = _GROQ_LIMIT_SCOPE_PATTERN.search(err_text)
+                if scope_m:
+                    limit_scope = scope_m.group(1)  # 例: "TPM", "TPD", "RPM", "RPD"
+
+                raise GroqRateLimitError(retry_after=retry_after, raw_message=err_text[:300], limit_scope=limit_scope)
             if resp.status != 200:
                 err_text = await resp.text()
                 raise GroqAPIError(f"Groq APIエラー（HTTP {resp.status}）: {err_text[:300]}")
@@ -4346,9 +4380,17 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
             reply_text = await _ai_chat_call_groq(messages, model=model)
     except GroqRateLimitError as e:
         try:
-            wait_hint = f"（あと約{e.retry_after:.0f}秒ほどで復帰する見込みです）" if e.retry_after else ""
+            wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
+
+            if e.limit_scope == "TPD" or e.limit_scope == "RPD":
+                scope_text = "本日の利用上限"
+            elif e.limit_scope == "TPM" or e.limit_scope == "RPM":
+                scope_text = "レート制限（短時間の利用集中）"
+            else:
+                scope_text = "レート制限"
+
             await message.reply(
-                "[AIチャット] ⚠️ 現在レート制限に引っかかっています。BOTを少し休ませてください。"
+                f"[AIチャット] ⚠️ 現在{scope_text}に引っかかっています。BOTを少し休ませてください。"
                 f"{wait_hint}\nしばらく時間をおいてから、もう一度お試しください。",
                 mention_author=False
             )
