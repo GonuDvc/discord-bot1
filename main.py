@@ -408,6 +408,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("hiroyuki_ng_mode_enabled", False),   # True: NGワードを含む発言にのみ反応する専用モード
         ("hiroyuki_ng_words", []),             # ひろゆきモード専用のNGワード一覧
         ("hiroyuki_ng_reply", "そういうのやめてもらっていいですか"),  # NGワード検知時の固定返信文
+        # --- AIチャット：一時停止・ユーザー個別設定（オーナー専用） ---
+        ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
+        ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -4177,14 +4180,59 @@ def _ai_chat_clear_history(channel_id: int, user_id: Optional[int] = None):
         _ai_chat_histories.pop(key, None)
 
 
-async def _ai_chat_call_groq(messages: list) -> str:
+def _ai_chat_get_user_setting(guild_config: dict, user_id: int) -> dict:
+    """
+    指定ユーザーのAIチャット個別設定を取得します。
+    未設定の場合はデフォルト値（model=None, system_prompt=None, blocked=False）を返します。
+    戻り値の辞書を書き換えても guild_config には反映されません（保存する場合は
+    _ai_chat_set_user_setting 等で明示的に書き戻してください）。
+    """
+    user_settings = guild_config.get("ai_chat_user_settings", {})
+    entry = user_settings.get(str(user_id), {})
+    return {
+        "model": entry.get("model"),
+        "system_prompt": entry.get("system_prompt"),
+        "blocked": entry.get("blocked", False),
+    }
+
+
+class GroqAPIError(RuntimeError):
+    """Groq API呼び出しに関する汎用エラー。"""
+    pass
+
+
+class GroqRateLimitError(GroqAPIError):
+    """
+    Groq APIがレート制限（HTTP 429）を返した場合に送出される専用例外。
+    呼び出し側でこれを個別にキャッチし、ユーザーに分かりやすい文言を表示するために使用します。
+    """
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+        self.retry_after = retry_after
+        self.raw_message = raw_message
+        suffix = f"（推定復帰まで約{retry_after:.0f}秒）" if retry_after else ""
+        super().__init__(f"Groq APIのレート制限に達しました{suffix}")
+
+
+# Groqのレート制限エラーメッセージから "Please try again in 11.325s" のような
+# 待機秒数を抽出するための正規表現。
+_GROQ_RETRY_AFTER_PATTERN = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
+
+
+async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str:
     """
     Groq Chat Completions APIを呼び出し、応答テキストを返します。
     失敗時は例外を送出するので、呼び出し側でtry/exceptしてください。
+    HTTP 429（レート制限）の場合は GroqRateLimitError を送出し、
+    それ以外のエラーは GroqAPIError を送出します。
 
     DeepSeek-R1やQwen3など「推論(reasoning)モデル」は応答に <think>...</think> 形式で
     思考過程を含めることがあります。reasoning_format="hidden" で抑制を試みつつ、
     対応していないモデル向けに文字列側でも <think> タグを除去するフォールバックを行います。
+
+    Args:
+        messages: Chat Completions形式のメッセージ配列。
+        model: 使用するモデル名。省略時はグローバル既定値（GROQ_MODEL）を使用します。
+               ユーザー個別設定でモデルが指定されている場合はここに渡してください。
     """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY が設定されていません。Botの環境変数を確認してください。")
@@ -4194,7 +4242,7 @@ async def _ai_chat_call_groq(messages: list) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": GROQ_MODEL,
+        "model": model or GROQ_MODEL,
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": GROQ_MAX_TOKENS,
@@ -4208,16 +4256,34 @@ async def _ai_chat_call_groq(messages: list) -> str:
             json=payload,
             timeout=aiohttp.ClientTimeout(total=30)
         ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after: Optional[float] = None
+                # Retry-Afterヘッダがあれば優先的に使用
+                header_val = resp.headers.get("Retry-After")
+                if header_val:
+                    try:
+                        retry_after = float(header_val)
+                    except ValueError:
+                        retry_after = None
+                if retry_after is None:
+                    m = _GROQ_RETRY_AFTER_PATTERN.search(err_text)
+                    if m:
+                        try:
+                            retry_after = float(m.group(1))
+                        except ValueError:
+                            retry_after = None
+                raise GroqRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
             if resp.status != 200:
                 err_text = await resp.text()
-                raise RuntimeError(f"Groq APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                raise GroqAPIError(f"Groq APIエラー（HTTP {resp.status}）: {err_text[:300]}")
             data = await resp.json()
 
     try:
         choice = data["choices"][0]
         raw_content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        raise RuntimeError(f"Groq APIの応答形式が想定と異なります: {data}")
+        raise GroqAPIError(f"Groq APIの応答形式が想定と異なります: {data}")
 
     reply_text = _strip_reasoning_tags(raw_content).strip()
 
@@ -4254,18 +4320,41 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     if not GROQ_API_KEY:
         return  # APIキー未設定時は無反応（オーナーが気付けるようログにだけ出す）
 
+    # サーバー単位の一時停止（オーナーが /ai_chat pause で設定）
+    if guild_config.get("ai_chat_paused", False):
+        return  # 一時停止中は無反応（オーナーが意図的に止めているため通知もしない）
+
+    # ユーザー個別設定の取得（モデル切替・システムプロンプト・利用ブロック）
+    user_setting = _ai_chat_get_user_setting(guild_config, message.author.id)
+    if user_setting["blocked"]:
+        return  # ブロック済みユーザーには無反応
+
     content = message.content.strip()
     if not content:
         return  # 添付ファイルのみ等、テキストが無い場合はスキップ
 
+    system_prompt = user_setting["system_prompt"] or AI_CHAT_SYSTEM_PROMPT
+    model = user_setting["model"] or None  # Noneなら _ai_chat_call_groq側でGROQ_MODELが使われる
+
     history = _ai_chat_get_history(message.channel.id, message.author.id)
-    messages = [{"role": "system", "content": AI_CHAT_SYSTEM_PROMPT}] + history + [
+    messages = [{"role": "system", "content": system_prompt}] + history + [
         {"role": "user", "content": content}
     ]
 
     try:
         async with message.channel.typing():
-            reply_text = await _ai_chat_call_groq(messages)
+            reply_text = await _ai_chat_call_groq(messages, model=model)
+    except GroqRateLimitError as e:
+        try:
+            wait_hint = f"（あと約{e.retry_after:.0f}秒ほどで復帰する見込みです）" if e.retry_after else ""
+            await message.reply(
+                "[AIチャット] ⚠️ 現在レート制限に引っかかっています。BOTを少し休ませてください。"
+                f"{wait_hint}\nしばらく時間をおいてから、もう一度お試しください。",
+                mention_author=False
+            )
+        except Exception:
+            pass
+        return
     except Exception as e:
         try:
             await message.reply(f"[AIチャット] 応答生成に失敗しました: {e}", mention_author=False)
@@ -6048,6 +6137,204 @@ async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: boo
     else:
         _ai_chat_clear_history(interaction.channel.id, interaction.user.id)
         await interaction.response.send_message("あなたのAIチャット履歴をクリアしました。", ephemeral=True)
+
+
+@ai_chat_group.command(name="pause", description="【オーナー限定】このサーバーのAIチャット自動応答を一時停止します")
+async def ai_chat_pause(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    if guild_config.get("ai_chat_paused", False):
+        await interaction.response.send_message("このサーバーのAIチャットは既に一時停止中です。", ephemeral=True)
+        return
+
+    guild_config["ai_chat_paused"] = True
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        "[一時停止] このサーバーのAIチャット自動応答を一時停止しました。\n"
+        "再開するには `/ai_chat resume` を実行してください。",
+        ephemeral=True
+    )
+
+
+@ai_chat_group.command(name="resume", description="【オーナー限定】このサーバーのAIチャット自動応答の一時停止を解除します")
+async def ai_chat_resume(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    if not guild_config.get("ai_chat_paused", False):
+        await interaction.response.send_message("このサーバーのAIチャットは一時停止していません。", ephemeral=True)
+        return
+
+    guild_config["ai_chat_paused"] = False
+    save_data(all_data)
+
+    await interaction.response.send_message("[再開] このサーバーのAIチャット自動応答を再開しました。", ephemeral=True)
+
+
+@ai_chat_group.command(name="user_config", description="【オーナー限定】特定ユーザーのAIチャット設定（使用モデル・システムプロンプト）をカスタマイズします")
+@app_commands.describe(
+    user="設定を変更するユーザー",
+    model="このユーザーに使用させるGroqモデル名（未指定なら変更しない）",
+    system_prompt="このユーザー専用のシステムプロンプト（人格・対応方針）。未指定なら変更しない",
+    reset_model="指定するとモデル設定をクリアし、サーバー既定（GROQ_MODEL）に戻します",
+    reset_system_prompt="指定するとシステムプロンプト設定をクリアし、既定プロンプトに戻します"
+)
+async def ai_chat_user_config(
+    interaction: discord.Interaction,
+    user: discord.User,
+    model: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    reset_model: bool = False,
+    reset_system_prompt: bool = False,
+):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    user_settings = guild_config.setdefault("ai_chat_user_settings", {})
+    user_id_str = str(user.id)
+    entry = user_settings.setdefault(user_id_str, {"model": None, "system_prompt": None, "blocked": False})
+
+    changed = []
+    if reset_model:
+        entry["model"] = None
+        changed.append("モデル設定をリセットしました（サーバー既定を使用）")
+    elif model is not None:
+        entry["model"] = model
+        changed.append(f"使用モデルを `{model}` に設定しました")
+
+    if reset_system_prompt:
+        entry["system_prompt"] = None
+        changed.append("システムプロンプトをリセットしました（既定プロンプトを使用）")
+    elif system_prompt is not None:
+        entry["system_prompt"] = system_prompt
+        changed.append("システムプロンプトを更新しました")
+
+    if not changed:
+        await interaction.response.send_message(
+            "変更点がありません。model / system_prompt / reset_model / reset_system_prompt のいずれかを指定してください。",
+            ephemeral=True
+        )
+        return
+
+    # 空の設定（すべてNone・ブロックもFalse）ならエントリごと削除してデータを整理
+    if entry["model"] is None and entry["system_prompt"] is None and not entry.get("blocked", False):
+        user_settings.pop(user_id_str, None)
+
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="[AIチャット] ユーザー個別設定を更新しました",
+        description=f"対象ユーザー: {user.mention}\n" + "\n".join(f"・{c}" for c in changed),
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ai_chat_group.command(name="user_block", description="【オーナー限定】特定ユーザーのAIチャット利用を禁止（ブロック）します")
+@app_commands.describe(user="ブロックするユーザー")
+async def ai_chat_user_block(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    user_settings = guild_config.setdefault("ai_chat_user_settings", {})
+    user_id_str = str(user.id)
+    entry = user_settings.setdefault(user_id_str, {"model": None, "system_prompt": None, "blocked": False})
+    entry["blocked"] = True
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[ブロック] {user.mention} のAIチャット利用を禁止しました。",
+        ephemeral=True
+    )
+
+
+@ai_chat_group.command(name="user_unblock", description="【オーナー限定】特定ユーザーのAIチャット利用禁止（ブロック）を解除します")
+@app_commands.describe(user="ブロックを解除するユーザー")
+async def ai_chat_user_unblock(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    user_settings = guild_config.setdefault("ai_chat_user_settings", {})
+    user_id_str = str(user.id)
+    entry = user_settings.get(user_id_str)
+
+    if not entry or not entry.get("blocked", False):
+        await interaction.response.send_message(f"{user.mention} はブロックされていません。", ephemeral=True)
+        return
+
+    entry["blocked"] = False
+    # 空の設定になったらエントリごと削除してデータを整理
+    if entry.get("model") is None and entry.get("system_prompt") is None:
+        user_settings.pop(user_id_str, None)
+    save_data(all_data)
+
+    await interaction.response.send_message(f"[解除] {user.mention} のAIチャット利用禁止を解除しました。", ephemeral=True)
+
+
+@ai_chat_group.command(name="user_reset", description="【オーナー限定】特定ユーザーのAIチャット個別設定（モデル・プロンプト・ブロック）を全てリセットします")
+@app_commands.describe(user="設定をリセットするユーザー")
+async def ai_chat_user_reset(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    user_settings = guild_config.setdefault("ai_chat_user_settings", {})
+    user_id_str = str(user.id)
+
+    if user_id_str not in user_settings:
+        await interaction.response.send_message(f"{user.mention} には個別設定がありません。", ephemeral=True)
+        return
+
+    user_settings.pop(user_id_str, None)
+    save_data(all_data)
+
+    await interaction.response.send_message(f"[リセット] {user.mention} のAIチャット個別設定を全てリセットしました。", ephemeral=True)
+
+
+@ai_chat_group.command(name="user_status", description="【オーナー限定】特定ユーザーのAIチャット個別設定を確認します")
+@app_commands.describe(user="確認するユーザー")
+async def ai_chat_user_status(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    setting = _ai_chat_get_user_setting(guild_config, user.id)
+
+    embed = discord.Embed(
+        title="[AIチャット] ユーザー個別設定",
+        description=f"対象ユーザー: {user.mention}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="使用モデル", value=f"`{setting['model']}`" if setting["model"] else f"（サーバー既定: `{GROQ_MODEL}`）", inline=False)
+    embed.add_field(
+        name="システムプロンプト",
+        value=(setting["system_prompt"][:500] if setting["system_prompt"] else "（既定プロンプトを使用）"),
+        inline=False
+    )
+    embed.add_field(name="利用禁止（ブロック）", value="はい" if setting["blocked"] else "いいえ", inline=False)
+    embed.add_field(
+        name="このサーバーの一時停止状態",
+        value="一時停止中" if guild_config.get("ai_chat_paused", False) else "稼働中",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
