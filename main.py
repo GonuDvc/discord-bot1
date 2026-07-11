@@ -46,6 +46,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# 推論(reasoning)系モデルは思考過程もこのトークン数を消費するため、
+# reasoning_format="hidden" で隠していても本文が短くなりがち。
+# 通常モデルより余裕を持たせたい場合は環境変数で調整してください。
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "2048"))
 
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
@@ -4193,7 +4197,7 @@ async def _ai_chat_call_groq(messages: list) -> str:
         "model": GROQ_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 1024,
+        "max_tokens": GROQ_MAX_TOKENS,
         "reasoning_format": "hidden",  # 推論モデルの思考過程を応答本文に含めない（対応モデルのみ有効）
     }
 
@@ -4210,11 +4214,20 @@ async def _ai_chat_call_groq(messages: list) -> str:
             data = await resp.json()
 
     try:
-        raw_content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        raw_content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise RuntimeError(f"Groq APIの応答形式が想定と異なります: {data}")
 
-    return _strip_reasoning_tags(raw_content).strip()
+    reply_text = _strip_reasoning_tags(raw_content).strip()
+
+    # 推論モデルは思考過程もmax_tokensを消費するため、本文が生成しきれず
+    # 途中で打ち切られる（finish_reason == "length"）ことがある。
+    # その場合は目立つように注記を付ける（GROQ_MAX_TOKENSを増やすことで軽減可能）。
+    if choice.get("finish_reason") == "length":
+        reply_text += "\n\n*（⚠️ 出力上限のため応答が途中で切れている可能性があります）*"
+
+    return reply_text
 
 
 _THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
