@@ -50,6 +50,13 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # reasoning_format="hidden" で隠していても本文が短くなりがち。
 # 通常モデルより余裕を持たせたい場合は環境変数で調整してください。
 GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "2048"))
+# メインモデル（GROQ_MODEL、またはユーザー個別設定モデル）が日次トークン上限（TPD）に
+# 達した場合に自動で切り替えるフォールバックモデル。カンマ区切りで優先順に複数指定可能。
+# 例: "llama-3.1-8b-instant,gemma2-9b-it"
+# 未設定時はフォールバックを行わない。
+GROQ_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("GROQ_FALLBACK_MODELS", "").split(",") if m.strip()
+]
 
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
@@ -4375,9 +4382,31 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         {"role": "user", "content": content}
     ]
 
+    # 試行するモデルの候補列を構築（メインモデル → フォールバックモデルの順）。
+    # ユーザー個別モデル設定がある場合はそれを最優先の「メイン」として扱い、
+    # それがTPD（日次上限）に達した場合のみフォールバック候補を順に試します。
+    candidate_models = [model] + GROQ_FALLBACK_MODELS
+
+    reply_text: Optional[str] = None
+    used_model: Optional[str] = None
+    last_error: Optional[Exception] = None
+
     try:
         async with message.channel.typing():
-            reply_text = await _ai_chat_call_groq(messages, model=model)
+            for idx, candidate in enumerate(candidate_models):
+                try:
+                    reply_text = await _ai_chat_call_groq(messages, model=candidate)
+                    used_model = candidate or GROQ_MODEL
+                    break
+                except GroqRateLimitError as e:
+                    last_error = e
+                    is_daily_limit = e.limit_scope in ("TPD", "RPD")
+                    is_last_candidate = (idx == len(candidate_models) - 1)
+                    # TPD（日次上限）以外、またはもう試す候補が無い場合はここで打ち切ってユーザーに通知
+                    if not is_daily_limit or is_last_candidate:
+                        raise
+                    # TPDかつ次の候補があるので、次のモデルで再試行を続ける
+                    continue
     except GroqRateLimitError as e:
         try:
             wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
@@ -4390,7 +4419,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 scope_text = "レート制限"
 
             await message.reply(
-                f"[AIチャット] ⚠️ 現在{scope_text}に引っかかっています。BOTを少し休ませてください。"
+                f"[AIチャット] 現在{scope_text}に引っかかっています。BOTを少し休ませてください。"
                 f"{wait_hint}\nしばらく時間をおいてから、もう一度お試しください。",
                 mention_author=False
             )
@@ -4407,6 +4436,11 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     if not reply_text:
         # 思考過程のみが返って本文が空になった等のケース
         reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
+
+    # フォールバックモデルで応答した場合はその旨を一言添える
+    primary_model = model or GROQ_MODEL
+    if used_model and used_model != primary_model:
+        reply_text += f"\n\n*（本日の利用上限のため、フォールバックモデル `{used_model}` で応答しました）*"
 
     _ai_chat_append_history(message.channel.id, message.author.id, content, reply_text)
 
