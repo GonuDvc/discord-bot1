@@ -5724,6 +5724,73 @@ async def server_disable_external_apps(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@server_group.command(name="role_lockdown_channels", description="【管理者専用】指定ロールのすべてのチャンネル権限で『@everyoneメンション』『外部アプリ使用』を不可にします")
+@app_commands.describe(role="制限を適用するロール")
+async def server_role_lockdown_channels(interaction: discord.Interaction, role: discord.Role):
+    if not await is_guild_admin(interaction): return
+    if not interaction.guild: return
+
+    guild = interaction.guild
+
+    if role.is_default():
+        await interaction.response.send_message(
+            "@everyone ロールは指定できません。個別のロールを指定してください。", ephemeral=True
+        )
+        return
+
+    if role >= guild.me.top_role:
+        await interaction.response.send_message(
+            "指定されたロールがBotのロールと同じか、より上位にあるため操作できません。ロール階層を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    updated = []
+    skipped = []
+    failed = []
+
+    all_channels = list(guild.channels)  # カテゴリ含む全チャンネル（フォーラム・ステージ等も対象）
+
+    for ch in all_channels:
+        try:
+            existing = ch.overwrites_for(role)
+            if existing.mention_everyone is False and existing.use_external_apps is False:
+                skipped.append(ch)
+                continue
+            existing.update(mention_everyone=False, use_external_apps=False)
+            await ch.set_permissions(
+                role,
+                overwrite=existing,
+                reason=f"{interaction.user} によりロール「{role.name}」の全チャンネル権限を一括制限"
+            )
+            updated.append(ch)
+        except discord.Forbidden:
+            failed.append((ch.name, "Botの権限不足"))
+        except discord.HTTPException as e:
+            failed.append((ch.name, str(e)))
+        await asyncio.sleep(0.5)  # レート制限対策
+
+    embed = discord.Embed(
+        title=f"[チャンネル権限一括制限] {role.name}",
+        description=(
+            f"{role.mention} について、サーバー内すべてのチャンネル（全 {len(all_channels)} 件）の権限オーバーライドで\n"
+            "『@everyoneメンション（mention_everyone）』『外部アプリの使用（use_external_apps）』を **不可** に設定しました。"
+        ),
+        color=discord.Color.green() if not failed else discord.Color.orange()
+    )
+    embed.add_field(name="✅ 更新したチャンネル", value=f"{len(updated)}件", inline=True)
+    embed.add_field(name="➖ 元から設定済みだったチャンネル", value=f"{len(skipped)}件", inline=True)
+    embed.add_field(name="❌ 失敗", value=f"{len(failed)}件", inline=True)
+
+    if failed:
+        fail_text = "\n".join(f"・{name}: {reason}" for name, reason in failed)[:1024]
+        embed.add_field(name="失敗したチャンネル", value=fail_text, inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @server_group.command(name="role_panel", description="指定したロール（最大23個）を取得できるセレクトメニュー付きパネルを送信します")
 async def server_role_panel(
     interaction: discord.Interaction, title: str, description: str,
