@@ -562,6 +562,7 @@ ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット�
 ai_chat_my_prompt_group = app_commands.Group(name="my_prompt", description="自分専用のAIチャット人格設定（システムプロンプト）を管理します", parent=ai_chat_group)
 ai_chat_summary_group = app_commands.Group(name="weekly_summary", description="【オーナー限定】サーバー活動のAIサマリー機能の管理", parent=ai_chat_group)
 ai_debate_group = app_commands.Group(name="ai_debate", description="【オーナー限定】AI同士（2人格）の自動会話機能の管理")
+ai_debate_random_group = app_commands.Group(name="random", description="お題・人格をAIにランダム生成させて開始します", parent=ai_debate_group)
 
 
 bot.tree.add_command(owner_trust_group)
@@ -4673,10 +4674,12 @@ async def _ai_summary_scheduler_loop():
 # ====================================================================
 # ・オーナーが /ai_debate start で2つの人格（システムプロンプト）とお題を指定すると、
 #   指定チャンネルでAI同士が交互に発言を続けます。
+# ・/ai_debate random start では、お題・2人格（名前+プロンプト）をGroq自身に
+#   都度ランダム生成させてから開始します（実行のたびに完全に新しい内容）。
 # ・停止するまで無限に続くため、暴走防止として以下の制御を入れています：
 #     1. 発言間隔（既定10秒、変更可）を必ず空けてから次の発言を生成する
 #     2. 1チャンネルにつき同時に1つのディベートのみ実行可（二重起動防止）
-#     3. サーバーごとに同時実行数の上限（既定1つ）を設ける
+#     3. 最大ターン数は既定で無制限（stopするまで継続）。指定する場合も上限は設けない
 #     4. Groqのレート制限エラーを検知した場合は自動で一時停止し、通知する
 # ・会話履歴はメモリ上のみで保持し、直近の往復数のみ渡してトークン消費を抑えます
 #   （プロセス再起動やBot再起動でディベートは自動停止します＝再開はオーナーが再実行）
@@ -4688,8 +4691,55 @@ AI_DEBATE_MIN_INTERVAL_SECONDS = 5        # 発言間隔の最小値（連投防
 AI_DEBATE_MAX_INTERVAL_SECONDS = 600      # 発言間隔の最大値
 AI_DEBATE_MAX_MESSAGE_LENGTH = 800        # 1発言あたりの最大文字数（Discord表示・トークン節約のため）
 
+_AI_DEBATE_RANDOM_GEN_SYSTEM_PROMPT = (
+    "あなたはDiscord上で行う「AI同士の自動ディベート（会話）」の設定を考えるアシスタントです。"
+    "毎回まったく新しく、ユニークで面白いお題と、性格が対照的な2人のキャラクター設定を考えてください。\n"
+    "・お題は雑談、討論、ロールプレイ、コント等、幅広いジャンルから自由に発想してください。\n"
+    "・2人のキャラクターは名前・口調・性格が明確に異なるようにしてください。\n"
+    "・過激な性的表現、暴力的表現、差別的表現は避けてください。\n\n"
+    "必ず次のJSON形式のみで出力してください。説明文やコードブロックは不要です。\n"
+    '{"topic": "お題（80文字以内）", '
+    '"persona_a_name": "1人目の名前（20文字以内）", "persona_a_prompt": "1人目の人格・口調の指示（150文字以内）", '
+    '"persona_b_name": "2人目の名前（20文字以内）", "persona_b_prompt": "2人目の人格・口調の指示（150文字以内）"}'
+)
+
 # {channel_id: {"task": asyncio.Task, ...state...}}
 _ai_debate_sessions: dict = {}
+
+
+async def _ai_debate_generate_random_setup() -> dict:
+    """
+    Groqに「面白いお題と対照的な2人格」をJSON形式で生成させます。
+    戻り値: {"topic": str, "persona_a_name": str, "persona_a_prompt": str,
+             "persona_b_name": str, "persona_b_prompt": str}
+    生成・解析に失敗した場合は GroqAPIError または ValueError を送出します。
+    """
+    messages = [
+        {"role": "system", "content": _AI_DEBATE_RANDOM_GEN_SYSTEM_PROMPT},
+        {"role": "user", "content": "新しいお題と2人格を考えてください。"},
+    ]
+    raw = await _ai_chat_call_groq(messages)
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"ランダム設定の生成結果を解析できませんでした: {e}")
+
+    required_keys = ("topic", "persona_a_name", "persona_a_prompt", "persona_b_name", "persona_b_prompt")
+    if not all(k in parsed and str(parsed[k]).strip() for k in required_keys):
+        raise ValueError("ランダム設定の生成結果に必要な項目が不足しています。")
+
+    return {
+        "topic": str(parsed["topic"]).strip()[:200],
+        "persona_a_name": str(parsed["persona_a_name"]).strip()[:80],
+        "persona_a_prompt": str(parsed["persona_a_prompt"]).strip()[:400],
+        "persona_b_name": str(parsed["persona_b_name"]).strip()[:80],
+        "persona_b_prompt": str(parsed["persona_b_prompt"]).strip()[:400],
+    }
 
 
 def _ai_debate_build_system_prompt(persona_name: str, persona_prompt: str, opponent_name: str, topic: str) -> str:
@@ -4711,7 +4761,7 @@ def _ai_debate_build_system_prompt(persona_name: str, persona_prompt: str, oppon
 async def _ai_debate_generate_turn(session: dict, speaker_key: str) -> str:
     """
     指定した話者（speaker_key: "a" または "b"）の次の発言をGroqで生成します。
-    session["history"] は {"role": "a"|"b", "content": str} のリストで、
+    session["history"] は {"speaker": "a"|"b", "content": str} のリストで、
     話者から見て自分の発言はassistant、相手の発言はuserとして組み立てます。
     """
     persona = session["personas"][speaker_key]
@@ -4803,7 +4853,7 @@ async def _ai_debate_loop(channel_id: int):
             except discord.HTTPException:
                 pass
 
-            # 上限ターン数が設定されていれば、到達時点で自動終了する
+            # 上限ターン数が設定されていれば、到達時点で自動終了する（未設定＝無制限）
             max_turns = session.get("max_turns")
             if max_turns and session["turn_count"] >= max_turns:
                 try:
@@ -4821,6 +4871,85 @@ async def _ai_debate_loop(channel_id: int):
         raise
     finally:
         _ai_debate_sessions.pop(channel_id, None)
+
+
+async def _ai_debate_launch(
+    interaction: discord.Interaction,
+    *,
+    topic: str,
+    persona_a_name: str,
+    persona_a_prompt: str,
+    persona_b_name: str,
+    persona_b_prompt: str,
+    interval_seconds: int,
+    max_turns: Optional[int],
+    model: Optional[str],
+    is_random: bool,
+):
+    """
+    /ai_debate start と /ai_debate random start の共通処理。
+    事前チェック（権限・チャンネル種別・二重起動・送信権限）を行い、
+    セッションを登録してバックグラウンドタスクを起動、開始メッセージを送信します。
+    """
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send("このコマンドはテキストチャンネルで実行してください。", ephemeral=True)
+        return
+
+    if channel.id in _ai_debate_sessions:
+        await interaction.followup.send(
+            "このチャンネルでは既にAIディベートが進行中です。`/ai_debate stop` で停止してから再開してください。",
+            ephemeral=True
+        )
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.send_messages or not perms.view_channel:
+        await interaction.followup.send(
+            f"Botに {channel.mention} での発言権限がありません。チャンネル権限を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    session = {
+        "channel": channel,
+        "guild_id": interaction.guild.id,
+        "topic": topic,
+        "personas": {
+            "a": {"name": persona_a_name[:80], "prompt": persona_a_prompt},
+            "b": {"name": persona_b_name[:80], "prompt": persona_b_prompt},
+        },
+        "history": [],
+        "turn_count": 0,
+        "interval_seconds": interval_seconds,
+        "max_turns": max_turns,
+        "model": model,
+        "started_by": interaction.user.id,
+        "stopped": False,
+    }
+    _ai_debate_sessions[channel.id] = session
+
+    task = asyncio.create_task(_ai_debate_loop(channel.id))
+    session["task"] = task
+
+    embed = discord.Embed(
+        title="[AIディベート] " + ("ランダム設定で開始しました" if is_random else "開始しました"),
+        description=f"お題: {topic}",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="人格A", value=f"**{persona_a_name}**\n{persona_a_prompt[:200]}", inline=True)
+    embed.add_field(name="人格B", value=f"**{persona_b_name}**\n{persona_b_prompt[:200]}", inline=True)
+    embed.add_field(
+        name="設定",
+        value=(
+            f"発言間隔: {interval_seconds}秒\n"
+            f"最大ターン数: {max_turns if max_turns else '無制限（/ai_debate stopまで継続）'}\n"
+            f"使用モデル: `{model or GROQ_MODEL}`"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="停止するには /ai_debate stop を実行してください")
+    await interaction.followup.send(embed=embed)
 
 
 @ai_debate_group.command(name="start", description="【オーナー限定】2つの人格を設定し、AI同士の自動会話をこのチャンネルで開始します")
@@ -4842,7 +4971,7 @@ async def ai_debate_start(
     人格b名前: str,
     人格bプロンプト: str,
     発言間隔秒: app_commands.Range[int, AI_DEBATE_MIN_INTERVAL_SECONDS, AI_DEBATE_MAX_INTERVAL_SECONDS] = AI_DEBATE_DEFAULT_INTERVAL_SECONDS,
-    最大ターン数: Optional[app_commands.Range[int, 1, 500]] = None,
+    最大ターン数: Optional[int] = None,
     モデル: Optional[str] = None,
 ):
     if not await is_owner_check(interaction):
@@ -4857,65 +4986,88 @@ async def ai_debate_start(
         )
         return
 
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message("このコマンドはテキストチャンネルで実行してください。", ephemeral=True)
+    if 最大ターン数 is not None and 最大ターン数 < 1:
+        await interaction.response.send_message("最大ターン数は1以上で指定してください（未指定なら無制限）。", ephemeral=True)
         return
 
-    if channel.id in _ai_debate_sessions:
+    await interaction.response.defer()
+    await _ai_debate_launch(
+        interaction,
+        topic=お題,
+        persona_a_name=人格a名前,
+        persona_a_prompt=人格aプロンプト,
+        persona_b_name=人格b名前,
+        persona_b_prompt=人格bプロンプト,
+        interval_seconds=発言間隔秒,
+        max_turns=最大ターン数,
+        model=モデル,
+        is_random=False,
+    )
+
+
+@ai_debate_random_group.command(name="start", description="【オーナー限定】お題・2人格をAIにランダム生成させ、AI同士の自動会話をこのチャンネルで開始します")
+@app_commands.describe(
+    発言間隔秒="次の発言までの待機秒数（既定10秒、5〜600秒）",
+    最大ターン数="指定した往復数に達すると自動終了します（未指定なら無制限、stopするまで継続）",
+    モデル="使用するGroqモデル名（未指定ならサーバー既定のGROQ_MODELを使用）"
+)
+async def ai_debate_random_start(
+    interaction: discord.Interaction,
+    発言間隔秒: app_commands.Range[int, AI_DEBATE_MIN_INTERVAL_SECONDS, AI_DEBATE_MAX_INTERVAL_SECONDS] = AI_DEBATE_DEFAULT_INTERVAL_SECONDS,
+    最大ターン数: Optional[int] = None,
+    モデル: Optional[str] = None,
+):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていないため、この機能は利用できません。", ephemeral=True
+        )
+        return
+
+    if 最大ターン数 is not None and 最大ターン数 < 1:
+        await interaction.response.send_message("最大ターン数は1以上で指定してください（未指定なら無制限）。", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    if isinstance(channel, discord.TextChannel) and channel.id in _ai_debate_sessions:
         await interaction.response.send_message(
             "このチャンネルでは既にAIディベートが進行中です。`/ai_debate stop` で停止してから再開してください。",
             ephemeral=True
         )
         return
 
-    perms = channel.permissions_for(interaction.guild.me)
-    if not perms.send_messages or not perms.view_channel:
-        await interaction.response.send_message(
-            f"Botに {channel.mention} での発言権限がありません。チャンネル権限を確認してください。",
+    await interaction.response.defer(thinking=True)
+
+    try:
+        setup = await _ai_debate_generate_random_setup()
+    except GroqRateLimitError as e:
+        wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
+        await interaction.followup.send(
+            f"Groq APIのレート制限に達しているため、ランダム設定を生成できませんでした。{wait_hint}",
             ephemeral=True
         )
         return
+    except Exception as e:
+        await interaction.followup.send(f"ランダム設定の生成に失敗しました: {e}", ephemeral=True)
+        return
 
-    session = {
-        "channel": channel,
-        "guild_id": interaction.guild.id,
-        "topic": お題,
-        "personas": {
-            "a": {"name": 人格a名前[:80], "prompt": 人格aプロンプト},
-            "b": {"name": 人格b名前[:80], "prompt": 人格bプロンプト},
-        },
-        "history": [],
-        "turn_count": 0,
-        "interval_seconds": 発言間隔秒,
-        "max_turns": 最大ターン数,
-        "model": モデル,
-        "started_by": interaction.user.id,
-        "stopped": False,
-    }
-    _ai_debate_sessions[channel.id] = session
-
-    task = asyncio.create_task(_ai_debate_loop(channel.id))
-    session["task"] = task
-
-    embed = discord.Embed(
-        title="[AIディベート] 開始しました",
-        description=f"お題: {お題}",
-        color=discord.Color.green()
+    await _ai_debate_launch(
+        interaction,
+        topic=setup["topic"],
+        persona_a_name=setup["persona_a_name"],
+        persona_a_prompt=setup["persona_a_prompt"],
+        persona_b_name=setup["persona_b_name"],
+        persona_b_prompt=setup["persona_b_prompt"],
+        interval_seconds=発言間隔秒,
+        max_turns=最大ターン数,
+        model=モデル,
+        is_random=True,
     )
-    embed.add_field(name="人格A", value=f"**{人格a名前}**\n{人格aプロンプト[:200]}", inline=True)
-    embed.add_field(name="人格B", value=f"**{人格b名前}**\n{人格bプロンプト[:200]}", inline=True)
-    embed.add_field(
-        name="設定",
-        value=(
-            f"発言間隔: {発言間隔秒}秒\n"
-            f"最大ターン数: {最大ターン数 if 最大ターン数 else '無制限（/ai_debate stopまで継続）'}\n"
-            f"使用モデル: `{モデル or GROQ_MODEL}`"
-        ),
-        inline=False
-    )
-    embed.set_footer(text="停止するには /ai_debate stop を実行してください")
-    await interaction.response.send_message(embed=embed)
 
 
 @ai_debate_group.command(name="stop", description="【オーナー限定】このチャンネルで進行中のAIディベートを停止します")
@@ -6092,6 +6244,7 @@ async def help_command(interaction: discord.Interaction):
                 "`/owner broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
                 "`/owner_trust add` / `/owner_trust remove` / `/owner_trust list` : 信頼ユーザーの追加・削除・一覧管理を行います\n"
                 "`/ai_debate start` : 2つの人格を設定し、AI同士の自動会話をこのチャンネルで開始します\n"
+                "`/ai_debate random start` : お題・2人格をAIにランダム生成させて自動会話を開始します\n"
                 "`/ai_debate stop` : 実行中のAIディベートを停止します\n"
                 "`/ai_debate status` : 実行中のAIディベートの状況を確認します\n"
                 "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
