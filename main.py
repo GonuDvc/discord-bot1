@@ -69,7 +69,7 @@ GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "")
 # Groqの日次上限に達していても引き続き利用できます）。
 # 未設定（CEREBRAS_API_KEY未設定）の場合はCerebrasへのフォールバックを行いません。
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
-CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 CEREBRAS_MAX_TOKENS = int(os.getenv("CEREBRAS_MAX_TOKENS", "2048"))
 
 # --------------------------------------------------------------------
@@ -4536,6 +4536,13 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
                 raise CerebrasRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
             if resp.status != 200:
                 err_text = await resp.text()
+                if resp.status == 404 and "model" in err_text.lower():
+                    raise CerebrasAPIError(
+                        f"Cerebras APIエラー（HTTP 404）: 指定されたモデル「{model or CEREBRAS_MODEL}」が見つかりません。"
+                        f"Cerebras側でモデルの提供が終了・変更された可能性があります。"
+                        f"Botの環境変数 CEREBRAS_MODEL を、Cerebras公式サイト（cloud.cerebras.ai）で"
+                        f"現在利用可能なモデル名に更新してください。詳細: {err_text[:200]}"
+                    )
                 raise CerebrasAPIError(f"Cerebras APIエラー（HTTP {resp.status}）: {err_text[:300]}")
             data = await resp.json()
 
