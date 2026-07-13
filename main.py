@@ -434,6 +434,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
+        ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）。オーナーが /ai_chat set_provider で設定
         # --- サーバー活動のAIサマリー機能 ---
         ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
         ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
@@ -4287,7 +4288,7 @@ _AI_CHAT_MODERATION_SYSTEM_PROMPT = (
 )
 
 
-async def _ai_chat_moderate_system_prompt(text: str) -> Tuple[bool, str]:
+async def _ai_chat_moderate_system_prompt(text: str, guild_id: Optional[int] = None) -> Tuple[bool, str]:
     """
     ユーザーが自分用に設定しようとしているシステムプロンプトをAI（Groq）で判定します。
     戻り値: (allowed: 許可するか, reason: 理由テキスト)
@@ -4298,7 +4299,8 @@ async def _ai_chat_moderate_system_prompt(text: str) -> Tuple[bool, str]:
         {"role": "user", "content": text},
     ]
     try:
-        raw, _provider = await _ai_call_llm_with_fallback(messages)
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
     except Exception as e:
         return False, f"判定処理に失敗したため設定できませんでした（{e}）"
 
@@ -4550,15 +4552,54 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
     return reply_text
 
 
-async def _ai_call_llm_with_fallback(messages: list, model: Optional[str] = None) -> Tuple[str, str]:
+async def _ai_get_provider_override(guild_id: Optional[int]) -> Optional[str]:
+    """
+    guild_configに保存されたai_provider設定を読み込みます。
+    "auto"（既定）の場合はNoneを返し、_ai_call_llm_with_fallback側の自動フォールバック動作に委ねます。
+    guild_idがNone、または設定読み込みに失敗した場合もNone（=auto扱い）を返します。
+    """
+    if guild_id is None:
+        return None
+    try:
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(guild_id))
+        provider = guild_config.get("ai_provider", "auto")
+        if provider in ("groq", "cerebras"):
+            return provider
+        return None
+    except Exception as e:
+        print(f"[AIプロバイダ設定] 読み込みに失敗しました（autoとして扱います）: {e}")
+        return None
+
+
+async def _ai_call_llm_with_fallback(
+    messages: list,
+    model: Optional[str] = None,
+    provider_override: Optional[str] = None,
+) -> Tuple[str, str]:
     """
     Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
     すべて日次上限（TPD/RPD）で失敗した場合のみ、最後にCerebrasを試す統一ラッパーです。
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
+    provider_override:
+      - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebrasへは切り替えない）
+      - "cerebras": Cerebrasのみ使用（Groqは一切呼ばない）
+      - None（既定）: 従来通りの自動フォールバック（Groq→Cerebras）
+
     戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras")
     """
+    if provider_override == "cerebras":
+        if not CEREBRAS_API_KEY:
+            raise RuntimeError(
+                "このサーバーはAIプロバイダが「Cerebras固定」に設定されていますが、"
+                "CEREBRAS_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
+                "Botの環境変数を確認してください。"
+            )
+        reply_text = await _ai_chat_call_cerebras(messages, model=model)
+        return reply_text, "cerebras"
+
     candidate_models = [model] + GROQ_FALLBACK_MODELS
 
     last_error: Optional[Exception] = None
@@ -4576,6 +4617,10 @@ async def _ai_call_llm_with_fallback(messages: list, model: Optional[str] = None
                 continue  # 次のGroqフォールバックモデルを試す
             # Groq側の候補をすべてTPD/RPDで使い切った → Cerebrasへ最終フォールバック
             break
+
+    if provider_override == "groq":
+        # Groq固定設定の場合はCerebrasへ切り替えず、Groqのエラーをそのまま送出する
+        raise last_error
 
     if not CEREBRAS_API_KEY:
         # Cerebras未設定なら、Groq側の最後のエラーをそのまま送出する
@@ -4706,7 +4751,8 @@ async def _ai_summary_generate(guild: discord.Guild) -> Tuple[Optional[str], dic
     ]
 
     try:
-        summary_text, _provider = await _ai_call_llm_with_fallback(messages)
+        provider_override = await _ai_get_provider_override(guild.id)
+        summary_text, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
     except Exception as e:
         print(f"[AIサマリー] LLM呼び出しに失敗: {e}")
         return None, activity
@@ -4835,7 +4881,7 @@ _AI_DEBATE_RANDOM_GEN_SYSTEM_PROMPT = (
 _ai_debate_sessions: dict = {}
 
 
-async def _ai_debate_generate_random_setup() -> dict:
+async def _ai_debate_generate_random_setup(guild_id: Optional[int] = None) -> dict:
     """
     Groqに「面白いお題と対照的な2人格」をJSON形式で生成させます。
     戻り値: {"topic": str, "persona_a_name": str, "persona_a_prompt": str,
@@ -4846,7 +4892,8 @@ async def _ai_debate_generate_random_setup() -> dict:
         {"role": "system", "content": _AI_DEBATE_RANDOM_GEN_SYSTEM_PROMPT},
         {"role": "user", "content": "新しいお題と2人格を考えてください。"},
     ]
-    raw, _provider = await _ai_call_llm_with_fallback(messages)
+    provider_override = await _ai_get_provider_override(guild_id)
+    raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
 
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -4910,7 +4957,10 @@ async def _ai_debate_generate_turn(session: dict, speaker_key: str) -> str:
         # 最初の発言者には、お題から会話を始めるよう明示的に促す
         messages.append({"role": "user", "content": "それでは、このお題について話を始めてください。"})
 
-    reply_text, _provider = await _ai_call_llm_with_fallback(messages, model=session.get("model") or None)
+    provider_override = await _ai_get_provider_override(session.get("guild_id"))
+    reply_text, _provider = await _ai_call_llm_with_fallback(
+        messages, model=session.get("model") or None, provider_override=provider_override
+    )
     reply_text = reply_text.strip()
     if len(reply_text) > AI_DEBATE_MAX_MESSAGE_LENGTH:
         reply_text = reply_text[:AI_DEBATE_MAX_MESSAGE_LENGTH] + "…"
@@ -5172,7 +5222,7 @@ async def ai_debate_random_start(
     await interaction.response.defer(thinking=True)
 
     try:
-        setup = await _ai_debate_generate_random_setup()
+        setup = await _ai_debate_generate_random_setup(guild_id=interaction.guild.id)
     except GroqRateLimitError as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
         await interaction.followup.send(
@@ -5344,7 +5394,12 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 used_model = GROQ_VISION_MODEL
                 used_provider = "groq"
             else:
-                reply_text, used_provider = await _ai_call_llm_with_fallback(messages, model=model)
+                provider_override = guild_config.get("ai_provider", "auto")
+                if provider_override not in ("groq", "cerebras"):
+                    provider_override = None
+                reply_text, used_provider = await _ai_call_llm_with_fallback(
+                    messages, model=model, provider_override=provider_override
+                )
                 used_model = model or GROQ_MODEL if used_provider == "groq" else CEREBRAS_MODEL
     except (GroqRateLimitError, CerebrasRateLimitError) as e:
         try:
@@ -5454,7 +5509,7 @@ def _ai_automod_enqueue(message: discord.Message):
             _ai_automod_queue.pop(old_key, None)
 
 
-async def _ai_automod_judge_batch(items: list) -> dict:
+async def _ai_automod_judge_batch(items: list, guild_id: Optional[int] = None) -> dict:
     """
     items: [(key, content), ...] 形式のバッチをGroqへ送り、判定結果を取得します。
     戻り値: {index(int): (flagged: bool, reason: str)}
@@ -5470,7 +5525,8 @@ async def _ai_automod_judge_batch(items: list) -> dict:
     ]
 
     try:
-        raw, _provider = await _ai_call_llm_with_fallback(messages)
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
     except Exception as e:
         print(f"[AI自動モデレーション] LLM呼び出しに失敗: {e}")
         return {}
@@ -5536,7 +5592,7 @@ async def _ai_automod_process_batch():
         for batch_start in range(0, len(entries), AI_AUTOMOD_MAX_BATCH_SIZE):
             batch = entries[batch_start:batch_start + AI_AUTOMOD_MAX_BATCH_SIZE]
             items = [(key, info["content"]) for key, info in batch]
-            results = await _ai_automod_judge_batch(items)
+            results = await _ai_automod_judge_batch(items, guild_id=guild_id)
 
             for idx, (key, info) in enumerate(batch):
                 flagged, reason = results.get(idx, (False, ""))
@@ -7457,6 +7513,42 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
         )
 
 
+@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダ（Groq/Cerebras）を切り替えます")
+@app_commands.describe(provider="使用するプロバイダ。autoは既定の自動フォールバック（Groq→Cerebras）です")
+@app_commands.choices(provider=[
+    app_commands.Choice(name="auto（既定：GroqがダメならCerebrasへ自動切替）", value="auto"),
+    app_commands.Choice(name="groq（Groq固定：日次上限に達しても切り替えない）", value="groq"),
+    app_commands.Choice(name="cerebras（Cerebras固定：Groqは一切使わない）", value="cerebras"),
+])
+async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_commands.Choice[str]):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if provider.value == "cerebras" and not CEREBRAS_API_KEY:
+        await interaction.response.send_message(
+            "[設定不可] CEREBRAS_API_KEYがBotに設定されていないため、「cerebras固定」は選択できません。\n"
+            "Botの環境変数にCEREBRAS_API_KEYを設定してから再度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_provider"] = provider.value
+    save_data(all_data)
+
+    descriptions = {
+        "auto": "既定の自動フォールバック動作に戻しました。Groqが日次上限に達した場合のみCerebrasへ自動的に切り替わります。",
+        "groq": "Groq固定に設定しました。日次上限（TPD/RPD）に達してもCerebrasへは切り替わらず、エラーがそのまま通知されます。",
+        "cerebras": "Cerebras固定に設定しました。Groqは一切呼び出されず、常にCerebrasが使用されます。",
+    }
+    await interaction.response.send_message(
+        f"[設定完了] このサーバーのAIプロバイダを「{provider.name}」に設定しました。\n{descriptions[provider.value]}\n"
+        f"※画像添付時のAIチャット応答はVision対応の都合上、常にGroqが使用されます（この設定によらず変わりません）。",
+        ephemeral=True
+    )
+
+
 @ai_chat_group.command(name="user_config", description="【オーナー限定】特定ユーザーのAIチャット設定（使用モデル・システムプロンプト）をカスタマイズします")
 @app_commands.describe(
     user="設定を変更するユーザー",
@@ -7650,7 +7742,7 @@ async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction
     # AIによる不適切判定にはGroq呼び出しの時間がかかるため、応答を保留してから処理する
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    allowed, reason = await _ai_chat_moderate_system_prompt(text)
+    allowed, reason = await _ai_chat_moderate_system_prompt(text, guild_id=interaction.guild.id)
     if not allowed:
         await interaction.followup.send(
             f"[却下] このシステムプロンプトは登録できませんでした。\n理由: {reason}",
