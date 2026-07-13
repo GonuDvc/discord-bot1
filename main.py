@@ -63,6 +63,15 @@ GROQ_FALLBACK_MODELS = [
 # Groqがサポートするvisionモデルを指定してください。未設定時は画像添付を無視してテキストのみ処理する。
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "")
 
+# --- Cerebras API（Groqが日次上限(TPD)に達した際の最終フォールバック先） ---
+# GroqのメインモデルおよびGROQ_FALLBACK_MODELSをすべて試してもTPD/RPDで失敗した場合、
+# 最後の手段としてCerebras APIに切り替えて応答を試みます（無料枠あり、Groqとは別枠のため
+# Groqの日次上限に達していても引き続き利用できます）。
+# 未設定（CEREBRAS_API_KEY未設定）の場合はCerebrasへのフォールバックを行いません。
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_MAX_TOKENS = int(os.getenv("CEREBRAS_MAX_TOKENS", "2048"))
+
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
 # --------------------------------------------------------------------
@@ -4289,7 +4298,7 @@ async def _ai_chat_moderate_system_prompt(text: str) -> Tuple[bool, str]:
         {"role": "user", "content": text},
     ]
     try:
-        raw = await _ai_chat_call_groq(messages)
+        raw, _provider = await _ai_call_llm_with_fallback(messages)
     except Exception as e:
         return False, f"判定処理に失敗したため設定できませんでした（{e}）"
 
@@ -4462,6 +4471,125 @@ def _strip_reasoning_tags(text: str) -> str:
 
 
 # ====================================================================
+# Cerebras API（Groqの日次上限到達時の最終フォールバック先）
+# ====================================================================
+# Cerebras Inference APIはOpenAI互換のchat completionsエンドポイントを提供しており、
+# Groqとは別枠のレート制限・無料枠を持ちます。
+# GroqのメインモデルとGROQ_FALLBACK_MODELSをすべて試してもTPD/RPD（日次上限）で
+# 失敗した場合のみ、最後の手段としてこちらを試します。
+# ====================================================================
+
+class CerebrasAPIError(RuntimeError):
+    """Cerebras API呼び出しに関する汎用エラー。"""
+    pass
+
+
+class CerebrasRateLimitError(CerebrasAPIError):
+    """Cerebras APIがレート制限（HTTP 429）を返した場合に送出される専用例外。"""
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+        self.retry_after = retry_after
+        self.raw_message = raw_message
+        suffix = f"（推定復帰まで約{_format_duration(retry_after)}）" if retry_after else ""
+        super().__init__(f"Cerebras APIのレート制限に達しました{suffix}")
+
+
+async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) -> str:
+    """
+    Cerebras Chat Completions APIを呼び出し、応答テキストを返します。
+    インターフェースは _ai_chat_call_groq と揃えてあり、呼び出し側から見て
+    差し替え可能になっています。
+    """
+    if not CEREBRAS_API_KEY:
+        raise RuntimeError("CEREBRAS_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model or CEREBRAS_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": CEREBRAS_MAX_TOKENS,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after: Optional[float] = None
+                header_val = resp.headers.get("Retry-After")
+                if header_val:
+                    try:
+                        retry_after = float(header_val)
+                    except ValueError:
+                        retry_after = None
+                if retry_after is None:
+                    retry_after = _parse_groq_retry_after(err_text)  # Cerebrasも同様の文面のためこのパーサーを流用
+                raise CerebrasRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+            if resp.status != 200:
+                err_text = await resp.text()
+                raise CerebrasAPIError(f"Cerebras APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        choice = data["choices"][0]
+        raw_content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise CerebrasAPIError(f"Cerebras APIの応答形式が想定と異なります: {data}")
+
+    reply_text = _strip_reasoning_tags(raw_content).strip()
+    if choice.get("finish_reason") == "length":
+        reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+
+    return reply_text
+
+
+async def _ai_call_llm_with_fallback(messages: list, model: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
+    すべて日次上限（TPD/RPD）で失敗した場合のみ、最後にCerebrasを試す統一ラッパーです。
+    Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
+    そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
+
+    戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras")
+    """
+    candidate_models = [model] + GROQ_FALLBACK_MODELS
+
+    last_error: Optional[Exception] = None
+    for idx, candidate in enumerate(candidate_models):
+        try:
+            reply_text = await _ai_chat_call_groq(messages, model=candidate)
+            return reply_text, "groq"
+        except GroqRateLimitError as e:
+            last_error = e
+            is_daily_limit = e.limit_scope in ("TPD", "RPD")
+            is_last_candidate = (idx == len(candidate_models) - 1)
+            if not is_daily_limit:
+                raise  # TPM等の短期レート制限はプロバイダを跨がず即座に通知する
+            if not is_last_candidate:
+                continue  # 次のGroqフォールバックモデルを試す
+            # Groq側の候補をすべてTPD/RPDで使い切った → Cerebrasへ最終フォールバック
+            break
+
+    if not CEREBRAS_API_KEY:
+        # Cerebras未設定なら、Groq側の最後のエラーをそのまま送出する
+        raise last_error
+
+    try:
+        reply_text = await _ai_chat_call_cerebras(messages)
+        return reply_text, "cerebras"
+    except Exception as e:
+        print(f"[AIフォールバック] Cerebrasへの切り替えにも失敗しました: {e}")
+        raise last_error from e
+
+
+# ====================================================================
 # サーバー活動のAIサマリー機能
 # ====================================================================
 
@@ -4578,9 +4706,9 @@ async def _ai_summary_generate(guild: discord.Guild) -> Tuple[Optional[str], dic
     ]
 
     try:
-        summary_text = await _ai_chat_call_groq(messages)
+        summary_text, _provider = await _ai_call_llm_with_fallback(messages)
     except Exception as e:
-        print(f"[AIサマリー] Groq呼び出しに失敗: {e}")
+        print(f"[AIサマリー] LLM呼び出しに失敗: {e}")
         return None, activity
 
     return summary_text, activity
@@ -4718,7 +4846,7 @@ async def _ai_debate_generate_random_setup() -> dict:
         {"role": "system", "content": _AI_DEBATE_RANDOM_GEN_SYSTEM_PROMPT},
         {"role": "user", "content": "新しいお題と2人格を考えてください。"},
     ]
-    raw = await _ai_chat_call_groq(messages)
+    raw, _provider = await _ai_call_llm_with_fallback(messages)
 
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -4782,7 +4910,7 @@ async def _ai_debate_generate_turn(session: dict, speaker_key: str) -> str:
         # 最初の発言者には、お題から会話を始めるよう明示的に促す
         messages.append({"role": "user", "content": "それでは、このお題について話を始めてください。"})
 
-    reply_text = await _ai_chat_call_groq(messages, model=session.get("model") or None)
+    reply_text, _provider = await _ai_call_llm_with_fallback(messages, model=session.get("model") or None)
     reply_text = reply_text.strip()
     if len(reply_text) > AI_DEBATE_MAX_MESSAGE_LENGTH:
         reply_text = reply_text[:AI_DEBATE_MAX_MESSAGE_LENGTH] + "…"
@@ -5200,18 +5328,9 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         {"role": "user", "content": user_message_content}
     ]
 
-    # 試行するモデルの候補列を構築（メインモデル → フォールバックモデルの順）。
-    # ユーザー個別モデル設定がある場合はそれを最優先の「メイン」として扱い、
-    # それがTPD（日次上限）に達した場合のみフォールバック候補を順に試します。
-    # 画像添付時はVision対応モデルのみを使用します（通常モデルは画像を処理できないため）。
-    if image_url is not None:
-        candidate_models = [GROQ_VISION_MODEL]
-    else:
-        candidate_models = [model] + GROQ_FALLBACK_MODELS
-
     reply_text: Optional[str] = None
     used_model: Optional[str] = None
-    last_error: Optional[Exception] = None
+    used_provider: str = "groq"
 
     # クールダウンはAPI呼び出しの成否に関わらず「利用した」時点で記録する
     # （エラー時に即座に連投できてしまうと日次上限の浪費を防げないため）
@@ -5219,27 +5338,22 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
 
     try:
         async with message.channel.typing():
-            for idx, candidate in enumerate(candidate_models):
-                try:
-                    reply_text = await _ai_chat_call_groq(messages, model=candidate)
-                    used_model = candidate or GROQ_MODEL
-                    break
-                except GroqRateLimitError as e:
-                    last_error = e
-                    is_daily_limit = e.limit_scope in ("TPD", "RPD")
-                    is_last_candidate = (idx == len(candidate_models) - 1)
-                    # TPD（日次上限）以外、またはもう試す候補が無い場合はここで打ち切ってユーザーに通知
-                    if not is_daily_limit or is_last_candidate:
-                        raise
-                    # TPDかつ次の候補があるので、次のモデルで再試行を続ける
-                    continue
-    except GroqRateLimitError as e:
+            if image_url is not None:
+                # 画像添付時はVision対応モデル固定（Cerebrasへのフォールバックは行わない）
+                reply_text = await _ai_chat_call_groq(messages, model=GROQ_VISION_MODEL)
+                used_model = GROQ_VISION_MODEL
+                used_provider = "groq"
+            else:
+                reply_text, used_provider = await _ai_call_llm_with_fallback(messages, model=model)
+                used_model = model or GROQ_MODEL if used_provider == "groq" else CEREBRAS_MODEL
+    except (GroqRateLimitError, CerebrasRateLimitError) as e:
         try:
             wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
 
-            if e.limit_scope == "TPD" or e.limit_scope == "RPD":
+            limit_scope = getattr(e, "limit_scope", None)
+            if limit_scope in ("TPD", "RPD"):
                 scope_text = "本日の利用上限"
-            elif e.limit_scope == "TPM" or e.limit_scope == "RPM":
+            elif limit_scope in ("TPM", "RPM"):
                 scope_text = "レート制限（短時間の利用集中）"
             else:
                 scope_text = "レート制限"
@@ -5263,9 +5377,11 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         # 思考過程のみが返って本文が空になった等のケース
         reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
 
-    # フォールバックモデルで応答した場合はその旨を一言添える
+    # フォールバックモデル/プロバイダで応答した場合はその旨を一言添える
     primary_model = model or GROQ_MODEL
-    if used_model and used_model != primary_model:
+    if used_provider == "cerebras":
+        reply_text += f"\n\n*（本日のGroq利用上限のため、Cerebras（`{used_model}`）で応答しました）*"
+    elif used_model and used_model != primary_model:
         reply_text += f"\n\n*（本日の利用上限のため、フォールバックモデル `{used_model}` で応答しました）*"
 
     # 履歴には画像URLそのものではなくテキストのみ保存する（画像のみ送信時はプレースホルダーを使用）。
@@ -5354,9 +5470,9 @@ async def _ai_automod_judge_batch(items: list) -> dict:
     ]
 
     try:
-        raw = await _ai_chat_call_groq(messages)
+        raw, _provider = await _ai_call_llm_with_fallback(messages)
     except Exception as e:
-        print(f"[AI自動モデレーション] Groq呼び出しに失敗: {e}")
+        print(f"[AI自動モデレーション] LLM呼び出しに失敗: {e}")
         return {}
 
     cleaned = raw.strip()
