@@ -72,6 +72,15 @@ CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 CEREBRAS_MAX_TOKENS = int(os.getenv("CEREBRAS_MAX_TOKENS", "2048"))
 
+# --- Mistral API（Groq→Cerebrasの両方が日次上限に達した際の最終フォールバック先） ---
+# Mistral AIもOpenAI互換のchat completionsエンドポイントを提供しています。
+# 無料の「Experiment」ティアはレート制限が厳しい（2リクエスト/分、50万TPM、月10億トークン）ため、
+# フォールバック順は Groq → Cerebras → Mistral の最終手段として位置付けます。
+# 未設定（MISTRAL_API_KEY未設定）の場合はMistralへのフォールバックを行いません。
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_MAX_TOKENS = int(os.getenv("MISTRAL_MAX_TOKENS", "2048"))
+
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
 # --------------------------------------------------------------------
@@ -434,7 +443,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
-        ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）。オーナーが /ai_chat set_provider で設定
+        ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）。オーナーが /ai_chat set_provider で設定
         # --- サーバー活動のAIサマリー機能 ---
         ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
         ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
@@ -4559,6 +4568,93 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
     return reply_text
 
 
+# ====================================================================
+# Mistral API（Groq→Cerebrasの両方が日次上限到達時の最終フォールバック先）
+# ====================================================================
+# Mistral AIのChat Completions APIもOpenAI互換であり、GroqやCerebrasとは
+# 別枠のレート制限・無料枠を持ちます。ただし無料ティアはRPM（1分あたりの
+# リクエスト数）が非常に低いため、Groq・Cerebrasの両方を使い切った場合のみ
+# 最後の手段として試します。
+# ====================================================================
+
+class MistralAPIError(RuntimeError):
+    """Mistral API呼び出しに関する汎用エラー。"""
+    pass
+
+
+class MistralRateLimitError(MistralAPIError):
+    """Mistral APIがレート制限（HTTP 429）を返した場合に送出される専用例外。"""
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+        self.retry_after = retry_after
+        self.raw_message = raw_message
+        suffix = f"（推定復帰まで約{_format_duration(retry_after)}）" if retry_after else ""
+        super().__init__(f"Mistral APIのレート制限に達しました{suffix}")
+
+
+async def _ai_chat_call_mistral(messages: list, model: Optional[str] = None) -> str:
+    """
+    Mistral Chat Completions APIを呼び出し、応答テキストを返します。
+    インターフェースは _ai_chat_call_groq / _ai_chat_call_cerebras と揃えてあり、
+    呼び出し側から見て差し替え可能になっています。
+    """
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model or MISTRAL_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": MISTRAL_MAX_TOKENS,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after: Optional[float] = None
+                header_val = resp.headers.get("Retry-After")
+                if header_val:
+                    try:
+                        retry_after = float(header_val)
+                    except ValueError:
+                        retry_after = None
+                if retry_after is None:
+                    retry_after = _parse_groq_retry_after(err_text)  # Mistralも同様の文面のためこのパーサーを流用
+                raise MistralRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+            if resp.status != 200:
+                err_text = await resp.text()
+                if resp.status == 404 and "model" in err_text.lower():
+                    raise MistralAPIError(
+                        f"Mistral APIエラー（HTTP 404）: 指定されたモデル「{model or MISTRAL_MODEL}」が見つかりません。"
+                        f"Mistral側でモデルの提供が終了・変更された可能性があります。"
+                        f"Botの環境変数 MISTRAL_MODEL を、Mistral公式サイト（console.mistral.ai）で"
+                        f"現在利用可能なモデル名に更新してください。詳細: {err_text[:200]}"
+                    )
+                raise MistralAPIError(f"Mistral APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        choice = data["choices"][0]
+        raw_content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise MistralAPIError(f"Mistral APIの応答形式が想定と異なります: {data}")
+
+    reply_text = _strip_reasoning_tags(raw_content).strip()
+    if choice.get("finish_reason") == "length":
+        reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+
+    return reply_text
+
+
 async def _ai_get_provider_override(guild_id: Optional[int]) -> Optional[str]:
     """
     guild_configに保存されたai_provider設定を読み込みます。
@@ -4571,7 +4667,7 @@ async def _ai_get_provider_override(guild_id: Optional[int]) -> Optional[str]:
         all_data = load_data()
         guild_config = get_guild_config(all_data, str(guild_id))
         provider = guild_config.get("ai_provider", "auto")
-        if provider in ("groq", "cerebras"):
+        if provider in ("groq", "cerebras", "mistral"):
             return provider
         return None
     except Exception as e:
@@ -4586,16 +4682,18 @@ async def _ai_call_llm_with_fallback(
 ) -> Tuple[str, str]:
     """
     Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
-    すべて日次上限（TPD/RPD）で失敗した場合のみ、最後にCerebrasを試す統一ラッパーです。
+    すべて日次上限（TPD/RPD）で失敗した場合はCerebrasを、
+    Cerebrasも失敗した場合は最後にMistralを試す統一ラッパーです。
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
     provider_override:
-      - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebrasへは切り替えない）
-      - "cerebras": Cerebrasのみ使用（Groqは一切呼ばない）
-      - None（既定）: 従来通りの自動フォールバック（Groq→Cerebras）
+      - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebras/Mistralへは切り替えない）
+      - "cerebras": Cerebrasのみ使用（Groq/Mistralは一切呼ばない）
+      - "mistral": Mistralのみ使用（Groq/Cerebrasは一切呼ばない）
+      - None（既定）: 従来通りの自動フォールバック（Groq→Cerebras→Mistral）
 
-    戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras")
+    戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras"|"mistral")
     """
     if provider_override == "cerebras":
         if not CEREBRAS_API_KEY:
@@ -4606,6 +4704,16 @@ async def _ai_call_llm_with_fallback(
             )
         reply_text = await _ai_chat_call_cerebras(messages, model=model)
         return reply_text, "cerebras"
+
+    if provider_override == "mistral":
+        if not MISTRAL_API_KEY:
+            raise RuntimeError(
+                "このサーバーはAIプロバイダが「Mistral固定」に設定されていますが、"
+                "MISTRAL_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
+                "Botの環境変数を確認してください。"
+            )
+        reply_text = await _ai_chat_call_mistral(messages, model=model)
+        return reply_text, "mistral"
 
     candidate_models = [model] + GROQ_FALLBACK_MODELS
 
@@ -4626,18 +4734,26 @@ async def _ai_call_llm_with_fallback(
             break
 
     if provider_override == "groq":
-        # Groq固定設定の場合はCerebrasへ切り替えず、Groqのエラーをそのまま送出する
+        # Groq固定設定の場合はCerebras/Mistralへ切り替えず、Groqのエラーをそのまま送出する
         raise last_error
 
-    if not CEREBRAS_API_KEY:
-        # Cerebras未設定なら、Groq側の最後のエラーをそのまま送出する
+    if CEREBRAS_API_KEY:
+        try:
+            reply_text = await _ai_chat_call_cerebras(messages)
+            return reply_text, "cerebras"
+        except Exception as e:
+            print(f"[AIフォールバック] Cerebrasへの切り替えにも失敗しました: {e}")
+            last_error = e
+
+    if not MISTRAL_API_KEY:
+        # Mistral未設定なら、ここまでの最後のエラーをそのまま送出する
         raise last_error
 
     try:
-        reply_text = await _ai_chat_call_cerebras(messages)
-        return reply_text, "cerebras"
+        reply_text = await _ai_chat_call_mistral(messages)
+        return reply_text, "mistral"
     except Exception as e:
-        print(f"[AIフォールバック] Cerebrasへの切り替えにも失敗しました: {e}")
+        print(f"[AIフォールバック] Mistralへの切り替えにも失敗しました: {e}")
         raise last_error from e
 
 
@@ -5402,13 +5518,18 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 used_provider = "groq"
             else:
                 provider_override = guild_config.get("ai_provider", "auto")
-                if provider_override not in ("groq", "cerebras"):
+                if provider_override not in ("groq", "cerebras", "mistral"):
                     provider_override = None
                 reply_text, used_provider = await _ai_call_llm_with_fallback(
                     messages, model=model, provider_override=provider_override
                 )
-                used_model = model or GROQ_MODEL if used_provider == "groq" else CEREBRAS_MODEL
-    except (GroqRateLimitError, CerebrasRateLimitError) as e:
+                if used_provider == "groq":
+                    used_model = model or GROQ_MODEL
+                elif used_provider == "cerebras":
+                    used_model = CEREBRAS_MODEL
+                else:
+                    used_model = MISTRAL_MODEL
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
         try:
             wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
 
@@ -5443,6 +5564,8 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     primary_model = model or GROQ_MODEL
     if used_provider == "cerebras":
         reply_text += f"\n\n*（本日のGroq利用上限のため、Cerebras（`{used_model}`）で応答しました）*"
+    elif used_provider == "mistral":
+        reply_text += f"\n\n*（本日のGroq・Cerebras利用上限のため、Mistral（`{used_model}`）で応答しました）*"
     elif used_model and used_model != primary_model:
         reply_text += f"\n\n*（本日の利用上限のため、フォールバックモデル `{used_model}` で応答しました）*"
 
@@ -7520,12 +7643,13 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
         )
 
 
-@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダ（Groq/Cerebras）を切り替えます")
-@app_commands.describe(provider="使用するプロバイダ。autoは既定の自動フォールバック（Groq→Cerebras）です")
+@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダ（Groq/Cerebras/Mistral）を切り替えます")
+@app_commands.describe(provider="使用するプロバイダ。autoは既定の自動フォールバック（Groq→Cerebras→Mistral）です")
 @app_commands.choices(provider=[
-    app_commands.Choice(name="auto（既定：GroqがダメならCerebrasへ自動切替）", value="auto"),
+    app_commands.Choice(name="auto（既定：Groq→Cerebras→Mistralへ自動切替）", value="auto"),
     app_commands.Choice(name="groq（Groq固定：日次上限に達しても切り替えない）", value="groq"),
     app_commands.Choice(name="cerebras（Cerebras固定：Groqは一切使わない）", value="cerebras"),
+    app_commands.Choice(name="mistral（Mistral固定：Groq/Cerebrasは一切使わない）", value="mistral"),
 ])
 async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_commands.Choice[str]):
     if not await is_owner_check(interaction): return
@@ -7539,15 +7663,24 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
         )
         return
 
+    if provider.value == "mistral" and not MISTRAL_API_KEY:
+        await interaction.response.send_message(
+            "[設定不可] MISTRAL_API_KEYがBotに設定されていないため、「mistral固定」は選択できません。\n"
+            "Botの環境変数にMISTRAL_API_KEYを設定してから再度お試しください。",
+            ephemeral=True
+        )
+        return
+
     all_data = load_data()
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
     guild_config["ai_provider"] = provider.value
     save_data(all_data)
 
     descriptions = {
-        "auto": "既定の自動フォールバック動作に戻しました。Groqが日次上限に達した場合のみCerebrasへ自動的に切り替わります。",
-        "groq": "Groq固定に設定しました。日次上限（TPD/RPD）に達してもCerebrasへは切り替わらず、エラーがそのまま通知されます。",
-        "cerebras": "Cerebras固定に設定しました。Groqは一切呼び出されず、常にCerebrasが使用されます。",
+        "auto": "既定の自動フォールバック動作に戻しました。GroqがダメならCerebras、それもダメならMistralへ自動的に切り替わります。",
+        "groq": "Groq固定に設定しました。日次上限（TPD/RPD）に達してもCerebras/Mistralへは切り替わらず、エラーがそのまま通知されます。",
+        "cerebras": "Cerebras固定に設定しました。Groq/Mistralは一切呼び出されず、常にCerebrasが使用されます。",
+        "mistral": "Mistral固定に設定しました。Groq/Cerebrasは一切呼び出されず、常にMistralが使用されます（無料枠のレート制限が厳しいためご注意ください）。",
     }
     await interaction.response.send_message(
         f"[設定完了] このサーバーのAIプロバイダを「{provider.name}」に設定しました。\n{descriptions[provider.value]}\n"
