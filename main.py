@@ -6392,14 +6392,18 @@ async def on_member_join(member: discord.Member):
                     try:
                         state = _generate_web_auth_state(member.guild.id, member.id)
                         terms_url = _build_terms_url(state)
+                        custom_title = cfg.get("web_auth_panel_title")
+                        custom_desc = cfg.get("web_auth_panel_description")
+                        dm_title = custom_title if custom_title else f"[!] {member.guild.name} への入室認証が必要です"
+                        dm_desc = custom_desc if custom_desc else (
+                            "当サーバーへ参加するには、**ウェブ認証**を完了させる必要があります。\n\n"
+                            "下のリンクをクリックし、利用規約をご確認のうえ認証を進めてください。\n"
+                            "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
+                            "⚠️ このリンクはあなた専用です。他の人に共有しないでください。"
+                        )
                         dm_embed = discord.Embed(
-                            title=f"[!] {member.guild.name} への入室認証が必要です",
-                            description=(
-                                "当サーバーへ参加するには、**ウェブ認証**を完了させる必要があります。\n\n"
-                                "下のリンクをクリックし、利用規約をご確認のうえ認証を進めてください。\n"
-                                "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
-                                "⚠️ このリンクはあなた専用です。他の人に共有しないでください。"
-                            ),
+                            title=dm_title,
+                            description=dm_desc,
                             color=discord.Color.orange()
                         )
                         dm_embed.add_field(
@@ -12237,7 +12241,7 @@ async def alt_check(
         embed.add_field(name="閾値", value=f"{cfg.get('alt_check_days', 30)}日未満", inline=True)
         action_label = {"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(cfg.get("alt_check_action", "notify"), "不明")
         embed.add_field(name="アクション", value=action_label, inline=True)
-        embed.set_footer(text="参加メンバーのアカウント作成日が閾値より新しい場合に反応します")
+        embed.set_footer(text="参加メンバーのアカウント作成日が閾値より新しい場合に反応します（ウェブ認証(/web_auth)にも同じ設定が適用されます）")
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
@@ -12260,7 +12264,8 @@ async def alt_check(
         f"alt_check を有効にしました。\n"
         f"・閾値: アカウント作成から **{cfg['alt_check_days']}日未満** で反応\n"
         f"・アクション: **{action_label}**\n"
-        "ログチャンネルを設定していない場合は通知が届きません（`/automod modlog_set` で設定してください）。",
+        "ログチャンネルを設定していない場合は通知が届きません（`/automod modlog_set` で設定してください）。\n"
+        "この設定は通常の参加時チェックに加え、**ウェブ認証（/web_auth）実行時のチェックにも適用**されます。",
         ephemeral=True
     )
 
@@ -14080,7 +14085,9 @@ async def sbl_action(interaction: discord.Interaction, action: str):
 @server_blacklist_group.command(name="setup", description="ウェブ認証の誘導方式を設定します（パネル設置 or 参加時DM自動送信）")
 @app_commands.describe(
     mode="認証誘導方式（パネル設置 or 参加時DM自動送信）",
-    verified_role="認証完了時に付与するロール（省略可）"
+    verified_role="認証完了時に付与するロール（省略可）",
+    title="パネル／DMのタイトル（省略時は既定文を使用）",
+    description="パネル／DMの説明文（省略時は既定文を使用）"
 )
 @app_commands.choices(mode=[
     app_commands.Choice(name="パネル設置（チャンネルにボタンを常設）", value="panel"),
@@ -14089,7 +14096,9 @@ async def sbl_action(interaction: discord.Interaction, action: str):
 async def sbl_setup(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
-    verified_role: discord.Role = None
+    verified_role: discord.Role = None,
+    title: str = None,
+    description: str = None
 ):
     if not await is_moderator(interaction):
         return
@@ -14113,6 +14122,21 @@ async def sbl_setup(
 
     cfg["web_auth_mode"] = mode.value
 
+    # パネル／DMのタイトル・説明文を保存（省略時は既存設定を維持、いずれも未設定なら既定文にフォールバック）
+    if title is not None:
+        cfg["web_auth_panel_title"] = title
+    if description is not None:
+        cfg["web_auth_panel_description"] = description
+
+    default_panel_title = "サーバー入室認証"
+    default_panel_description = (
+        "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
+        "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
+        "（他の特定サーバーへの参加履歴を確認し、問題なければ認証が完了します）"
+    )
+    panel_title = cfg.get("web_auth_panel_title") or default_panel_title
+    panel_description = cfg.get("web_auth_panel_description") or default_panel_description
+
     role_text = f"認証後付与ロール: {verified_role.mention}" if verified_role else (
         f"認証後付与ロール: <@&{cfg['web_auth_verified_role_id']}>" if cfg.get("web_auth_verified_role_id") else "認証後付与ロール: 未設定"
     )
@@ -14132,18 +14156,16 @@ async def sbl_setup(
             color=discord.Color.green()
         )
         embed.add_field(name="設定", value=role_text, inline=False)
-        embed.set_footer(text="/web_auth setup でいつでも切り替えられます")
+        embed.add_field(name="DMタイトル", value=panel_title, inline=False)
+        embed.add_field(name="DM説明文", value=panel_description[:1024], inline=False)
+        embed.set_footer(text="/web_auth setup でいつでも切り替えられます（title/descriptionで文面変更可）")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     else:
         # --- パネルモード: このチャンネルにボタンを設置 ---
         embed_panel = discord.Embed(
-            title="サーバー入室認証",
-            description=(
-                "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
-                "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
-                "（他の特定サーバーへの参加履歴を確認し、問題なければ認証が完了します）"
-            ),
+            title=panel_title,
+            description=panel_description,
             color=discord.Color.blue()
         )
 
@@ -14162,7 +14184,7 @@ async def sbl_setup(
             color=discord.Color.green()
         )
         result_embed.add_field(name="設定", value=role_text, inline=False)
-        result_embed.set_footer(text="/web_auth setup でいつでも切り替えられます")
+        result_embed.set_footer(text="/web_auth setup でいつでも切り替えられます（title/descriptionで文面変更可）")
         await interaction.edit_original_response(content=None, embed=result_embed)
 
 
@@ -14798,7 +14820,72 @@ async def _oauth2_callback_handler(request):
     action_label = "BAN" if action == "ban" else "キック"
 
     # =========================================================
-    # ① 荒らしリスト（ブラックリスト）照合 — 常時実行
+    # ① サブ垢（新規アカウント）対策 — alt_check_enabled がONの場合のみ
+    #    /server protect alt_check の設定をウェブ認証にも適用します。
+    #    アクションが「通知のみ」の場合はここでは弾かず、通知のみ行って認証は継続させます。
+    # =========================================================
+    if cfg.get("alt_check_enabled", False):
+        alt_threshold_days = cfg.get("alt_check_days", 30)
+        alt_action = cfg.get("alt_check_action", "notify")
+        account_created_at = discord.utils.snowflake_time(user_id)
+        account_age_days = (discord.utils.utcnow() - account_created_at).days
+
+        if account_age_days < alt_threshold_days:
+            print(f"[ウェブ認証/alt_check] ユーザー {user_id} のアカウント日齢 {account_age_days}日（閾値: {alt_threshold_days}日） -> action={alt_action}")
+
+            # ログ通知（アクションに関わらず通知）
+            log_ch_id = cfg.get("server_blacklist_log_channel_id") or cfg.get("mod_log_channel_id")
+            if log_ch_id and target_guild:
+                log_ch = target_guild.get_channel(log_ch_id)
+                if log_ch:
+                    alt_embed = discord.Embed(
+                        title="[!] ウェブ認証: 新規アカウント検知 (alt_check)",
+                        color=discord.Color.orange()
+                    )
+                    alt_embed.add_field(name="対象ユーザー", value=f"<@{user_id}> (`{user_id}`)", inline=False)
+                    alt_embed.add_field(name="アカウント作成日", value=account_created_at.strftime("%Y/%m/%d"), inline=True)
+                    alt_embed.add_field(name="アカウント日齢", value=f"{account_age_days}日", inline=True)
+                    alt_embed.add_field(name="閾値", value=f"{alt_threshold_days}日未満", inline=True)
+                    alt_embed.add_field(
+                        name="実行アクション",
+                        value={"notify": "通知のみ（認証は継続）", "kick": "キック", "ban": "BAN"}.get(alt_action, alt_action),
+                        inline=True
+                    )
+                    alt_embed.add_field(name="検出経路", value="ウェブ認証 (OAuth2)", inline=True)
+                    alt_embed.timestamp = discord.utils.utcnow()
+                    try:
+                        await log_ch.send(embed=alt_embed)
+                    except Exception:
+                        pass
+
+            if alt_action in ("kick", "ban"):
+                if target_guild:
+                    member = target_guild.get_member(user_id)
+                    if member:
+                        try:
+                            if alt_action == "ban":
+                                await target_guild.ban(
+                                    discord.Object(id=user_id),
+                                    reason=f"ウェブ認証/alt_check: アカウント日齢 {account_age_days}日（閾値: {alt_threshold_days}日）"
+                                )
+                            else:
+                                await member.kick(
+                                    reason=f"ウェブ認証/alt_check: アカウント日齢 {account_age_days}日（閾値: {alt_threshold_days}日）"
+                                )
+                        except Exception as e:
+                            print(f"[ウェブ認証/alt_check] {alt_action}実行エラー: {e}")
+
+                alt_action_label = "BAN" if alt_action == "ban" else "キック"
+                return _html_page(
+                    title="参加不可",
+                    message="このサーバーには参加できません",
+                    sub=f"アカウントの作成から日が浅いため（新規アカウント対策）、{alt_action_label}されました。",
+                    ok=False
+                )
+            # alt_action == "notify" の場合は弾かずに以降のBL照合へ進む
+
+    # =========================================================
+    # ② 荒らしリスト（ブラックリスト）照合 — 常時実行
     #    サーバーBL機能のON/OFFに関わらず、荒らしリストに登録済みなら弾く
     # =========================================================
     troll_list = global_cfg_bl.get("troll_list", {})
@@ -14873,7 +14960,7 @@ async def _oauth2_callback_handler(request):
         )
 
     # =========================================================
-    # ② サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
+    # ③ サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
     # =========================================================
     if not cfg.get("server_blacklist_enabled", True):
         # 機能が無効になっていれば認証OK。ロール付与は「認証完了」ボタン押下時に確定させる
