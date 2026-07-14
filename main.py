@@ -205,6 +205,18 @@ else:
 # Botのカスタムステータステキスト保存用変数
 current_custom_status = None
 
+# --------------------------------------------------------------------
+# ステータスローテーション表示用のグローバル状態
+# --------------------------------------------------------------------
+# current_custom_status が設定されていない間、複数の情報（サーバー数、
+# コマンド登録数、コマンド累計実行数、更新中表示など）を一定間隔で
+# 自動的に切り替えて表示するためのカウンタ・タスク管理変数群。
+_bot_start_time: float = time.time()
+_command_exec_count: int = 0          # これまでに実行されたスラッシュコマンドの累計回数
+_status_rotation_task = None          # ローテーション表示を行うバックグラウンドタスク
+_status_rotation_interval = 15        # ステータスを切り替える間隔（秒）
+_status_data_updating_count = 0       # 0より大きい間はローテーションに「更新中」を挟む（複数ギルド同時実行に対応するためカウンタ方式）
+
 
 # ====================================================================
 # セクション 1: データベース・設定処理
@@ -497,6 +509,15 @@ bot = commands.Bot(
 #   1. 例外を確実にログへ出力し、原因調査を可能にする
 #   2. ユーザーには常に何らかの応答を返し、「反応なし」を防ぐ
 # という2点を保証します。
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command):
+    """スラッシュコマンドが正常に実行完了するたびに呼び出されます（discord.pyがCommandTreeから中継）。
+    ステータス表示の「コマンド実行数」ローテーション項目に使うため、
+    累計実行回数をカウントするだけの軽量な処理です。"""
+    global _command_exec_count
+    _command_exec_count += 1
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
     # クールダウンや権限不足など、ユーザー起因のエラーは分かりやすいメッセージに変換
@@ -959,15 +980,91 @@ def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
 
 
 async def update_bot_status(client, text=None):
-    """Botのプレゼンス（カスタムステータス）を更新します。"""
+    """Botのプレゼンス（カスタムステータス）を更新します。
+    text（またはcurrent_custom_status）が設定されている間は、その文言を
+    固定表示します。未設定の場合はローテーション表示（_status_rotation_loop）に
+    委ねるため、ここではサーバー数のデフォルト表示のみを行います。"""
     global current_custom_status
     if text:
         current_custom_status = text
-    
+
     status_text = current_custom_status if current_custom_status else f"{len(client.guilds)}個のサーバー"
     activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
     await client.change_presence(status=discord.Status.online, activity=activity)
     print(f"[ステータス更新] {status_text} を視聴中 (Online)")
+
+
+async def _set_presence_text(client, text: str, activity_type: discord.ActivityType = discord.ActivityType.watching):
+    """内部用: プレゼンスのテキストのみを直接変更します（current_custom_statusは変更しない）。
+    ローテーション表示や起動中表示など、恒久設定ではない一時的なステータス切り替えに使用します。"""
+    try:
+        activity = discord.Activity(type=activity_type, name=text)
+        await client.change_presence(status=discord.Status.online, activity=activity)
+    except Exception as e:
+        print(f"[警告] プレゼンス更新に失敗しました: {e}")
+
+
+def _build_status_rotation_items(client) -> list:
+    """ローテーション表示するステータス候補のリストを (ActivityType, テキスト) のタプルで返します。"""
+    guild_count = len(client.guilds)
+    command_count = len(client.tree.get_commands())
+    uptime_seconds = int(time.time() - _bot_start_time)
+    days, rem = divmod(uptime_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        uptime_text = f"{days}日{hours}時間稼働中"
+    elif hours > 0:
+        uptime_text = f"{hours}時間{minutes}分稼働中"
+    else:
+        uptime_text = f"{minutes}分稼働中"
+
+    items = [
+        (discord.ActivityType.watching, f"{guild_count}個のサーバー"),
+        (discord.ActivityType.playing, f"コマンド {command_count}種 / 実行 {_command_exec_count}回"),
+        (discord.ActivityType.watching, uptime_text),
+    ]
+    # データ更新処理（統計チャンネル自動更新など）の実行中は「更新中」表示を挟む
+    if _status_data_updating_count > 0:
+        items.append((discord.ActivityType.playing, "データを更新中..."))
+    return items
+
+
+async def _status_rotation_loop(client):
+    """current_custom_status が未設定の間、複数のステータス情報を一定間隔で
+    自動的に切り替えて表示し続けるバックグラウンドループです。
+    current_custom_status が設定された場合は自動的に一時停止し、
+    解除（reset）されると自動的に再開します。"""
+    index = 0
+    while True:
+        try:
+            if current_custom_status:
+                # カスタムステータスが手動設定されている間はローテーションを休止し、
+                # 固定表示を維持する（update_bot_status側で既に反映済み）。
+                await asyncio.sleep(_status_rotation_interval)
+                continue
+
+            items = _build_status_rotation_items(client)
+            if not items:
+                await asyncio.sleep(_status_rotation_interval)
+                continue
+
+            activity_type, text = items[index % len(items)]
+            await _set_presence_text(client, text, activity_type)
+            index += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[警告] ステータスローテーション中にエラーが発生しました: {e}")
+        await asyncio.sleep(_status_rotation_interval)
+
+
+def start_status_rotation(client):
+    """ステータスローテーションのバックグラウンドタスクを起動します（重複起動防止つき）。"""
+    global _status_rotation_task
+    if _status_rotation_task is None or _status_rotation_task.done():
+        _status_rotation_task = asyncio.create_task(_status_rotation_loop(client))
+        print("[システム] ステータスローテーションを開始しました")
 
 
 # ====================================================================
@@ -3304,6 +3401,13 @@ def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Emb
 async def on_ready():
     """Bot起動完了時に呼び出されます。ビューの永続化再登録やプレゼンス設定を行います。"""
 
+    # 起動処理（ビュー再登録・タスク復元など）が完了するまでの間、
+    # ひと目で「起動作業中」と分かるようにステータスを一時表示する。
+    try:
+        await _set_presence_text(bot, "起動中...", discord.ActivityType.playing)
+    except Exception as e:
+        print(f"[警告] 起動中ステータスの表示に失敗しました: {e}")
+
     # Opusライブラリを自動検索してロードする（Nixpacks環境対応）
     if not discord.opus.is_loaded():
         import ctypes.util
@@ -3475,7 +3579,11 @@ async def on_ready():
                 print(f"[警告] 投票パネルの再登録に失敗しました（guild={guild_id_str}, poll={poll_id_str}）: {e}")
 
     try:
-        await update_bot_status(bot)
+        if current_custom_status:
+            # 手動設定済みのカスタムステータスがあれば、それを優先して固定表示する
+            await update_bot_status(bot)
+        # ローテーション表示タスクを起動（カスタムステータス設定中は内部で自動休止する）
+        start_status_rotation(bot)
     except Exception as e:
         print(f"初期ステータス設定エラー: {e}")
     
@@ -3576,13 +3684,16 @@ async def on_ready():
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     print(f"[サーバー参加] {guild.name} (ID: {guild.id}) に導入されました。")
-    await update_bot_status(bot)
+    # カスタムステータス固定表示中のみ即時反映（ローテーション表示中は次回切り替え時に自動反映される）
+    if current_custom_status:
+        await update_bot_status(bot)
 
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
     print(f"[サーバー脱退] {guild.name} (ID: {guild.id}) から削除されました。")
-    await update_bot_status(bot)
+    if current_custom_status:
+        await update_bot_status(bot)
 
 
 # ====================================================================
@@ -9316,7 +9427,7 @@ async def modlog_set(interaction: discord.Interaction, channel: discord.TextChan
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@owner_group.command(name="status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
+@owner_group.command(name="status", description="【オーナー限定】Botの視聴中ステータスの文字を変更、またはローテーション表示に戻します（reset指定）")
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
@@ -9324,10 +9435,16 @@ async def owner_status(interaction: discord.Interaction, text: str):
             global current_custom_status
             current_custom_status = None
             await update_bot_status(bot)
-            await interaction.response.send_message("ステータスをデフォルト（サーバー数カウント）にリセットしました。", ephemeral=True)
+            await interaction.response.send_message(
+                "カスタムステータスを解除しました。サーバー数・コマンド数・稼働時間などのローテーション表示に戻ります。",
+                ephemeral=True
+            )
         else:
             await update_bot_status(bot, text)
-            await interaction.response.send_message(f"Botのステータスを「{text} を視聴中」に変更しました。", ephemeral=True)
+            await interaction.response.send_message(
+                f"Botのステータスを「{text} を視聴中」に固定しました（ローテーション表示は一時停止します）。",
+                ephemeral=True
+            )
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
@@ -9986,12 +10103,19 @@ async def _update_stats_channels(guild: discord.Guild):
 
 
 async def _stats_loop(guild: discord.Guild):
-    """5分ごとに統計チャンネルを更新するループタスクです。"""
+    """5分ごとに統計チャンネルを更新するループタスクです。
+    実行中はBotのステータスローテーションに「データを更新中...」を
+    一時的に挟むため、グローバルカウンタ _status_data_updating_count を
+    加減算する（複数ギルドで同時に走っても正しくON/OFFを判定できるようにするため）。"""
+    global _status_data_updating_count
     while True:
         try:
+            _status_data_updating_count += 1
             await _update_stats_channels(guild)
         except Exception as e:
             print(f"[stats_loop エラー] {guild.name}: {e}")
+        finally:
+            _status_data_updating_count = max(0, _status_data_updating_count - 1)
         await asyncio.sleep(300)  # 5分ごとに更新
 
 
@@ -15226,7 +15350,7 @@ async def _admin_bot_status_handler(request):
     else:
         current_custom_status = None
         await update_bot_status(bot)
-        return _dashboard_redirect(provided_key, "ステータス文言をデフォルト（サーバー数表示）に戻しました。")
+        return _dashboard_redirect(provided_key, "ステータス文言をデフォルト（サーバー数・コマンド数・稼働時間などのローテーション表示）に戻しました。")
 
 
 async def _start_web_server():
