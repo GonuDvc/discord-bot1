@@ -4150,46 +4150,44 @@ def _remember_dm_relay(all_data: dict, forwarded_message_id: int, user_id: int):
 
 
 async def _forward_dm_to_owner(message: discord.Message, owner_id: int):
-    """一般ユーザーからBOTへのDMを、送信者情報付きのembedでオーナーへ転送します。"""
+    """一般ユーザーからBOTへのDMを、送信者情報付きの通常メッセージでオーナーへ転送します。"""
     try:
         owner_user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
     except Exception as e:
         print(f"[DMリレー] オーナー情報の取得に失敗しました: {e}")
         return
 
-    embed = discord.Embed(
-        title=" BOTにDMが届きました",
-        description=message.content if message.content else "(本文なし／添付ファイルのみ)",
-        color=discord.Color.blue(),
-        timestamp=message.created_at
+    body_text = message.content if message.content else "(本文なし／添付ファイルのみ)"
+    header_text = (
+        f"📩 **BOTにDMが届きました**\n"
+        f"送信者: {message.author} (`{message.author.id}`)\n"
+        f"----------------------------------------\n"
+        f"{body_text}"
     )
-    embed.set_author(
-        name=f"{message.author} ({message.author.id})",
-        icon_url=message.author.display_avatar.url if message.author.display_avatar else discord.utils.MISSING
-    )
-    embed.set_footer(text="このメッセージに「返信」するか、!reply <ユーザーID> <内容> でこのユーザーへ返信できます")
+    footer_text = "\n----------------------------------------\nこのメッセージに「返信」するか、`!reply <ユーザーID> <内容>` でこのユーザーへ返信できます"
 
-    # 添付ファイルの処理（画像はembedに表示、それ以外はそのままファイルとして転送）
+    # 添付ファイルの処理（画像URL・その他添付は本文に列挙し、非画像ファイルはそのまま添付転送）
     files_to_send = []
-    image_url = None
-    extra_image_urls = []
+    image_urls = []
     try:
         for a in message.attachments:
-            if a.content_type and a.content_type.startswith("image/") and image_url is None:
-                image_url = a.url
-            elif a.content_type and a.content_type.startswith("image/"):
-                extra_image_urls.append(a.url)
+            if a.content_type and a.content_type.startswith("image/"):
+                image_urls.append(a.url)
             else:
                 files_to_send.append(await a.to_file())
-        if image_url:
-            embed.set_image(url=image_url)
-        if extra_image_urls:
-            embed.add_field(name="その他の添付画像", value="\n".join(extra_image_urls), inline=False)
     except Exception as e:
         print(f"[DMリレー] 添付ファイルの処理中にエラーが発生しました: {e}")
 
+    full_text = header_text
+    if image_urls:
+        full_text += "\n\n添付画像:\n" + "\n".join(image_urls)
+    full_text += footer_text
+
+    if len(full_text) > 2000:
+        full_text = full_text[:1997] + "..."
+
     try:
-        sent_msg = await owner_user.send(embed=embed, files=files_to_send if files_to_send else None)
+        sent_msg = await owner_user.send(content=full_text, files=files_to_send if files_to_send else None)
     except discord.Forbidden:
         print("[DMリレー] オーナーへの転送に失敗しました（オーナーがBOTからのDMを拒否しています）。")
         return
