@@ -195,6 +195,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.dm_messages = True      # DMメッセージ of 受信を有効化（on_message で DM を処理するために必要）
+intents.invites = True          # 招待トラッキング機能（/invite stats）のため招待作成・削除イベントを受信
 
 # JSONデータファイル of パス設定 (Railway用の永続化パス '/app/data' of 存在チェック)
 if os.path.exists("/app/data"):
@@ -462,6 +463,12 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_summary_weekday", 0),            # 自動実行する曜日（0=月曜〜6=日曜、datetime.weekday()準拠）
         ("ai_summary_hour", 9),               # 自動実行する時刻（0-23、UTC基準で扱う）
         ("ai_summary_last_run", None),        # 最後に自動実行した日付（YYYY-MM-DD文字列）。二重実行防止用
+        # --- 招待トラッキング（/invite stats） ---
+        ("invite_tracking_enabled", True),    # 機能ON/OFF（招待インテントが必要）
+        ("invite_stats", {}),                 # {inviter_user_id_str: {"joins": int, "leaves": int}}
+        ("invite_join_log", {}),              # {member_user_id_str: inviter_user_id_str} 誰が誰を招待したか（最新の参加分）
+        # --- AFK機能（/afk） ---
+        ("afk_users", {}),                    # {user_id_str: {"reason": str, "since": unix_timestamp, "old_nick": str|None}}
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -565,6 +572,7 @@ voice_sound_group = app_commands.Group(name="voice_sound", description="ボイ�
 roleshop_group = app_commands.Group(name="roleshop", description="【管理者専用】ロールショップの管理")
 vendingmachine_group = app_commands.Group(name="vendingmachine", description="【管理者専用】自販機の管理")
 ticket_group = app_commands.Group(name="ticket", description="問い合わせチケットシステムの管理")
+invite_group = app_commands.Group(name="invite", description="招待トラッキング（誰が何人招待したか）の確認・管理")
 interview_group = app_commands.Group(name="interview", description="【管理者専用】面接（応募）システムの管理")
 interview_question_group = app_commands.Group(name="question", description="【管理者専用】面接の質問リストを管理", parent=interview_group)
 
@@ -612,6 +620,7 @@ bot.tree.add_command(voice_sound_group)
 bot.tree.add_command(roleshop_group)
 bot.tree.add_command(vendingmachine_group)
 bot.tree.add_command(ticket_group)
+bot.tree.add_command(invite_group)
 bot.tree.add_command(interview_group)
 bot.tree.add_command(server_group)
 bot.tree.add_command(moderation_group)
@@ -1065,6 +1074,154 @@ def start_status_rotation(client):
     if _status_rotation_task is None or _status_rotation_task.done():
         _status_rotation_task = asyncio.create_task(_status_rotation_loop(client))
         print("[システム] ステータスローテーションを開始しました")
+
+
+# ====================================================================
+# 招待トラッキング（/invite stats）
+# ====================================================================
+# discord.Invite.uses はキャッシュされた値のため、招待作成/削除イベントや
+# 定期リフレッシュだけでは「誰が参加時にどの招待コードを使ったか」を直接は
+# 特定できません。そこでギルドごとに「招待コード -> 直近のuses数」の
+# スナップショットをメモリ上に保持し、on_member_join のたびに現在のuses数と
+# 比較して増分（+1）があった招待コードを特定する方式を取ります。
+# ※ メモリ上のキャッシュのため、Bot再起動直後は on_ready でのキャッシュ再構築が
+#    完了するまでの短い間、新規参加者の招待元特定ができない場合があります。
+
+_invite_uses_cache: dict = {}  # {guild_id: {invite_code: uses_count}}
+
+
+async def _refresh_invite_cache_for_guild(guild: discord.Guild):
+    """指定ギルドの招待コード一覧を取得し、uses数スナップショットを更新します。"""
+    try:
+        invites = await guild.invites()
+        _invite_uses_cache[guild.id] = {inv.code: (inv.uses or 0) for inv in invites}
+    except discord.Forbidden:
+        # 「招待を管理」権限がない場合は静かにスキップ（招待トラッキングは無効扱いになる）
+        _invite_uses_cache[guild.id] = {}
+    except Exception as e:
+        print(f"[招待トラッキング] キャッシュ更新エラー（{guild.name}）: {e}")
+        _invite_uses_cache.setdefault(guild.id, {})
+
+
+async def _refresh_all_invite_caches(client):
+    """Bot起動時に、参加している全ギルドの招待キャッシュを一括構築します。"""
+    for guild in client.guilds:
+        await _refresh_invite_cache_for_guild(guild)
+    print(f"[システム] 招待トラッキングキャッシュを構築しました（{len(client.guilds)}ギルド）")
+
+
+async def _identify_used_invite(member: discord.Member):
+    """新規参加者がどの招待コードを使ったかを特定し、対応する discord.Invite オブジェクト
+    （招待作成者情報 .inviter を含む）を返します。特定できない場合はNoneを返します。
+    実行後、内部キャッシュは最新状態に更新されます。"""
+    guild = member.guild
+    before = _invite_uses_cache.get(guild.id, {})
+
+    try:
+        after_invites = await guild.invites()
+    except discord.Forbidden:
+        return None
+    except Exception as e:
+        print(f"[招待トラッキング] 参加時の招待一覧取得エラー: {e}")
+        return None
+
+    used_invite = None
+    for inv in after_invites:
+        if (inv.uses or 0) > before.get(inv.code, 0):
+            used_invite = inv
+            break
+
+    _invite_uses_cache[guild.id] = {inv.code: (inv.uses or 0) for inv in after_invites}
+    return used_invite
+
+
+def record_invite_stat(all_data: dict, guild_id_str: str, inviter_id_str: str, joined: bool):
+    """招待統計（招待した人ごとの参加者数）を加算/減算します。joined=Trueで参加、Falseで退出時の減算。"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    stats = cfg.setdefault("invite_stats", {})
+    entry = stats.setdefault(inviter_id_str, {"joins": 0, "leaves": 0})
+    if joined:
+        entry["joins"] = entry.get("joins", 0) + 1
+    else:
+        entry["leaves"] = entry.get("leaves", 0) + 1
+
+
+# ====================================================================
+# AFK機能（/afk）
+# ====================================================================
+
+def set_afk_status(all_data: dict, guild_id_str: str, user_id_str: str, reason: str, old_nick: str | None):
+    """ユーザーをAFK状態として記録します。"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    afk_map = cfg.setdefault("afk_users", {})
+    afk_map[user_id_str] = {
+        "reason": reason,
+        "since": int(time.time()),
+        "old_nick": old_nick,
+    }
+
+
+def clear_afk_status(all_data: dict, guild_id_str: str, user_id_str: str) -> dict | None:
+    """AFK状態を解除し、解除前の情報（旧ニックネーム等）を返します。未設定の場合はNoneを返します。"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    afk_map = cfg.setdefault("afk_users", {})
+    return afk_map.pop(user_id_str, None)
+
+
+async def _handle_afk_logic(message: discord.Message, all_data: dict, guild_id_str: str) -> bool:
+    """AFK機能のメッセージ処理を行います。
+    1. 発言者自身がAFK中であれば自動解除する（ニックネームも復元）
+    2. メッセージ中でメンションされた相手がAFK中であれば、離席中である旨を返信する
+    戻り値: all_data に変更を加えた場合は True（呼び出し元で save_data させるため）"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    afk_map = cfg.get("afk_users", {})
+    if not afk_map:
+        return False
+
+    changed = False
+    author_id_str = str(message.author.id)
+
+    # 1. 本人発言による自動解除
+    if author_id_str in afk_map:
+        entry = clear_afk_status(all_data, guild_id_str, author_id_str)
+        changed = True
+        if entry:
+            old_nick = entry.get("old_nick")
+            member = message.guild.get_member(message.author.id) if message.guild else None
+            if member and (member.nick or "").startswith("[AFK] "):
+                try:
+                    await member.edit(nick=old_nick, reason="AFK解除")
+                except Exception:
+                    pass
+            try:
+                await message.channel.send(
+                    f"おかえりなさい、{message.author.mention}！ AFKを解除しました。",
+                    delete_after=10
+                )
+            except Exception:
+                pass
+
+    # 2. メンションされた相手がAFK中であれば通知
+    notified_ids = set()
+    for mentioned in message.mentions:
+        mentioned_id_str = str(mentioned.id)
+        if mentioned_id_str == author_id_str or mentioned_id_str in notified_ids:
+            continue
+        entry = afk_map.get(mentioned_id_str)
+        if entry:
+            notified_ids.add(mentioned_id_str)
+            reason = entry.get("reason", "離席中")
+            since_ts = entry.get("since")
+            since_text = f"（<t:{since_ts}:R>から）" if since_ts else ""
+            try:
+                await message.channel.send(
+                    f"[AFK] {mentioned.mention} は現在離席中です{since_text}\n理由: {reason}",
+                    allowed_mentions=discord.AllowedMentions(users=False)
+                )
+            except Exception:
+                pass
+
+    return changed
 
 
 # ====================================================================
@@ -3586,7 +3743,13 @@ async def on_ready():
         start_status_rotation(bot)
     except Exception as e:
         print(f"初期ステータス設定エラー: {e}")
-    
+
+    # 招待トラッキング用キャッシュの構築（再接続のたびに呼ばれても軽量なため毎回リフレッシュする）
+    try:
+        await _refresh_all_invite_caches(bot)
+    except Exception as e:
+        print(f"[警告] 招待トラッキングキャッシュの構築に失敗しました: {e}")
+
     print("--- 起動完了: 現在のサーバー設定一覧 ---")
     for guild_id_str, config in all_data.items():
         if guild_id_str in ("user_apps", "global_config"):
@@ -3687,6 +3850,8 @@ async def on_guild_join(guild: discord.Guild):
     # カスタムステータス固定表示中のみ即時反映（ローテーション表示中は次回切り替え時に自動反映される）
     if current_custom_status:
         await update_bot_status(bot)
+    # 招待トラッキング用キャッシュを初期化（このサーバー分）
+    await _refresh_invite_cache_for_guild(guild)
 
 
 @bot.event
@@ -3694,6 +3859,26 @@ async def on_guild_remove(guild: discord.Guild):
     print(f"[サーバー脱退] {guild.name} (ID: {guild.id}) から削除されました。")
     if current_custom_status:
         await update_bot_status(bot)
+    _invite_uses_cache.pop(guild.id, None)
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    """招待リンクが新規作成された際、招待トラッキング用キャッシュに反映します。"""
+    if invite.guild is None:
+        return
+    cache = _invite_uses_cache.setdefault(invite.guild.id, {})
+    cache[invite.code] = invite.uses or 0
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    """招待リンクが削除された際、招待トラッキング用キャッシュから除去します。"""
+    if invite.guild is None:
+        return
+    cache = _invite_uses_cache.get(invite.guild.id)
+    if cache:
+        cache.pop(invite.code, None)
 
 
 # ====================================================================
@@ -4100,6 +4285,11 @@ async def on_message(message: discord.Message):
 
     guild_id_str = str(message.guild.id)
     all_data = load_data()
+
+    # AFK機能: 本人発言による自動解除／メンションされた際の離席通知
+    afk_data_changed = await _handle_afk_logic(message, all_data, guild_id_str)
+    if afk_data_changed:
+        save_data(all_data)
 
     if guild_id_str in all_data:
         guild_config = all_data[guild_id_str]
@@ -6033,6 +6223,30 @@ async def on_member_join(member: discord.Member):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="アカウント作成日時", value=member.created_at.strftime("%Y/%m/%d %H:%M:%S UTC"), inline=False)
+
+    # =========================================================
+    # 招待トラッキング: どの招待コード・誰の招待で参加したかを特定して記録
+    # =========================================================
+    if cfg.get("invite_tracking_enabled", True):
+        try:
+            used_invite = await _identify_used_invite(member)
+            if used_invite is not None:
+                inviter = used_invite.inviter
+                if inviter is not None:
+                    inviter_id_str = str(inviter.id)
+                    record_invite_stat(all_data, str(member.guild.id), inviter_id_str, joined=True)
+                    cfg.setdefault("invite_join_log", {})[str(member.id)] = inviter_id_str
+                    embed.add_field(
+                        name="招待元",
+                        value=f"{inviter.mention}（コード: `{used_invite.code}`）",
+                        inline=False
+                    )
+                else:
+                    # Vanity URL等、招待者不明のケース
+                    embed.add_field(name="招待元", value=f"不明（コード: `{used_invite.code}`）", inline=False)
+        except Exception as e:
+            print(f"[招待トラッキング] 参加時の招待元特定エラー: {e}")
+
     await _send_mod_log(member.guild, embed)
 
     # 荒らし対策: 隔離ロールの自動付与（未認証状態にする）
@@ -6181,6 +6395,9 @@ async def on_member_join(member: discord.Member):
                     except Exception as e:
                         print(f"[サーバーBL] DM送信エラー: {e}")
 
+    # 招待トラッキング等、この関数内で all_data に加えた変更を保存
+    save_data(all_data)
+
 
 @bot.event
 async def on_member_remove(member: discord.Member):
@@ -6191,6 +6408,24 @@ async def on_member_remove(member: discord.Member):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     await _send_mod_log(member.guild, embed)
+
+    # 招待トラッキング: 招待元がいれば退出数を加算し、AFK登録も後片付けする
+    all_data = load_data()
+    guild_id_str = str(member.guild.id)
+    cfg = get_guild_config(all_data, guild_id_str)
+    changed = False
+
+    inviter_id_str = cfg.get("invite_join_log", {}).pop(str(member.id), None)
+    if inviter_id_str:
+        record_invite_stat(all_data, guild_id_str, inviter_id_str, joined=False)
+        changed = True
+
+    if str(member.id) in cfg.get("afk_users", {}):
+        clear_afk_status(all_data, guild_id_str, str(member.id))
+        changed = True
+
+    if changed:
+        save_data(all_data)
 
 
 @bot.event
@@ -17562,6 +17797,135 @@ async def ticket_setup(
 @ticket_group.command(name="close", description="現在のチャンネルがチケットの場合、クローズします")
 async def ticket_close(interaction: discord.Interaction):
     await _close_ticket_channel(interaction)
+
+
+# ====================================================================
+# 招待トラッキング（/invite stats, /invite leaderboard）
+# ====================================================================
+
+@invite_group.command(name="stats", description="招待した人数のランキング、または指定ユーザーの招待成績を確認します")
+async def invite_stats_cmd(interaction: discord.Interaction, ユーザー: discord.Member = None):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if not cfg.get("invite_tracking_enabled", True):
+        await interaction.response.send_message(
+            "このサーバーでは招待トラッキングが無効になっています。",
+            ephemeral=True
+        )
+        return
+
+    target = ユーザー or interaction.user
+    stats = cfg.get("invite_stats", {}).get(str(target.id), {"joins": 0, "leaves": 0})
+    joins = stats.get("joins", 0)
+    leaves = stats.get("leaves", 0)
+    net = joins - leaves
+
+    embed = discord.Embed(
+        title=f"招待成績: {target.display_name}",
+        color=discord.Color.blue()
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="累計招待参加数", value=f"{joins}人", inline=True)
+    embed.add_field(name="うち退出済み", value=f"{leaves}人", inline=True)
+    embed.add_field(name="現在の招待実績（純増）", value=f"{net}人", inline=True)
+    embed.set_footer(text="Bot起動中に取得できた招待作成者情報のみ集計されます（Vanity URL経由の参加は集計対象外）")
+    await interaction.response.send_message(embed=embed)
+
+
+@invite_group.command(name="leaderboard", description="招待した人数のサーバー内ランキングを表示します")
+async def invite_leaderboard_cmd(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    stats = cfg.get("invite_stats", {})
+
+    if not stats:
+        await interaction.response.send_message("まだ招待トラッキングのデータがありません。", ephemeral=True)
+        return
+
+    # 純増数（joins - leaves）の降順でランキング化
+    ranked = sorted(
+        stats.items(),
+        key=lambda item: item[1].get("joins", 0) - item[1].get("leaves", 0),
+        reverse=True
+    )[:10]
+
+    embed = discord.Embed(
+        title="招待ランキング TOP10",
+        description=f"{interaction.guild.name} における招待実績（純増数）ランキングです。",
+        color=discord.Color.gold()
+    )
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (user_id_str, entry) in enumerate(ranked):
+        joins = entry.get("joins", 0)
+        leaves = entry.get("leaves", 0)
+        net = joins - leaves
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} <@{user_id_str}> — **{net}人**（参加{joins} / 退出{leaves}）")
+
+    embed.add_field(name="ランキング", value="\n".join(lines) if lines else "データがありません", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@invite_group.command(name="toggle", description="【管理者専用】このサーバーの招待トラッキング機能のON/OFFを切り替えます")
+async def invite_toggle_cmd(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction):
+        return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["invite_tracking_enabled"] = not cfg.get("invite_tracking_enabled", True)
+    save_data(all_data)
+    state = "有効" if cfg["invite_tracking_enabled"] else "無効"
+    await interaction.response.send_message(f"招待トラッキング機能を{state}にしました。", ephemeral=True)
+
+
+# ====================================================================
+# AFK機能（/afk）
+# ====================================================================
+# 席を外す際に /afk を実行しておくと、他の人からメンションされた際に
+# Botが「離席中です」と自動で知らせてくれます。本人が次に発言すると
+# 自動的にAFK状態が解除されます。
+
+@bot.tree.command(name="afk", description="離席（AFK）状態に設定します。次に発言すると自動的に解除されます")
+async def afk_cmd(interaction: discord.Interaction, 理由: str = "離席中"):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_id_str = str(interaction.guild.id)
+    user_id_str = str(interaction.user.id)
+
+    member = interaction.guild.get_member(interaction.user.id)
+    old_nick = member.nick if member else None
+
+    set_afk_status(all_data, guild_id_str, user_id_str, 理由, old_nick)
+    save_data(all_data)
+
+    # ニックネームに[AFK]を付与（表示上分かりやすくするための任意演出。権限不足時は無視）
+    if member and not (member.nick or "").startswith("[AFK] "):
+        try:
+            new_nick = f"[AFK] {member.display_name}"
+            if len(new_nick) <= 32:
+                await member.edit(nick=new_nick, reason="AFK設定")
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title="[AFK] 離席モードにしました",
+        description=f"理由: {理由}\n\nメンションされると、代わりにBotが離席中である旨をお知らせします。\n次に何か発言すると自動的に解除されます。",
+        color=discord.Color.greyple()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ====================================================================
