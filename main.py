@@ -194,7 +194,7 @@ if not TOKEN:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.dm_messages = True      # DMメッセージ of 受信を有効化（on_message で DM を処理するために必要）
+intents.dm_messages = True      # DMメッセージ受信を有効化（1対1DM・Botが参加済みのグループDM双方のメッセージ受信に必要）
 intents.invites = True          # 招待トラッキング機能（/invite stats）のため招待作成・削除イベントを受信
 
 # JSONデータファイル of パス設定 (Railway用の永続化パス '/app/data' of 存在チェック)
@@ -722,6 +722,9 @@ def get_global_config(all_data: dict) -> dict:
     # サーバーブラックリスト（全サーバー共通）
     if "global_server_blacklist_ids" not in cfg:
         cfg["global_server_blacklist_ids"] = []  # [server_id_int, ...]
+    # AFK機能: DM・グループDM用（サーバーに紐付かないためグローバル領域で管理）
+    if "global_afk_users" not in cfg:
+        cfg["global_afk_users"] = {}  # {user_id_str: {"reason": str, "since": unix_timestamp}}
     return cfg
 
 
@@ -1222,6 +1225,54 @@ async def _handle_afk_logic(message: discord.Message, all_data: dict, guild_id_s
                 pass
 
     return changed
+
+
+async def _handle_afk_logic_dm(message: discord.Message):
+    """グループDM専用のAFK処理です。サーバーに紐付かないため、
+    get_global_config 配下のグローバルAFKストレージ（global_afk_users）を使用します。
+    ニックネーム変更はグループDMには存在しないため行いません。"""
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    afk_map = global_cfg.get("global_afk_users", {})
+    if not afk_map:
+        return
+
+    changed = False
+    author_id_str = str(message.author.id)
+
+    # 1. 本人発言による自動解除
+    if author_id_str in afk_map:
+        afk_map.pop(author_id_str, None)
+        changed = True
+        try:
+            await message.channel.send(
+                f"おかえりなさい、{message.author.mention}！ AFKを解除しました。"
+            )
+        except Exception:
+            pass
+
+    # 2. メンションされた相手がAFK中であれば通知
+    notified_ids = set()
+    for mentioned in message.mentions:
+        mentioned_id_str = str(mentioned.id)
+        if mentioned_id_str == author_id_str or mentioned_id_str in notified_ids:
+            continue
+        entry = afk_map.get(mentioned_id_str)
+        if entry:
+            notified_ids.add(mentioned_id_str)
+            reason = entry.get("reason", "離席中")
+            since_ts = entry.get("since")
+            since_text = f"（<t:{since_ts}:R>から）" if since_ts else ""
+            try:
+                await message.channel.send(
+                    f"[AFK] {mentioned.mention} は現在離席中です{since_text}\n理由: {reason}",
+                    allowed_mentions=discord.AllowedMentions(users=False)
+                )
+            except Exception:
+                pass
+
+    if changed:
+        save_data(all_data)
 
 
 # ====================================================================
@@ -4279,7 +4330,12 @@ async def on_message(message: discord.Message):
         return
 
     if not message.guild:
-        # ギルドに属さないメッセージ = DM -> オーナー⇔ユーザー間のリレー処理
+        if isinstance(message.channel, discord.GroupChannel):
+            # グループDM: オーナー転送の対象外とし、AFK機能のみ処理する
+            await _handle_afk_logic_dm(message)
+            await bot.process_commands(message)
+            return
+        # 1対1のDM -> オーナー⇔ユーザー間のリレー処理
         await _handle_dm_relay(message)
         return
 
@@ -17926,6 +17982,44 @@ async def afk_cmd(interaction: discord.Interaction, 理由: str = "離席中"):
         color=discord.Color.greyple()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.command(name="afk")
+async def afk_text_cmd(ctx: commands.Context, *, 理由: str = "離席中"):
+    """
+    テキストコマンド版のAFK設定です（!afk 理由）。
+    Discordの仕様上、スラッシュコマンド（/afk）はグループDM内では使用できないため、
+    グループDM・通常DM・サーバーのいずれでも使えるテキストコマンドとして用意しています。
+    """
+    if ctx.guild is not None:
+        # サーバー内では /afk（スラッシュコマンド版）に案内する
+        # ※ !afk 自体もサーバー内で動作させたい場合はこの分岐を削除してください
+        all_data = load_data()
+        guild_id_str = str(ctx.guild.id)
+        user_id_str = str(ctx.author.id)
+        member = ctx.guild.get_member(ctx.author.id)
+        old_nick = member.nick if member else None
+        set_afk_status(all_data, guild_id_str, user_id_str, 理由, old_nick)
+        save_data(all_data)
+        if member and not (member.nick or "").startswith("[AFK] "):
+            try:
+                new_nick = f"[AFK] {member.display_name}"
+                if len(new_nick) <= 32:
+                    await member.edit(nick=new_nick, reason="AFK設定")
+            except Exception:
+                pass
+        await ctx.send(f"[AFK] {ctx.author.mention} を離席モードにしました。理由: {理由}")
+        return
+
+    # DM／グループDM: グローバルAFKストレージを使用（サーバーロール等は存在しないため）
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg.setdefault("global_afk_users", {})[str(ctx.author.id)] = {
+        "reason": 理由,
+        "since": int(time.time()),
+    }
+    save_data(all_data)
+    await ctx.send(f"[AFK] {ctx.author.mention} を離席モードにしました。理由: {理由}")
 
 
 # ====================================================================
