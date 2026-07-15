@@ -610,7 +610,7 @@ newspaper_group = app_commands.Group(name="newspaper", description="帝国新聞
 say_group = app_commands.Group(name="say", description="Botに代わりに発言させます（テキスト / Embed）")
 embed_group = app_commands.Group(name="embed", description="Embedメッセージの作成・送信")
 my_group = app_commands.Group(name="my", description="サーバー・権限・URLなどの各種スキャン・確認機能")
-ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット機能（Groq）の設定・管理")
+ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット機能の設定・管理")
 ai_chat_my_prompt_group = app_commands.Group(name="my_prompt", description="自分専用のAIチャット人格設定（システムプロンプト）を管理します", parent=ai_chat_group)
 ai_chat_summary_group = app_commands.Group(name="weekly_summary", description="【オーナー限定】サーバー活動のAIサマリー機能の管理", parent=ai_chat_group)
 ai_debate_group = app_commands.Group(name="ai_debate", description="【オーナー限定】AI同士（2人格）の自動会話機能の管理")
@@ -4705,7 +4705,8 @@ async def _ai_chat_moderate_system_prompt(text: str, guild_id: Optional[int] = N
         provider_override = await _ai_get_provider_override(guild_id)
         raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
     except Exception as e:
-        return False, f"判定処理に失敗したため設定できませんでした（{e}）"
+        print(f"[AIチャット/my_prompt] 判定処理エラー: {e}")
+        return False, "判定処理に失敗したため設定できませんでした"
 
     # ```json ... ``` のようなコードブロックで返ってくる場合に備えて除去
     cleaned = raw.strip()
@@ -5510,16 +5511,16 @@ async def _ai_debate_loop(channel_id: int):
                 wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
                 try:
                     await channel.send(
-                        f"[AIディベート] Groq APIのレート制限に達したため、ディベートを自動停止しました。{wait_hint}\n"
+                        f"[AIディベート] APIのレート制限に達したため、ディベートを自動停止しました。{wait_hint}\n"
                         "しばらく時間をおいてから `/ai_debate start` で再開してください。"
                     )
                 except discord.HTTPException:
                     pass
                 _ai_debate_sessions.pop(channel_id, None)
                 return
-            except Exception as e:
+            except Exception:
                 try:
-                    await channel.send(f"[AIディベート] 発言生成中にエラーが発生したため停止しました: {e}")
+                    await channel.send("[AIディベート] 発言生成中にエラーが発生したため停止しました。しばらく時間をおいて再度お試しください。")
                 except discord.HTTPException:
                     pass
                 _ai_debate_sessions.pop(channel_id, None)
@@ -5638,8 +5639,7 @@ async def _ai_debate_launch(
         name="設定",
         value=(
             f"発言間隔: {interval_seconds}秒\n"
-            f"最大ターン数: {max_turns if max_turns else '無制限（/ai_debate stopまで継続）'}\n"
-            f"使用モデル: `{model or GROQ_MODEL}`"
+            f"最大ターン数: {max_turns if max_turns else '無制限（/ai_debate stopまで継続）'}"
         ),
         inline=False
     )
@@ -5656,7 +5656,7 @@ async def _ai_debate_launch(
     人格bプロンプト="2人目のAIの人格・話し方の指示",
     発言間隔秒="次の発言までの待機秒数（既定10秒、5〜600秒）",
     最大ターン数="指定した往復数に達すると自動終了します（未指定なら無制限、stopするまで継続）",
-    モデル="使用するGroqモデル名（未指定ならサーバー既定のGROQ_MODELを使用）"
+    モデル="使用するモデル名（管理者向け・未指定ならサーバー既定値を使用）"
 )
 async def ai_debate_start(
     interaction: discord.Interaction,
@@ -5704,7 +5704,7 @@ async def ai_debate_start(
 @app_commands.describe(
     発言間隔秒="次の発言までの待機秒数（既定10秒、5〜600秒）",
     最大ターン数="指定した往復数に達すると自動終了します（未指定なら無制限、stopするまで継続）",
-    モデル="使用するGroqモデル名（未指定ならサーバー既定のGROQ_MODELを使用）"
+    モデル="使用するモデル名（管理者向け・未指定ならサーバー既定値を使用）"
 )
 async def ai_debate_random_start(
     interaction: discord.Interaction,
@@ -5743,12 +5743,12 @@ async def ai_debate_random_start(
     except GroqRateLimitError as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
         await interaction.followup.send(
-            f"Groq APIのレート制限に達しているため、ランダム設定を生成できませんでした。{wait_hint}",
+            f"APIのレート制限に達しているため、ランダム設定を生成できませんでした。{wait_hint}",
             ephemeral=True
         )
         return
-    except Exception as e:
-        await interaction.followup.send(f"ランダム設定の生成に失敗しました: {e}", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("ランダム設定の生成に失敗しました。しばらく時間をおいて再度お試しください。", ephemeral=True)
         return
 
     await _ai_debate_launch(
@@ -5944,8 +5944,9 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
             pass
         return
     except Exception as e:
+        print(f"[AIチャット] 応答生成エラー: {e}")
         try:
-            await message.reply(f"[AIチャット] 応答生成に失敗しました: {e}", mention_author=False)
+            await message.reply("[AIチャット] 応答生成に失敗しました。時間をおいて再度お試しください。", mention_author=False)
         except Exception:
             pass
         return
@@ -5954,14 +5955,13 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         # 思考過程のみが返って本文が空になった等のケース
         reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
 
-    # フォールバックモデル/プロバイダで応答した場合はその旨を一言添える
+    # フォールバックプロバイダ/モデルで応答した場合、一般ユーザーには実装詳細（プロバイダ名・モデル名）を
+    # 見せず「一時的に別方式で応答した」旨のみ簡潔に伝える（AI実装のプロバイダ/モデル名の外部露出防止）
     primary_model = model or GROQ_MODEL
-    if used_provider == "cerebras":
-        reply_text += f"\n\n*（本日のGroq利用上限のため、Cerebras（`{used_model}`）で応答しました）*"
-    elif used_provider == "mistral":
-        reply_text += f"\n\n*（本日のGroq・Cerebras利用上限のため、Mistral（`{used_model}`）で応答しました）*"
+    if used_provider in ("cerebras", "mistral"):
+        reply_text += "\n\n*（本日の利用上限のため、一時的に別方式で応答しました）*"
     elif used_model and used_model != primary_model:
-        reply_text += f"\n\n*（本日の利用上限のため、フォールバックモデル `{used_model}` で応答しました）*"
+        reply_text += "\n\n*（本日の利用上限のため、代替モデルで応答しました）*"
 
     # 履歴には画像URLそのものではなくテキストのみ保存する（画像のみ送信時はプレースホルダーを使用）。
     # 添付画像のURLは時間経過で失効するため、履歴として持ち回らせない設計。
@@ -7983,7 +7983,7 @@ async def server_role_lockdown_channels(interaction: discord.Interaction, role: 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@ai_chat_group.command(name="set_channel", description="【オーナー限定】このサーバーでAIチャット（Groq）を自動応答させるチャンネルを設定します")
+@ai_chat_group.command(name="set_channel", description="【オーナー限定】このサーバーでAIチャットを自動応答させるチャンネルを設定します")
 @app_commands.describe(channel="AIチャット専用にするチャンネル")
 async def ai_chat_set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await is_owner_check(interaction): return
@@ -8011,7 +8011,7 @@ async def ai_chat_set_channel(interaction: discord.Interaction, channel: discord
 
     await interaction.response.send_message(
         f"[設定完了] {channel.mention} をAIチャット専用チャンネルに設定しました。\n"
-        f"このチャンネルでの発言に、Groq（モデル: `{GROQ_MODEL}`）が自動応答します。",
+        f"このチャンネルでの発言にAIが自動応答します。",
         ephemeral=True
     )
 
@@ -8119,13 +8119,13 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
         )
 
 
-@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダ（Groq/Cerebras/Mistral）を切り替えます")
-@app_commands.describe(provider="使用するプロバイダ。autoは既定の自動フォールバック（Groq→Cerebras→Mistral）です")
+@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダを切り替えます")
+@app_commands.describe(provider="使用するAIプロバイダ。autoは既定の自動フォールバックです")
 @app_commands.choices(provider=[
-    app_commands.Choice(name="auto（既定：Groq→Cerebras→Mistralへ自動切替）", value="auto"),
-    app_commands.Choice(name="groq（Groq固定：日次上限に達しても切り替えない）", value="groq"),
-    app_commands.Choice(name="cerebras（Cerebras固定：Groqは一切使わない）", value="cerebras"),
-    app_commands.Choice(name="mistral（Mistral固定：Groq/Cerebrasは一切使わない）", value="mistral"),
+    app_commands.Choice(name="auto（既定：利用状況に応じて自動切替）", value="auto"),
+    app_commands.Choice(name="プロバイダ1固定", value="groq"),
+    app_commands.Choice(name="プロバイダ2固定", value="cerebras"),
+    app_commands.Choice(name="プロバイダ3固定", value="mistral"),
 ])
 async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_commands.Choice[str]):
     if not await is_owner_check(interaction): return
@@ -8133,16 +8133,16 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
 
     if provider.value == "cerebras" and not CEREBRAS_API_KEY:
         await interaction.response.send_message(
-            "[設定不可] CEREBRAS_API_KEYがBotに設定されていないため、「cerebras固定」は選択できません。\n"
-            "Botの環境変数にCEREBRAS_API_KEYを設定してから再度お試しください。",
+            "[設定不可] このプロバイダはBotに設定されていないため選択できません。\n"
+            "Botの環境変数を確認してください。",
             ephemeral=True
         )
         return
 
     if provider.value == "mistral" and not MISTRAL_API_KEY:
         await interaction.response.send_message(
-            "[設定不可] MISTRAL_API_KEYがBotに設定されていないため、「mistral固定」は選択できません。\n"
-            "Botの環境変数にMISTRAL_API_KEYを設定してから再度お試しください。",
+            "[設定不可] このプロバイダはBotに設定されていないため選択できません。\n"
+            "Botの環境変数を確認してください。",
             ephemeral=True
         )
         return
@@ -8153,24 +8153,25 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
     save_data(all_data)
 
     descriptions = {
-        "auto": "既定の自動フォールバック動作に戻しました。GroqがダメならCerebras、それもダメならMistralへ自動的に切り替わります。",
-        "groq": "Groq固定に設定しました。日次上限（TPD/RPD）に達してもCerebras/Mistralへは切り替わらず、エラーがそのまま通知されます。",
-        "cerebras": "Cerebras固定に設定しました。Groq/Mistralは一切呼び出されず、常にCerebrasが使用されます。",
-        "mistral": "Mistral固定に設定しました。Groq/Cerebrasは一切呼び出されず、常にMistralが使用されます（無料枠のレート制限が厳しいためご注意ください）。",
+        "auto": "既定の自動フォールバック動作に戻しました。利用状況に応じて自動的に切り替わります。",
+        "groq": "プロバイダ1固定に設定しました。上限に達しても他のプロバイダへは切り替わらず、エラーがそのまま通知されます。",
+        "cerebras": "プロバイダ2固定に設定しました。常にこのプロバイダが使用されます。",
+        "mistral": "プロバイダ3固定に設定しました。常にこのプロバイダが使用されます（無料枠のレート制限が厳しいためご注意ください）。",
     }
     await interaction.response.send_message(
         f"[設定完了] このサーバーのAIプロバイダを「{provider.name}」に設定しました。\n{descriptions[provider.value]}\n"
-        f"※画像添付時のAIチャット応答はVision対応の都合上、常にGroqが使用されます（この設定によらず変わりません）。",
+        f"※画像添付時のAIチャット応答は、対応の都合上、この設定によらず固定のプロバイダが使用されます。",
         ephemeral=True
     )
+
 
 
 @ai_chat_group.command(name="user_config", description="【オーナー限定】特定ユーザーのAIチャット設定（使用モデル・システムプロンプト）をカスタマイズします")
 @app_commands.describe(
     user="設定を変更するユーザー",
-    model="このユーザーに使用させるGroqモデル名（未指定なら変更しない）",
+    model="このユーザーに使用させるモデル名（管理者向け・未指定なら変更しない）",
     system_prompt="このユーザー専用のシステムプロンプト（人格・対応方針）。未指定なら変更しない",
-    reset_model="指定するとモデル設定をクリアし、サーバー既定（GROQ_MODEL）に戻します",
+    reset_model="指定するとモデル設定をクリアし、サーバー既定値に戻します",
     reset_system_prompt="指定するとシステムプロンプト設定をクリアし、既定プロンプトに戻します"
 )
 async def ai_chat_user_config(
@@ -8307,7 +8308,7 @@ async def ai_chat_user_status(interaction: discord.Interaction, user: discord.Us
         description=f"対象ユーザー: {user.mention}",
         color=discord.Color.blue()
     )
-    embed.add_field(name="使用モデル", value=f"`{setting['model']}`" if setting["model"] else f"（サーバー既定: `{GROQ_MODEL}`）", inline=False)
+    embed.add_field(name="使用モデル", value=f"`{setting['model']}`" if setting["model"] else "（サーバー既定値）", inline=False)
     embed.add_field(
         name="システムプロンプト",
         value=(setting["system_prompt"][:500] if setting["system_prompt"] else "（既定プロンプトを使用）"),
@@ -8510,7 +8511,7 @@ async def ai_chat_summary_run(interaction: discord.Interaction, channel: Optiona
             )
         else:
             await interaction.followup.send(
-                "サマリーの生成に失敗しました（Groq APIエラー）。時間をおいて再度お試しください。",
+                "サマリーの生成に失敗しました。時間をおいて再度お試しください。",
                 ephemeral=True
             )
         return
