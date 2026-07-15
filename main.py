@@ -756,6 +756,13 @@ def get_global_config(all_data: dict) -> dict:
         cfg["bot_stats_total_uptime_seconds"] = 0  # これまでの累計稼働秒数（Bot停止中の時間は含まない）
     if "bot_stats_command_exec_count" not in cfg:
         cfg["bot_stats_command_exec_count"] = 0    # これまでに実行されたスラッシュコマンドの累計回数
+    # DM（/ai コマンド）でのAIチャット設定（サーバーに紐付かないためグローバル領域で管理）
+    if "dm_ai_chat_enabled" not in cfg:
+        cfg["dm_ai_chat_enabled"] = True            # True: /ai コマンドを許可する（オーナーが /ai_chat dm off で無効化可）
+    if "dm_ai_chat_cooldown_seconds" not in cfg:
+        cfg["dm_ai_chat_cooldown_seconds"] = 10      # /ai コマンドの連投制限（秒）
+    if "dm_ai_chat_blocked_users" not in cfg:
+        cfg["dm_ai_chat_blocked_users"] = []         # [user_id_int, ...] /ai コマンドの利用をブロックされたユーザー
     return cfg
 
 
@@ -6077,6 +6084,198 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
 
 
 # ====================================================================
+# /ai コマンド（DM・グループDM・サーバー内どこからでも使える汎用AI質問コマンド）
+# ====================================================================
+# ・サーバー内の専用チャンネル自動応答（_handle_ai_chat_message）とは別に、
+#   場所を問わず単発で質問できるスラッシュコマンドを用意する。
+# ・DMには「サーバー設定」が存在しないため、クールダウン・ブロック等は
+#   グローバル設定（dm_ai_chat_*）で一元管理する。
+# ・会話履歴はチャンネルID単位で _ai_chat_histories をそのまま流用する
+#   （DMチャンネルにも一意のchannel.idがあるため、既存の仕組みと共存できる）。
+# ・ギルド疑似IDとして 0 を用いてクールダウンキャッシュ（_ai_chat_last_request）を
+#   共有する（実在のDiscordギルドIDは0にならないため衝突しない）。
+# ====================================================================
+
+_AI_COMMAND_DM_GUILD_KEY = 0  # DM/グループDMからの /ai 利用時に使う疑似ギルドID（クールダウン管理用）
+
+
+@bot.tree.command(name="ai", description="AIに質問します（DM・グループDM・サーバー内どこでも使えます）")
+@app_commands.describe(質問="AIに聞きたい内容を入力してください")
+async def ai_command(interaction: discord.Interaction, 質問: str):
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "現在この機能は利用できません（Botの設定が未完了です）。", ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+
+    if not global_cfg.get("dm_ai_chat_enabled", True):
+        await interaction.response.send_message(
+            "現在 `/ai` コマンドは無効化されています。管理者にお問い合わせください。", ephemeral=True
+        )
+        return
+
+    if interaction.user.id in global_cfg.get("dm_ai_chat_blocked_users", []):
+        await interaction.response.send_message("このコマンドの利用が制限されています。", ephemeral=True)
+        return
+
+    cooldown_seconds = global_cfg.get("dm_ai_chat_cooldown_seconds", 10)
+    remaining = _ai_chat_check_cooldown(_AI_COMMAND_DM_GUILD_KEY, interaction.user.id, cooldown_seconds)
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # サーバー内で実行された場合、そのサーバーのユーザー個別設定（人格・ブロック等）を尊重する。
+    # DM/グループDMではサーバー設定が存在しないため既定のシステムプロンプトを使用する。
+    system_prompt = AI_CHAT_SYSTEM_PROMPT
+    model: Optional[str] = None
+    provider_override: Optional[str] = None
+    if interaction.guild is not None:
+        guild_config = get_guild_config(all_data, str(interaction.guild.id))
+        user_setting = _ai_chat_get_user_setting(guild_config, interaction.user.id)
+        if user_setting["blocked"]:
+            await interaction.followup.send("このコマンドの利用が制限されています。", ephemeral=True)
+            return
+        system_prompt = user_setting["system_prompt"] or AI_CHAT_SYSTEM_PROMPT
+        model = user_setting["model"] or None
+        provider_override = guild_config.get("ai_provider", "auto")
+        if provider_override not in ("groq", "cerebras", "mistral"):
+            provider_override = None
+
+    # 履歴キー: DM/グループDM/サーバーいずれもチャンネルID単位（既存の自動応答と同じ仕組みを再利用）
+    channel_id = interaction.channel_id
+    history = _ai_chat_get_history(channel_id, interaction.user.id)
+    messages = [{"role": "system", "content": system_prompt}] + history + [
+        {"role": "user", "content": 質問}
+    ]
+
+    _ai_chat_record_request(_AI_COMMAND_DM_GUILD_KEY, interaction.user.id)
+
+    try:
+        reply_text, _used_provider = await _ai_call_llm_with_fallback(
+            messages, model=model, provider_override=provider_override
+        )
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
+        wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
+        limit_scope = getattr(e, "limit_scope", None)
+        if limit_scope in ("TPD", "RPD"):
+            scope_text = "本日の利用上限"
+        elif limit_scope in ("TPM", "RPM"):
+            scope_text = "レート制限（短時間の利用集中）"
+        else:
+            scope_text = "レート制限"
+        await interaction.followup.send(
+            f"現在{scope_text}に引っかかっています。BOTを少し休ませてください。{wait_hint}\n"
+            "しばらく時間をおいてから、もう一度お試しください。"
+        )
+        return
+    except Exception as e:
+        print(f"[/ai] 応答生成エラー: {e}")
+        await interaction.followup.send("応答の生成に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    if not reply_text:
+        reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
+
+    _ai_chat_append_history(channel_id, interaction.user.id, 質問, reply_text)
+
+    # Discordの1メッセージ2000文字制限に合わせて分割送信
+    chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
+    await interaction.followup.send(chunks[0])
+    for chunk in chunks[1:]:
+        try:
+            await interaction.channel.send(chunk)
+        except Exception:
+            pass
+
+
+ai_chat_dm_group = app_commands.Group(name="dm", description="【オーナー限定】/ai コマンド（DM等での汎用AI質問）の管理", parent=ai_chat_group)
+
+
+@ai_chat_dm_group.command(name="toggle", description="【オーナー限定】/ai コマンドの利用可否を切り替えます")
+@app_commands.describe(状態="on: 有効化 / off: 無効化")
+@app_commands.choices(状態=[
+    app_commands.Choice(name="有効にする", value="on"),
+    app_commands.Choice(name="無効にする", value="off"),
+])
+async def ai_chat_dm_toggle(interaction: discord.Interaction, 状態: app_commands.Choice[str]):
+    if not await is_owner_check(interaction): return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["dm_ai_chat_enabled"] = (状態.value == "on")
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"`/ai` コマンドを **{'有効' if 状態.value == 'on' else '無効'}** にしました。", ephemeral=True
+    )
+
+
+@ai_chat_dm_group.command(name="set_cooldown", description="【オーナー限定】/ai コマンドの連投制限（クールダウン秒数）を設定します")
+@app_commands.describe(秒数="連投を制限する秒数（0で制限なし）")
+async def ai_chat_dm_set_cooldown(interaction: discord.Interaction, 秒数: app_commands.Range[int, 0, 3600]):
+    if not await is_owner_check(interaction): return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["dm_ai_chat_cooldown_seconds"] = 秒数
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"`/ai` コマンドのクールダウンを **{秒数}秒** に設定しました。", ephemeral=True
+    )
+
+
+@ai_chat_dm_group.command(name="block", description="【オーナー限定】指定ユーザーの /ai コマンド利用をブロックします")
+@app_commands.describe(user="ブロックするユーザー")
+async def ai_chat_dm_block(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blocked = global_cfg.setdefault("dm_ai_chat_blocked_users", [])
+    if user.id not in blocked:
+        blocked.append(user.id)
+        save_data(all_data)
+        await interaction.response.send_message(f"{user.mention} の `/ai` コマンド利用をブロックしました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{user.mention} は既にブロックされています。", ephemeral=True)
+
+
+@ai_chat_dm_group.command(name="unblock", description="【オーナー限定】指定ユーザーの /ai コマンドブロックを解除します")
+@app_commands.describe(user="ブロックを解除するユーザー")
+async def ai_chat_dm_unblock(interaction: discord.Interaction, user: discord.User):
+    if not await is_owner_check(interaction): return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blocked = global_cfg.setdefault("dm_ai_chat_blocked_users", [])
+    if user.id in blocked:
+        blocked.remove(user.id)
+        save_data(all_data)
+        await interaction.response.send_message(f"{user.mention} の `/ai` コマンドブロックを解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{user.mention} はブロックされていません。", ephemeral=True)
+
+
+@ai_chat_dm_group.command(name="status", description="/ai コマンドの現在の設定状況を確認します")
+async def ai_chat_dm_status(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    embed = discord.Embed(title="/ai コマンド 設定状況", color=discord.Color.blue())
+    embed.add_field(name="状態", value="有効" if global_cfg.get("dm_ai_chat_enabled", True) else "無効", inline=True)
+    embed.add_field(name="クールダウン", value=f"{global_cfg.get('dm_ai_chat_cooldown_seconds', 10)}秒", inline=True)
+    embed.add_field(name="ブロック中ユーザー数", value=f"{len(global_cfg.get('dm_ai_chat_blocked_users', []))}人", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ====================================================================
 # AI自動モデレーション機能
 # ====================================================================
 # ・既存のng_words（単純な文字列一致）では、言い換えや遠回しな表現による
@@ -7021,6 +7220,7 @@ async def help_command(interaction: discord.Interaction):
             "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
             "`/calc` : 数式を計算して結果を返します\n"
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
+            "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
