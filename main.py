@@ -81,12 +81,31 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_MAX_TOKENS = int(os.getenv("MISTRAL_MAX_TOKENS", "2048"))
 
-# --- Tavily Search API（AIチャットのWeb検索機能） ---
+# --- Web検索API（AIチャットのWeb検索機能）---
 # AIモデル自体は学習データの時点までの知識しか持たないため、最新情報（ニュース・現在の状況等）
-# が必要な質問にはTavily検索を経由してAIに情報を渡す（Tool Use/Function Calling方式）。
-# 未設定（TAVILY_API_KEY未設定）の場合、Web検索機能は無効になり、AIは自身の知識のみで応答する
-# （既存の動作と同じ）。無料枠は月1,000クエリまで（2025年時点、tavily.comで要確認）。
+# が必要な質問にはWeb検索を経由してAIに情報を渡す（Tool Use/Function Calling方式）。
+# 各社とも無料枠には月間の上限があるため、1つのAPIが上限に達しても検索機能自体は止まらないよう、
+# 複数のAPIを優先順位付きで用意し、上位から順に試して失敗（レート制限・エラー等）したら
+# 次のAPIに自動フォールバックする（Groq→Cerebras→Mistralと同じ考え方）。
+# 優先順位: Tavily → Exa → Firecrawl
+# いずれのAPIキーも未設定の場合はWeb検索機能自体が無効になり、AIは自身の知識のみで応答する
+# （既存の動作と同じ）。無料枠の目安（2026年7月時点、各社サイトで要確認・変更されうる）:
+#   Tavily: 月1,000クレジット（カード不要）
+#   Exa: 月1,000検索（カード不要）
+#   Firecrawl: 月1,000クレジット（カード不要）
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+# --- Exa Search API（Tavilyが上限に達した際の第2フォールバック先） ---
+# 未設定（EXA_API_KEY未設定）の場合はExaへのフォールバックを行わない。
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+
+# --- Firecrawl Search API（最終フォールバック先） ---
+# 未設定（FIRECRAWL_API_KEY未設定）の場合はFirecrawlへのフォールバックを行わない。
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
+
+# いずれか1つでもWeb検索APIキーが設定されていれば、Web検索機能（ツール）自体をAIに提示する。
+WEB_SEARCH_AVAILABLE = bool(TAVILY_API_KEY or EXA_API_KEY or FIRECRAWL_API_KEY)
+
 
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
@@ -4756,7 +4775,8 @@ AI_CHAT_MODEL_CONCEALMENT_GUARD = (
 AI_CHAT_GUILD_PROMPT_MAX_LENGTH = 1500  # サーバー既定人格として登録できる最大文字数（オーナー専用設定のため一般ユーザーより広め）
 
 # Web検索（Tool Use）で最新情報を取得した場合の振る舞いに関する指示。
-# TAVILY_API_KEY未設定時はツール自体が渡らないため、この指示があってもAIが検索を試みることはない。
+# Web検索APIキー（Tavily/Exa/Firecrawlのいずれも）未設定時はツール自体が渡らないため、
+# この指示があってもAIが検索を試みることはない。
 AI_CHAT_SEARCH_USAGE_GUIDE = (
     "\n\nあなたには「web_search」というツールが利用可能な場合があります。"
     "自分の知識が古い可能性がある質問（最新ニュース、現在の状況、最近のリリース情報など）には"
@@ -4786,7 +4806,7 @@ def _ai_chat_finalize_system_prompt(system_prompt: str, include_search_guide: bo
     （実際にweb_searchツールを渡さない呼び出し経路、例: Bot同士の会話で使用）。
     """
     result = system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD
-    if TAVILY_API_KEY and include_search_guide:
+    if WEB_SEARCH_AVAILABLE and include_search_guide:
         result += AI_CHAT_SEARCH_USAGE_GUIDE
     return result
 
@@ -5174,38 +5194,38 @@ async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str
 
 
 # ====================================================================
-# Tavily Search API（AIチャットのWeb検索・最新情報取得機能）
+# Web検索API群（AIチャットのWeb検索・最新情報取得機能）
 # ====================================================================
 # GroqのモデルはあくまでAPIが提供するChat Completions（テキスト生成）のみを行い、
 # それ自体はインターネットに接続できない。最新情報が必要な場合は、
 # 1. Groqに「web_search」というツールを使えることを伝える（Tool Use/Function Calling）
 # 2. Groqが必要と判断した場合、検索クエリを含むtool_callを返してくる
-# 3. こちらがTavily APIで実際に検索し、結果をテキストとしてGroqに返す
+# 3. こちらが実際にWeb検索APIで検索し、結果をテキストとしてGroqに返す
 # 4. Groqがその検索結果を踏まえて最終的な応答文を生成する
 # という2往復のやり取りで実現する。
+#
+# 各社無料枠には月間・日次の上限があるため、1社が上限（レート制限/エラー）に達しても
+# 検索機能自体が完全に止まらないよう、以下の優先順位で自動フォールバックする
+# （Groq→Cerebras→Mistralの考え方と同じ）:
+#   1. Tavily      （TAVILY_API_KEY）
+#   2. Exa          （EXA_API_KEY）
+#   3. Firecrawl    （FIRECRAWL_API_KEY）
+# 未設定のAPIはスキップされる。全て未設定 or 全て失敗した場合のみ、その旨のテキストを返す。
 # ====================================================================
 
-class TavilySearchError(RuntimeError):
-    """Tavily検索API呼び出しに関する汎用エラー。"""
+class WebSearchError(RuntimeError):
+    """Web検索API呼び出しに関する汎用エラー（各プロバイダの失敗時にraiseし、次のプロバイダへ回す）。"""
     pass
 
 
 async def _tavily_web_search(query: str, max_results: int = 5) -> str:
-    """
-    Tavily Search APIを呼び出し、検索結果をAIに読ませやすいテキスト形式に整形して返します。
-    失敗した場合は例外を送出せず、その旨を示す短いテキストを返します
-    （検索に失敗してもAIチャット自体は継続させたいため）。
-    """
-    if not TAVILY_API_KEY:
-        return "（Web検索機能は現在利用できません。APIキーが設定されていません。）"
-
+    """Tavily Search APIを呼び出し、検索結果をテキスト形式に整形して返します。失敗時はWebSearchErrorをraiseします。"""
     payload = {
         "api_key": TAVILY_API_KEY,
         "query": query,
         "max_results": max_results,
         "search_depth": "basic",
     }
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -5215,12 +5235,12 @@ async def _tavily_web_search(query: str, max_results: int = 5) -> str:
             ) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
-                    print(f"[Tavily検索] APIエラー（HTTP {resp.status}）: {err_text[:300]}")
-                    return "（Web検索に失敗しました。検索結果なしで回答してください。）"
+                    raise WebSearchError(f"Tavily APIエラー（HTTP {resp.status}）: {err_text[:300]}")
                 data = await resp.json()
+    except WebSearchError:
+        raise
     except Exception as e:
-        print(f"[Tavily検索] 呼び出しエラー: {e}")
-        return "（Web検索に失敗しました。検索結果なしで回答してください。）"
+        raise WebSearchError(f"Tavily 呼び出しエラー: {e}") from e
 
     results = data.get("results", [])
     if not results:
@@ -5240,6 +5260,120 @@ async def _tavily_web_search(query: str, max_results: int = 5) -> str:
         lines.append(f"[{i}] {title}\n{content_snippet}\n出典URL: {url}")
 
     return "\n\n".join(lines)
+
+
+async def _exa_web_search(query: str, max_results: int = 5) -> str:
+    """Exa Search APIを呼び出し、検索結果をテキスト形式に整形して返します。失敗時はWebSearchErrorをraiseします。"""
+    headers = {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "query": query,
+        "numResults": max_results,
+        "contents": {"text": {"maxCharacters": 500}},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.exa.ai/search",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise WebSearchError(f"Exa APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+    except WebSearchError:
+        raise
+    except Exception as e:
+        raise WebSearchError(f"Exa 呼び出しエラー: {e}") from e
+
+    results = data.get("results", [])
+    if not results:
+        return "（検索結果が見つかりませんでした。）"
+
+    lines = []
+    for i, r in enumerate(results[:max_results], start=1):
+        title = (r.get("title") or "").strip()
+        text = (r.get("text") or "").strip()[:500]
+        url = r.get("url", "")
+        lines.append(f"[{i}] {title}\n{text}\n出典URL: {url}")
+
+    return "\n\n".join(lines)
+
+
+async def _firecrawl_web_search(query: str, max_results: int = 5) -> str:
+    """Firecrawl Search APIを呼び出し、検索結果をテキスト形式に整形して返します。失敗時はWebSearchErrorをraiseします。"""
+    headers = {
+        "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "query": query,
+        "limit": max_results,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.firecrawl.dev/v1/search",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise WebSearchError(f"Firecrawl APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+    except WebSearchError:
+        raise
+    except Exception as e:
+        raise WebSearchError(f"Firecrawl 呼び出しエラー: {e}") from e
+
+    results = data.get("data", [])
+    if not results:
+        return "（検索結果が見つかりませんでした。）"
+
+    lines = []
+    for i, r in enumerate(results[:max_results], start=1):
+        title = (r.get("title") or "").strip()
+        description = (r.get("description") or "").strip()[:500]
+        url = r.get("url", "")
+        lines.append(f"[{i}] {title}\n{description}\n出典URL: {url}")
+
+    return "\n\n".join(lines)
+
+
+# 優先順位付きのプロバイダ一覧: (表示名, APIキーが設定されているか判定する関数, 検索実行関数)
+_WEB_SEARCH_PROVIDERS = [
+    ("Tavily", lambda: bool(TAVILY_API_KEY), _tavily_web_search),
+    ("Exa", lambda: bool(EXA_API_KEY), _exa_web_search),
+    ("Firecrawl", lambda: bool(FIRECRAWL_API_KEY), _firecrawl_web_search),
+]
+
+
+async def _web_search_fallback(query: str, max_results: int = 5) -> str:
+    """
+    設定済みのWeb検索APIを優先順位（Tavily→Exa→Firecrawl）の順に試し、
+    最初に成功したものの結果を返します。
+    どのAPIキーも未設定の場合、または全プロバイダが失敗した場合のみ、
+    その旨を示す短いテキストを返します（検索に失敗してもAIチャット自体は継続させたいため）。
+    """
+    tried_any = False
+    for name, is_configured, search_func in _WEB_SEARCH_PROVIDERS:
+        if not is_configured():
+            continue
+        tried_any = True
+        try:
+            return await search_func(query, max_results)
+        except Exception as e:
+            print(f"[Web検索] {name} が失敗したため次のプロバイダへフォールバックします: {e}")
+            continue
+
+    if not tried_any:
+        return "（Web検索機能は現在利用できません。APIキーが設定されていません。）"
+    return "（Web検索に失敗しました。検索結果なしで回答してください。）"
 
 
 _WEB_SEARCH_TOOL_DEFINITION = {
@@ -5267,15 +5401,16 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 
 async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = None) -> str:
     """
-    Web検索（Tavily）を使えるGroq呼び出し。TAVILY_API_KEYが未設定の場合は
-    検索機能なしの通常呼び出し（_ai_chat_call_groq）にそのままフォールバックします。
+    Web検索（Tavily→Exa→Firecrawlの優先順位で自動フォールバック）を使えるGroq呼び出し。
+    どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出し（_ai_chat_call_groq）に
+    そのままフォールバックします。
 
     Tool Use方式のため、AIが検索が必要と判断した場合のみ検索が実行され、
     通常の会話では従来通り1回のAPI呼び出しで完結します（コスト・速度への影響は最小限）。
     最大2回まで検索ツールを呼ばせ、それ以上は打ち切って最終応答を強制します
     （無限に検索を繰り返してレスポンスが返らなくなることを防ぐため）。
     """
-    if not TAVILY_API_KEY:
+    if not WEB_SEARCH_AVAILABLE:
         return await _ai_chat_call_groq(messages, model=model)
 
     if not GROQ_API_KEY:
@@ -5360,7 +5495,7 @@ async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = 
                 query = str(func_args.get("query", "")).strip()
                 if query:
                     print(f"[AIチャット/Web検索] クエリ: {query}")
-                    search_result_text = await _tavily_web_search(query)
+                    search_result_text = await _web_search_fallback(query)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
             else:
@@ -5602,8 +5737,9 @@ async def _ai_call_llm_with_fallback(
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
-    enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索（Tavily）機能を
-    持たせます（TAVILY_API_KEY未設定時は自動的に検索なし呼び出しにフォールバックします）。
+    enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索
+    （Tavily→Exa→Firecrawlの優先順位で自動フォールバック）機能を
+    持たせます（どのAPIキーも未設定の場合は自動的に検索なし呼び出しにフォールバックします）。
     フォールバックモデル・Cerebras・Mistralへの切り替え時は検索機能を使いません
     （実装をシンプルに保つため、検索は「メインの1回目の試行」でのみ有効）。
 
@@ -9507,18 +9643,32 @@ async def ai_chat_show_personality(interaction: discord.Interaction):
 @ai_chat_group.command(name="search_status", description="AIチャットのWeb検索（最新情報取得）機能が利用可能かを確認します")
 async def ai_chat_search_status(interaction: discord.Interaction):
     embed = discord.Embed(title="AIチャット Web検索機能", color=discord.Color.blue())
-    if TAVILY_API_KEY:
+
+    provider_lines = [
+        ("Tavily", bool(TAVILY_API_KEY), "TAVILY_API_KEY"),
+        ("Exa", bool(EXA_API_KEY), "EXA_API_KEY"),
+        ("Firecrawl", bool(FIRECRAWL_API_KEY), "FIRECRAWL_API_KEY"),
+    ]
+    status_text = "\n".join(
+        f"{'✅' if configured else '❌'} {name}（優先順位 {i}）"
+        for i, (name, configured, _) in enumerate(provider_lines, start=1)
+    )
+
+    if WEB_SEARCH_AVAILABLE:
         embed.description = (
-            "✅ 有効です。\n"
+            "✅ Web検索機能は有効です。\n"
             "AIが「最新情報が必要」と判断した質問（最新ニュース・現在の状況など）に対しては、"
-            "自動的にWeb検索を行ってから回答します。"
+            "以下の優先順位で設定済みのAPIを順に試し、自動的にWeb検索を行ってから回答します"
+            "（1つが失敗・上限到達しても次のAPIに自動フォールバックします）。\n\n"
+            f"{status_text}"
         )
         embed.color = discord.Color.green()
     else:
+        missing_vars = "、".join(env_name for _, configured, env_name in provider_lines if not configured)
         embed.description = (
-            "❌ 現在無効です（Botの環境変数 `TAVILY_API_KEY` が未設定のため）。\n"
+            "❌ 現在無効です（Web検索APIキーが1つも設定されていないため）。\n"
             "AIは学習データの時点までの知識のみで応答します（最新のニュース等には対応できません）。\n"
-            "有効にするには、Tavily（tavily.com）でAPIキーを取得し、Botの環境変数に設定してください。"
+            f"有効にするには、いずれかのAPIキーをBotの環境変数に設定してください: {missing_vars}"
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
