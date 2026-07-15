@@ -6860,6 +6860,96 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
 
 
 # ====================================================================
+# /image コマンド（Pollinations.ai を使った画像生成機能）
+# ====================================================================
+# Pollinations.ai (https://pollinations.ai) はAPIキー・サインアップ不要で画像生成できる
+# 無料サービス。GETリクエストのURLにプロンプトを埋め込むだけで画像バイナリが返ってくる。
+# 匿名利用時はレート制限（目安: 15秒に1回程度）があるため、Bot側でも簡易クールダウンを設ける。
+# ====================================================================
+
+_IMAGE_COMMAND_GUILD_KEY = -2  # /image 利用時のクールダウン管理用の疑似ギルドID（他機能のキーと衝突しないよう負の値にする）
+IMAGE_COMMAND_COOLDOWN_SECONDS = 15  # Pollinations匿名利用時のレート制限目安に合わせた最小間隔
+IMAGE_COMMAND_MIN_SIZE = 256
+IMAGE_COMMAND_MAX_SIZE = 1536
+
+
+async def _pollinations_generate_image(prompt: str, width: int, height: int) -> bytes:
+    """
+    Pollinations.ai の画像生成エンドポイントを呼び出し、画像バイナリを返します。
+    失敗した場合は例外を送出します（呼び出し元でハンドリングする）。
+    """
+    encoded_prompt = urllib.parse.quote(prompt, safe="")
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+    params = {
+        "width": width,
+        "height": height,
+        "nologo": "true",
+        # 同一プロンプトでもCDNキャッシュで同じ画像が返り続けないよう、毎回ランダムなseedを付与する
+        "seed": random.randint(0, 2**31 - 1),
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                raise RuntimeError(f"Pollinations APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                raise RuntimeError(f"想定外のレスポンス形式です（Content-Type: {content_type}）")
+            return await resp.read()
+
+
+@bot.tree.command(name="image", description="AIに画像を生成させます（Pollinations.ai使用・無料）")
+@app_commands.describe(
+    プロンプト="生成したい画像の内容（日本語も可。具体的・詳細なほど精度が上がります）",
+    横幅=f"画像の幅（ピクセル、{IMAGE_COMMAND_MIN_SIZE}〜{IMAGE_COMMAND_MAX_SIZE}、省略時は1024）",
+    縦幅=f"画像の高さ（ピクセル、{IMAGE_COMMAND_MIN_SIZE}〜{IMAGE_COMMAND_MAX_SIZE}、省略時は1024）",
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def image_command(
+    interaction: discord.Interaction,
+    プロンプト: str,
+    横幅: Optional[int] = 1024,
+    縦幅: Optional[int] = 1024,
+):
+    remaining = _ai_chat_check_cooldown(_IMAGE_COMMAND_GUILD_KEY, interaction.user.id, IMAGE_COMMAND_COOLDOWN_SECONDS)
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    width = max(IMAGE_COMMAND_MIN_SIZE, min(横幅 or 1024, IMAGE_COMMAND_MAX_SIZE))
+    height = max(IMAGE_COMMAND_MIN_SIZE, min(縦幅 or 1024, IMAGE_COMMAND_MAX_SIZE))
+
+    await interaction.response.defer(thinking=True)
+    _ai_chat_record_request(_IMAGE_COMMAND_GUILD_KEY, interaction.user.id)
+
+    try:
+        image_bytes = await _pollinations_generate_image(プロンプト, width, height)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("画像生成がタイムアウトしました。時間をおいて再度お試しください。")
+        return
+    except Exception as e:
+        print(f"[/image] 画像生成エラー: {e}")
+        await interaction.followup.send("画像生成に失敗しました。プロンプトを変えるか、時間をおいて再度お試しください。")
+        return
+
+    file_obj = discord.File(io.BytesIO(image_bytes), filename="generated.png")
+    embed = discord.Embed(
+        description=f"**プロンプト:** {プロンプト[:1000]}",
+        color=discord.Color.purple()
+    )
+    embed.set_image(url="attachment://generated.png")
+    embed.set_footer(text=f"Powered by Pollinations.ai ・ {width}x{height}")
+    await interaction.followup.send(embed=embed, file=file_obj)
+
+
+# ====================================================================
 # /reply_suggest コマンド（グループDMの会話をスキャンし、AIが返信候補を提案する）
 # ====================================================================
 # ・対象はグループDM（discord.GroupChannel）のみ。1対1DMやサーバー内チャンネルは対象外。
@@ -8202,6 +8292,7 @@ async def help_command(interaction: discord.Interaction):
             "`/calc` : 数式を計算して結果を返します\n"
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
             "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
+            "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
