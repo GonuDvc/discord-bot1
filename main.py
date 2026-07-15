@@ -213,10 +213,13 @@ current_custom_status = None
 # コマンド登録数、コマンド累計実行数、更新中表示など）を一定間隔で
 # 自動的に切り替えて表示するためのカウンタ・タスク管理変数群。
 _bot_start_time: float = time.time()
-_command_exec_count: int = 0          # これまでに実行されたスラッシュコマンドの累計回数
+_bot_prior_uptime_seconds: int = 0    # 再起動前までの累計稼働秒数（on_readyで永続化データから読み込む）
+_command_exec_count: int = 0          # これまでに実行されたスラッシュコマンドの累計回数（再起動前の分を含む）
+_command_exec_count_unsaved: int = 0  # 前回のディスク保存以降にカウントされた未保存分（バッチ保存用）
 _status_rotation_task = None          # ローテーション表示を行うバックグラウンドタスク
 _status_rotation_interval = 15        # ステータスを切り替える間隔（秒）
 _status_data_updating_count = 0       # 0より大きい間はローテーションに「更新中」を挟む（複数ギルド同時実行に対応するためカウンタ方式）
+_uptime_periodic_save_task = None     # 稼働時間を定期的に永続化するバックグラウンドタスク
 
 
 # ====================================================================
@@ -523,10 +526,29 @@ bot = commands.Bot(
 @bot.event
 async def on_app_command_completion(interaction: discord.Interaction, command):
     """スラッシュコマンドが正常に実行完了するたびに呼び出されます（discord.pyがCommandTreeから中継）。
-    ステータス表示の「コマンド実行数」ローテーション項目に使うため、
-    累計実行回数をカウントするだけの軽量な処理です。"""
-    global _command_exec_count
+    ステータス表示の「コマンド実行数」ローテーション項目に使うため、累計実行回数をカウントします。
+    再起動をまたいでも値が引き継がれるよう、メモリ上のカウンタと合わせて永続化用の差分も記録し、
+    一定件数ごとに非同期でディスクへ反映します（毎回保存するとイベントループを圧迫するため）。"""
+    global _command_exec_count, _command_exec_count_unsaved
     _command_exec_count += 1
+    _command_exec_count_unsaved += 1
+
+    # 10回ごと、または初回はまとめて保存（頻繁な同期I/Oによるイベントループブロックを避けるため）
+    if _command_exec_count_unsaved >= 10:
+        pending = _command_exec_count_unsaved
+        _command_exec_count_unsaved = 0
+        asyncio.create_task(_flush_command_exec_count(pending))
+
+
+async def _flush_command_exec_count(increment: int):
+    """コマンド実行数の増分を非同期でディスクへ反映します（on_app_command_completionから呼ばれる）。"""
+    try:
+        all_data = await aload_data()
+        global_cfg = get_global_config(all_data)
+        global_cfg["bot_stats_command_exec_count"] = global_cfg.get("bot_stats_command_exec_count", 0) + increment
+        await asave_data(all_data)
+    except Exception as e:
+        print(f"[警告] コマンド実行数の永続化に失敗しました: {e}")
 
 
 @bot.tree.error
@@ -729,6 +751,11 @@ def get_global_config(all_data: dict) -> dict:
     # AFK機能: DM・グループDM用（サーバーに紐付かないためグローバル領域で管理）
     if "global_afk_users" not in cfg:
         cfg["global_afk_users"] = {}  # {user_id_str: {"reason": str, "since": unix_timestamp}}
+    # ステータス表示用: 再起動をまたいで引き継ぐ累計値
+    if "bot_stats_total_uptime_seconds" not in cfg:
+        cfg["bot_stats_total_uptime_seconds"] = 0  # これまでの累計稼働秒数（Bot停止中の時間は含まない）
+    if "bot_stats_command_exec_count" not in cfg:
+        cfg["bot_stats_command_exec_count"] = 0    # これまでに実行されたスラッシュコマンドの累計回数
     return cfg
 
 
@@ -1024,7 +1051,9 @@ def _build_status_rotation_items(client) -> list:
     """ローテーション表示するステータス候補のリストを (ActivityType, テキスト) のタプルで返します。"""
     guild_count = len(client.guilds)
     command_count = len(client.tree.get_commands())
-    uptime_seconds = int(time.time() - _bot_start_time)
+    # 稼働時間は「再起動前までの累計（_bot_prior_uptime_seconds）」+「今回起動からの経過」の合計で表示する。
+    # これにより再起動を挟んでも稼働時間の表示がリセットされず、通算値として引き継がれる。
+    uptime_seconds = _bot_prior_uptime_seconds + int(time.time() - _bot_start_time)
     days, rem = divmod(uptime_seconds, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, _ = divmod(rem, 60)
@@ -1081,6 +1110,53 @@ def start_status_rotation(client):
     if _status_rotation_task is None or _status_rotation_task.done():
         _status_rotation_task = asyncio.create_task(_status_rotation_loop(client))
         print("[システム] ステータスローテーションを開始しました")
+
+
+UPTIME_PERSIST_INTERVAL_SECONDS = 300  # 稼働時間を永続化する間隔（5分ごと）
+
+
+async def _uptime_periodic_save_loop():
+    """
+    再起動をまたいでも稼働時間の表示・累計値がリセットされないよう、
+    一定間隔で「これまでの累計稼働秒数」をディスクへ保存し続けるバックグラウンドタスクです。
+    保存後は _bot_start_time を現在時刻にリセットすることで、次回保存までの増分だけを
+    _bot_prior_uptime_seconds に加算していく方式にし、二重カウントを防ぎます。
+    Botが不意に落ちた場合でも、直近の保存間隔（最大5分）以内の誤差に抑えられます。
+    プロセス終了時（Ctrl+C等の正常終了）にも最後の一回を保存します。
+    """
+    global _bot_start_time, _bot_prior_uptime_seconds
+    await bot.wait_until_ready()
+    try:
+        while True:
+            await asyncio.sleep(UPTIME_PERSIST_INTERVAL_SECONDS)
+            await _persist_uptime_once()
+    except asyncio.CancelledError:
+        # プロセス終了時などにキャンセルされた場合も、最後に一度だけ保存を試みる
+        try:
+            await _persist_uptime_once()
+        except Exception:
+            pass
+        raise
+
+
+async def _persist_uptime_once():
+    """現在までの経過分を累計稼働秒数へ加算し、ディスクへ保存します。"""
+    global _bot_start_time, _bot_prior_uptime_seconds
+    now = time.time()
+    elapsed = int(now - _bot_start_time)
+    if elapsed <= 0:
+        return
+    try:
+        all_data = await aload_data()
+        global_cfg = get_global_config(all_data)
+        new_total = global_cfg.get("bot_stats_total_uptime_seconds", 0) + elapsed
+        global_cfg["bot_stats_total_uptime_seconds"] = new_total
+        await asave_data(all_data)
+        # 保存済み分を基準値に繰り込み、_bot_start_time をリセットして二重カウントを防ぐ
+        _bot_prior_uptime_seconds = new_total
+        _bot_start_time = now
+    except Exception as e:
+        print(f"[警告] 稼働時間の永続化に失敗しました: {e}")
 
 
 # ====================================================================
@@ -3647,6 +3723,28 @@ def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Emb
 @bot.event
 async def on_ready():
     """Bot起動完了時に呼び出されます。ビューの永続化再登録やプレゼンス設定を行います。"""
+
+    # 累計稼働秒数・コマンド実行数を永続化データから読み込む（初回接続時のみ）。
+    # on_readyは再接続のたびに複数回呼ばれうるため、二重加算を防ぐグローバルフラグで一度だけ実行する。
+    global _bot_prior_uptime_seconds, _command_exec_count, _uptime_periodic_save_task
+    global _stats_bootstrap_done
+    if not globals().get("_stats_bootstrap_done", False):
+        try:
+            _bootstrap_data = load_data()
+            _bootstrap_global_cfg = get_global_config(_bootstrap_data)
+            _bot_prior_uptime_seconds = _bootstrap_global_cfg.get("bot_stats_total_uptime_seconds", 0)
+            _command_exec_count = _bootstrap_global_cfg.get("bot_stats_command_exec_count", 0)
+            print(
+                f"[システム] 再起動をまたいだ累計値を読み込みました: "
+                f"稼働時間={_bot_prior_uptime_seconds}秒 / コマンド実行数={_command_exec_count}回"
+            )
+        except Exception as e:
+            print(f"[警告] 累計稼働時間・コマンド実行数の読み込みに失敗しました: {e}")
+        _stats_bootstrap_done = True
+
+        # 稼働時間を定期的に永続化するバックグラウンドタスクを起動（再接続時の重複起動を防止）
+        if _uptime_periodic_save_task is None or _uptime_periodic_save_task.done():
+            _uptime_periodic_save_task = asyncio.create_task(_uptime_periodic_save_loop())
 
     # 起動処理（ビュー再登録・タスク復元など）が完了するまでの間、
     # ひと目で「起動作業中」と分かるようにステータスを一時表示する。
@@ -19125,8 +19223,25 @@ async def _main():
         print("[警告] OAuth2の環境変数（DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / OAUTH_REDIRECT_URI）が未設定のため、Webサーバーは起動しません。")
         print("       サーバーブラックリスト機能を使用する場合は、これらの環境変数を設定してください。")
 
-    async with bot:
-        await bot.start(TOKEN)
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    finally:
+        # プロセス終了時（正常終了・Railway再デプロイ等のSIGTERM含む）にも、
+        # ここまでの稼働時間・未保存のコマンド実行数を最終保存しておくことで、
+        # 再起動後の累計表示の誤差を最小限にする。
+        try:
+            await _persist_uptime_once()
+        except Exception as e:
+            print(f"[警告] 終了時の稼働時間保存に失敗しました: {e}")
+        try:
+            global _command_exec_count_unsaved
+            if _command_exec_count_unsaved > 0:
+                pending = _command_exec_count_unsaved
+                _command_exec_count_unsaved = 0
+                await _flush_command_exec_count(pending)
+        except Exception as e:
+            print(f"[警告] 終了時のコマンド実行数保存に失敗しました: {e}")
 
 
 asyncio.run(_main())
