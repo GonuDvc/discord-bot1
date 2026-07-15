@@ -81,6 +81,13 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_MAX_TOKENS = int(os.getenv("MISTRAL_MAX_TOKENS", "2048"))
 
+# --- Tavily Search API（AIチャットのWeb検索機能） ---
+# AIモデル自体は学習データの時点までの知識しか持たないため、最新情報（ニュース・現在の状況等）
+# が必要な質問にはTavily検索を経由してAIに情報を渡す（Tool Use/Function Calling方式）。
+# 未設定（TAVILY_API_KEY未設定）の場合、Web検索機能は無効になり、AIは自身の知識のみで応答する
+# （既存の動作と同じ）。無料枠は月1,000クエリまで（2025年時点、tavily.comで要確認）。
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
 # --------------------------------------------------------------------
 # ひろゆき構文ランダム返信機能で使用するセリフ一覧
 # --------------------------------------------------------------------
@@ -4748,6 +4755,15 @@ AI_CHAT_MODEL_CONCEALMENT_GUARD = (
 
 AI_CHAT_GUILD_PROMPT_MAX_LENGTH = 1500  # サーバー既定人格として登録できる最大文字数（オーナー専用設定のため一般ユーザーより広め）
 
+# Web検索（Tool Use）で最新情報を取得した場合の振る舞いに関する指示。
+# TAVILY_API_KEY未設定時はツール自体が渡らないため、この指示があってもAIが検索を試みることはない。
+AI_CHAT_SEARCH_USAGE_GUIDE = (
+    "\n\nあなたには「web_search」というツールが利用可能な場合があります。"
+    "自分の知識が古い可能性がある質問（最新ニュース、現在の状況、最近のリリース情報など）には"
+    "積極的にこのツールを使って調べてから回答してください。"
+    "検索結果を使って回答する場合は、簡潔に情報源（サイト名程度でよい）に触れてください。"
+)
+
 
 def _ai_chat_resolve_default_system_prompt(guild_config: dict) -> str:
     """
@@ -4759,14 +4775,20 @@ def _ai_chat_resolve_default_system_prompt(guild_config: dict) -> str:
     return guild_config.get("ai_chat_guild_system_prompt") or AI_CHAT_SYSTEM_PROMPT
 
 
-def _ai_chat_finalize_system_prompt(system_prompt: str) -> str:
+def _ai_chat_finalize_system_prompt(system_prompt: str, include_search_guide: bool = True) -> str:
     """
     実際にAPIへ渡す直前に必ず通す関数。どの経路（コード内蔵/サーバー既定/ユーザー個別）の
     システムプロンプトであっても、モデル秘匿ガードを末尾に付与してから返す。
     ユーザーやサーバーオーナーが設定したプロンプトでこのガードを上書き・無効化できないよう、
     必ず最後尾に追加する（プロンプトの後半にある指示ほど優先されやすい傾向を利用する）。
+
+    include_search_guide: False の場合、Web検索案内文を付与しない
+    （実際にweb_searchツールを渡さない呼び出し経路、例: Bot同士の会話で使用）。
     """
-    return system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD
+    result = system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD
+    if TAVILY_API_KEY and include_search_guide:
+        result += AI_CHAT_SEARCH_USAGE_GUIDE
+    return result
 
 # {(channel_id, user_id): {"messages": [{"role":..., "content":...}, ...], "last_used": epoch_seconds}}
 _ai_chat_histories: dict = {}
@@ -5151,6 +5173,209 @@ async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str
     return reply_text
 
 
+# ====================================================================
+# Tavily Search API（AIチャットのWeb検索・最新情報取得機能）
+# ====================================================================
+# GroqのモデルはあくまでAPIが提供するChat Completions（テキスト生成）のみを行い、
+# それ自体はインターネットに接続できない。最新情報が必要な場合は、
+# 1. Groqに「web_search」というツールを使えることを伝える（Tool Use/Function Calling）
+# 2. Groqが必要と判断した場合、検索クエリを含むtool_callを返してくる
+# 3. こちらがTavily APIで実際に検索し、結果をテキストとしてGroqに返す
+# 4. Groqがその検索結果を踏まえて最終的な応答文を生成する
+# という2往復のやり取りで実現する。
+# ====================================================================
+
+class TavilySearchError(RuntimeError):
+    """Tavily検索API呼び出しに関する汎用エラー。"""
+    pass
+
+
+async def _tavily_web_search(query: str, max_results: int = 5) -> str:
+    """
+    Tavily Search APIを呼び出し、検索結果をAIに読ませやすいテキスト形式に整形して返します。
+    失敗した場合は例外を送出せず、その旨を示す短いテキストを返します
+    （検索に失敗してもAIチャット自体は継続させたいため）。
+    """
+    if not TAVILY_API_KEY:
+        return "（Web検索機能は現在利用できません。APIキーが設定されていません。）"
+
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    print(f"[Tavily検索] APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                    return "（Web検索に失敗しました。検索結果なしで回答してください。）"
+                data = await resp.json()
+    except Exception as e:
+        print(f"[Tavily検索] 呼び出しエラー: {e}")
+        return "（Web検索に失敗しました。検索結果なしで回答してください。）"
+
+    results = data.get("results", [])
+    if not results:
+        return "（検索結果が見つかりませんでした。）"
+
+    lines = []
+    # Tavilyが要約（answer）を返す場合、最も端的な情報として先頭に含める
+    if data.get("answer"):
+        lines.append(f"要約: {data['answer']}")
+
+    for i, r in enumerate(results[:max_results], start=1):
+        title = r.get("title", "").strip()
+        content = (r.get("content") or "").strip()
+        url = r.get("url", "")
+        # AIへ渡す用の中間データのため文字数を絞る（そのままユーザーに見せるものではない）
+        content_snippet = content[:500]
+        lines.append(f"[{i}] {title}\n{content_snippet}\n出典URL: {url}")
+
+    return "\n\n".join(lines)
+
+
+_WEB_SEARCH_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "現在の日付・最新ニュース・現在の状況・最近発生した出来事など、"
+            "学習データの時点では知り得ない最新情報が必要な場合にWeb検索を行います。"
+            "一般的な知識や過去の確定した事実については使用しないでください。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "検索したい内容を表す簡潔な検索キーワード（日本語または英語）"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+
+async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = None) -> str:
+    """
+    Web検索（Tavily）を使えるGroq呼び出し。TAVILY_API_KEYが未設定の場合は
+    検索機能なしの通常呼び出し（_ai_chat_call_groq）にそのままフォールバックします。
+
+    Tool Use方式のため、AIが検索が必要と判断した場合のみ検索が実行され、
+    通常の会話では従来通り1回のAPI呼び出しで完結します（コスト・速度への影響は最小限）。
+    最大2回まで検索ツールを呼ばせ、それ以上は打ち切って最終応答を強制します
+    （無限に検索を繰り返してレスポンスが返らなくなることを防ぐため）。
+    """
+    if not TAVILY_API_KEY:
+        return await _ai_chat_call_groq(messages, model=model)
+
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    working_messages = list(messages)  # 呼び出し元のリストは書き換えない
+    max_search_rounds = 2
+
+    for round_idx in range(max_search_rounds + 1):
+        payload = {
+            "model": model or GROQ_MODEL,
+            "messages": working_messages,
+            "temperature": 0.7,
+            "max_tokens": GROQ_MAX_TOKENS,
+            "reasoning_format": "hidden",
+        }
+        # 最終ラウンド（検索回数を使い切った後）はツールを渡さず、必ずテキストで応答させる
+        if round_idx < max_search_rounds:
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            payload["tool_choice"] = "auto"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    err_text = await resp.text()
+                    retry_after: Optional[float] = None
+                    header_val = resp.headers.get("Retry-After")
+                    if header_val:
+                        try:
+                            retry_after = float(header_val)
+                        except ValueError:
+                            retry_after = None
+                    if retry_after is None:
+                        retry_after = _parse_groq_retry_after(err_text)
+                    limit_scope: Optional[str] = None
+                    scope_m = _GROQ_LIMIT_SCOPE_PATTERN.search(err_text)
+                    if scope_m:
+                        limit_scope = scope_m.group(1)
+                    raise GroqRateLimitError(retry_after=retry_after, raw_message=err_text[:300], limit_scope=limit_scope)
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise GroqAPIError(f"Groq APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+
+        try:
+            choice = data["choices"][0]
+            message_obj = choice["message"]
+        except (KeyError, IndexError, TypeError):
+            raise GroqAPIError(f"Groq APIの応答形式が想定と異なります: {data}")
+
+        tool_calls = message_obj.get("tool_calls")
+        if not tool_calls:
+            # 通常の応答（検索不要と判断した、または検索ラウンドを使い切った）
+            raw_content = message_obj.get("content") or ""
+            reply_text = _strip_reasoning_tags(raw_content).strip()
+            if choice.get("finish_reason") == "length":
+                reply_text += "\n\n*（⚠️ 出力上限のため応答が途中で切れている可能性があります）*"
+            return reply_text
+
+        # AIが検索を要求してきた場合: アシスタントのtool_call発言と、検索結果(tool結果)を
+        # 会話履歴に追加し、次のラウンドで最終応答を生成させる
+        working_messages.append(message_obj)
+        for tool_call in tool_calls:
+            func = tool_call.get("function", {})
+            func_name = func.get("name", "")
+            try:
+                func_args = json.loads(func.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                func_args = {}
+
+            if func_name == "web_search":
+                query = str(func_args.get("query", "")).strip()
+                if query:
+                    print(f"[AIチャット/Web検索] クエリ: {query}")
+                    search_result_text = await _tavily_web_search(query)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            else:
+                search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
+
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": search_result_text
+            })
+
+    # ここに到達するのは max_search_rounds を使い切ってもtool_callsが返り続けた異常系のみ
+    return "（検索処理が複雑すぎたため、応答を生成できませんでした。質問を変えて再度お試しください。）"
+
+
 _THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_TAG_UNCLOSED_PATTERN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
 
@@ -5368,6 +5593,7 @@ async def _ai_call_llm_with_fallback(
     messages: list,
     model: Optional[str] = None,
     provider_override: Optional[str] = None,
+    enable_search: bool = False,
 ) -> Tuple[str, str]:
     """
     Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
@@ -5375,6 +5601,11 @@ async def _ai_call_llm_with_fallback(
     Cerebrasも失敗した場合は最後にMistralを試す統一ラッパーです。
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
+
+    enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索（Tavily）機能を
+    持たせます（TAVILY_API_KEY未設定時は自動的に検索なし呼び出しにフォールバックします）。
+    フォールバックモデル・Cerebras・Mistralへの切り替え時は検索機能を使いません
+    （実装をシンプルに保つため、検索は「メインの1回目の試行」でのみ有効）。
 
     provider_override:
       - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebras/Mistralへは切り替えない）
@@ -5409,7 +5640,10 @@ async def _ai_call_llm_with_fallback(
     last_error: Optional[Exception] = None
     for idx, candidate in enumerate(candidate_models):
         try:
-            reply_text = await _ai_chat_call_groq(messages, model=candidate)
+            if enable_search and idx == 0:
+                reply_text = await _ai_chat_call_groq_with_search(messages, model=candidate)
+            else:
+                reply_text = await _ai_chat_call_groq(messages, model=candidate)
             return reply_text, "groq"
         except GroqRateLimitError as e:
             last_error = e
@@ -5758,7 +5992,8 @@ async def _ai_debate_generate_turn(session: dict, speaker_key: str) -> str:
     system_prompt = _ai_chat_finalize_system_prompt(
         _ai_debate_build_system_prompt(
             persona["name"], persona["prompt"], opponent_persona["name"], session["topic"]
-        )
+        ),
+        include_search_guide=False
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -6215,7 +6450,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 if provider_override not in ("groq", "cerebras", "mistral"):
                     provider_override = None
                 reply_text, used_provider = await _ai_call_llm_with_fallback(
-                    messages, model=model, provider_override=provider_override
+                    messages, model=model, provider_override=provider_override, enable_search=True
                 )
                 if used_provider == "groq":
                     used_model = model or GROQ_MODEL
@@ -6327,7 +6562,8 @@ async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict
         _ai_chat_resolve_default_system_prompt(guild_config) + (
             "\n\n（補足: 今、会話相手は人間ではなく別のBotです。"
             "自然な相槌や短めの受け答えを意識し、同じような話を無限に広げすぎないようにしてください。）"
-        )
+        ),
+        include_search_guide=False
     )
 
     # 履歴はチャンネル単位・「Bot同士の会話」専用のuser_id（0）で管理し、
@@ -6451,7 +6687,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
 
     try:
         reply_text, _used_provider = await _ai_call_llm_with_fallback(
-            messages, model=model, provider_override=provider_override
+            messages, model=model, provider_override=provider_override, enable_search=True
         )
     except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
@@ -9265,6 +9501,25 @@ async def ai_chat_show_personality(interaction: discord.Interaction):
     else:
         embed.description = AI_CHAT_SYSTEM_PROMPT
         embed.set_footer(text="カスタム人格は未設定のため、標準の人格が使用されています")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ai_chat_group.command(name="search_status", description="AIチャットのWeb検索（最新情報取得）機能が利用可能かを確認します")
+async def ai_chat_search_status(interaction: discord.Interaction):
+    embed = discord.Embed(title="AIチャット Web検索機能", color=discord.Color.blue())
+    if TAVILY_API_KEY:
+        embed.description = (
+            "✅ 有効です。\n"
+            "AIが「最新情報が必要」と判断した質問（最新ニュース・現在の状況など）に対しては、"
+            "自動的にWeb検索を行ってから回答します。"
+        )
+        embed.color = discord.Color.green()
+    else:
+        embed.description = (
+            "❌ 現在無効です（Botの環境変数 `TAVILY_API_KEY` が未設定のため）。\n"
+            "AIは学習データの時点までの知識のみで応答します（最新のニュース等には対応できません）。\n"
+            "有効にするには、Tavily（tavily.com）でAPIキーを取得し、Botの環境変数に設定してください。"
+        )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
