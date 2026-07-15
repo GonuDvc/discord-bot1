@@ -6101,6 +6101,8 @@ _AI_COMMAND_DM_GUILD_KEY = 0  # DM/グループDMからの /ai 利用時に使�
 
 @bot.tree.command(name="ai", description="AIに質問します（DM・グループDM・サーバー内どこでも使えます）")
 @app_commands.describe(質問="AIに聞きたい内容を入力してください")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def ai_command(interaction: discord.Interaction, 質問: str):
     if not GROQ_API_KEY:
         await interaction.response.send_message(
