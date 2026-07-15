@@ -6375,17 +6375,47 @@ async def reply_suggest_command(interaction: discord.Interaction, 件数: app_co
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    # Botがこのグループチャンネルに実際に参加しているかを事前確認する。
+    # ユーザーインストール型アプリとして実行された場合、Bot自身はグループDMのメンバーではないことがあり、
+    # その場合 interaction.channel はBotのキャッシュ上には存在しない（.history()が403で失敗する）。
+    cached_channel = bot.get_channel(interaction.channel_id)
+    if cached_channel is None:
+        await interaction.followup.send(
+            "この機能を利用するには、BOT自身がこのグループDMに参加している必要があります。\n"
+            "グループDMのメンバー追加からBOTを招待してから、もう一度お試しください。",
+            ephemeral=True
+        )
+        return
+
     # 直近の会話履歴を取得（話者の表示名と本文のみ。新しい順で取得し、あとで古い順に並び替える）
     transcript_lines = []
     try:
-        async for msg in interaction.channel.history(limit=30, oldest_first=False):
+        async for msg in cached_channel.history(limit=30, oldest_first=False):
             if msg.author.bot:
                 continue
             if not msg.content or not msg.content.strip():
                 continue
             transcript_lines.append(f"{msg.author.display_name}: {msg.content.strip()}")
+    except discord.Forbidden:
+        # ユーザーインストール型アプリとしてこのグループDMで実行された場合、
+        # Botがそのグループチャンネル自体には参加していないケースがあり、
+        # その場合 .history() はDiscord側の権限エラー（403 Forbidden）を返す。
+        print(f"[/reply_suggest] 履歴取得エラー(Forbidden): channel_id={interaction.channel_id}")
+        await interaction.followup.send(
+            "会話履歴を取得できませんでした。\n"
+            "このグループDMにBOT自身が参加していない場合、この機能は利用できません。"
+            "（BOTをこのグループDMに招待すると利用できるようになります）",
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as e:
+        print(f"[/reply_suggest] 履歴取得エラー(HTTPException): {e}")
+        await interaction.followup.send(
+            "会話履歴の取得に失敗しました。時間をおいて再度お試しください。", ephemeral=True
+        )
+        return
     except Exception as e:
-        print(f"[/reply_suggest] 履歴取得エラー: {e}")
+        print(f"[/reply_suggest] 履歴取得エラー: {type(e).__name__}: {e}")
         await interaction.followup.send("会話履歴の取得に失敗しました。", ephemeral=True)
         return
 
@@ -8987,6 +9017,9 @@ async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction
     一般メンバーが自分専用のシステムプロンプトを送信した際の共通処理。
     スラッシュコマンド（text引数指定）とModal送信の両方から呼び出されます。
     呼び出し前提: interaction.response がまだ行われていないこと（この関数内でdeferします）。
+
+    BOTオーナー本人が実行した場合は、一般ユーザー向けの制約（文字数上限・AIモデレーション判定）を
+    適用せず、入力した内容をそのまま登録します（オーナーは自分のBotの挙動を自由に設定できるため）。
     """
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -8997,10 +9030,31 @@ async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction
         await interaction.response.send_message("空の文章は登録できません。", ephemeral=True)
         return
 
-    if len(text) > AI_CHAT_USER_PROMPT_MAX_LENGTH:
+    owner_id = await resolve_owner_id(interaction.client)
+    is_owner = (interaction.user.id == owner_id)
+
+    if not is_owner and len(text) > AI_CHAT_USER_PROMPT_MAX_LENGTH:
         await interaction.response.send_message(
             f"文字数が上限（{AI_CHAT_USER_PROMPT_MAX_LENGTH}文字）を超えています。"
             f"（現在: {len(text)}文字）短くして再度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    if is_owner:
+        # オーナーは文字数制限・AI不適切判定のいずれも適用しない。
+        # 保存自体は即座に完了できるため、defer不要（応答が速くなる）。
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(interaction.guild.id))
+        user_settings = guild_config.setdefault("ai_chat_user_settings", {})
+        user_id_str = str(interaction.user.id)
+        entry = user_settings.setdefault(user_id_str, {"model": None, "system_prompt": None, "blocked": False})
+        entry["system_prompt"] = text
+        save_data(all_data)
+
+        await interaction.response.send_message(
+            "[設定完了] あなた専用のAIチャット人格設定を登録しました（オーナー権限により、文字数制限・内容チェックは適用されていません）。\n"
+            "以降、AIチャットチャンネルでのあなたの発言にこの人格設定が適用されます。",
             ephemeral=True
         )
         return
@@ -9042,7 +9096,7 @@ async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction
 
 class AIChatMyPromptModal(discord.ui.Modal, title="あなた専用のAI人格設定"):
     """
-    /ai_chat my_prompt set をtext引数なしで実行した際に開くModal。
+    /ai_chat my_prompt set をtext引数なしで実行した際に開くModal（一般ユーザー向け）。
     複数行での入力・貼り付けがしやすいよう TextStyle.paragraph を使用します。
     """
     prompt_text = discord.ui.TextInput(
@@ -9057,8 +9111,26 @@ class AIChatMyPromptModal(discord.ui.Modal, title="あなた専用のAI人格設
         await _ai_chat_process_my_prompt_submission(interaction, self.prompt_text.value)
 
 
-@ai_chat_my_prompt_group.command(name="set", description="自分専用のAIチャット人格設定（システムプロンプト）を登録します（最大500文字）")
-@app_commands.describe(text="AIに与える人格・対応方針の指示文（最大500文字）。省略すると入力フォーム（Modal）が開きます")
+class AIChatOwnerPromptModal(discord.ui.Modal, title="あなた専用のAI人格設定（オーナー）"):
+    """
+    /ai_chat my_prompt set をtext引数なしで実行した際、実行者がBOTオーナーであれば
+    こちらのModalが開く。文字数上限はDiscordのTextInputの仕様上限（4000文字）まで許容する
+    （一般ユーザー向けのAI_CHAT_USER_PROMPT_MAX_LENGTHは適用しない）。
+    """
+    prompt_text = discord.ui.TextInput(
+        label="AIに与える人格・対応方針の指示文（オーナー用）",
+        style=discord.TextStyle.paragraph,
+        placeholder="文字数制限・AIによる内容チェックなしで登録されます。",
+        required=True,
+        max_length=4000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _ai_chat_process_my_prompt_submission(interaction, self.prompt_text.value)
+
+
+@ai_chat_my_prompt_group.command(name="set", description="自分専用のAIチャット人格設定（システムプロンプト）を登録します（最大500文字、オーナーは無制限）")
+@app_commands.describe(text="AIに与える人格・対応方針の指示文（最大500文字、オーナーは無制限）。省略すると入力フォーム（Modal）が開きます")
 async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: Optional[str] = None):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -9072,8 +9144,12 @@ async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: Optional
         return
 
     if text is None:
-        # text未指定時はModalを開いて複数行の入力を受け付ける
-        await interaction.response.send_modal(AIChatMyPromptModal())
+        # text未指定時はModalを開いて複数行の入力を受け付ける（オーナーは文字数上限が緩和された専用Modal）
+        owner_id = await resolve_owner_id(interaction.client)
+        if interaction.user.id == owner_id:
+            await interaction.response.send_modal(AIChatOwnerPromptModal())
+        else:
+            await interaction.response.send_modal(AIChatMyPromptModal())
         return
 
     await _ai_chat_process_my_prompt_submission(interaction, text)
