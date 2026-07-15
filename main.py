@@ -464,6 +464,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
         ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）。オーナーが /ai_chat set_provider で設定
+        # --- AIチャット：他BOTの発言への自動応答（安全対策付き・オーナー専用） ---
+        ("ai_chat_bot_reply_enabled", False),   # True: 登録済みBotの発言にAIチャットチャンネルで自動応答する
+        ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
+        ("ai_chat_bot_reply_max_turns", 4),     # 1つの発言連鎖につき、こちらが連続で応答する最大ターン数（無限ループ防止）
+        ("ai_chat_bot_reply_cooldown_seconds", 15),  # 同じチャンネルでBotへ応答してから次に応答するまでの最短間隔（秒）
         # --- サーバー活動のAIサマリー機能 ---
         ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
         ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
@@ -4472,6 +4477,19 @@ async def on_message(message: discord.Message):
     また、BOT宛のDM（オーナー⇔ユーザー間のメッセージリレー）も処理します。
     """
     if message.author.bot:
+        # 他Botの発言は原則無視するが、「他BOTへの自動応答」機能で明示的に登録された
+        # Botの発言かつAIチャット専用チャンネルでの発言に限り、専用の処理ルートへ回す。
+        # （自分自身の発言・無限ループ防止のため、後続のチェックは _handle_ai_chat_bot_reply 内で行う）
+        if message.guild is not None:
+            all_data_bot_check = load_data()
+            guild_config_bot_check = get_guild_config(all_data_bot_check, str(message.guild.id))
+            if (
+                guild_config_bot_check.get("ai_chat_bot_reply_enabled", False)
+                and message.author.id in guild_config_bot_check.get("ai_chat_bot_reply_target_ids", [])
+            ):
+                ai_chat_channel_id_bot_check = guild_config_bot_check.get("ai_chat_channel_id")
+                if ai_chat_channel_id_bot_check and message.channel.id == ai_chat_channel_id_bot_check:
+                    await _handle_ai_chat_bot_reply(message, guild_config_bot_check)
         return
 
     if not message.guild:
@@ -4773,6 +4791,22 @@ def _ai_chat_check_cooldown(guild_id: int, user_id: int, cooldown_seconds: int) 
 def _ai_chat_record_request(guild_id: int, user_id: int):
     """クールダウン判定用に、直近のリクエスト時刻を記録します。"""
     _ai_chat_last_request[(guild_id, user_id)] = time.time()
+
+
+# --------------------------------------------------------------------
+# 他BOTの発言への自動応答（bot_reply）: 連鎖ターン数・クールダウン管理
+# --------------------------------------------------------------------
+# {channel_id: consecutive_turn_count} — このBotが「他Botの発言」に連続で応答した回数。
+# 人間の発言があった時点でリセットされる（_handle_ai_chat_messageの冒頭で参照・リセットする）。
+_ai_chat_bot_reply_turn_count: dict = {}
+
+# {channel_id: last_reply_epoch_seconds} — このBotが直近で他Botへ応答した時刻（クールダウン用）
+_ai_chat_bot_reply_last_time: dict = {}
+
+
+def _ai_chat_bot_reply_reset_turn_count(channel_id: int):
+    """人間の発言があった場合など、連鎖ターン数カウンタをリセットします。"""
+    _ai_chat_bot_reply_turn_count.pop(channel_id, None)
 
 
 def _ai_chat_get_user_setting(guild_config: dict, user_id: int) -> dict:
@@ -6046,6 +6080,10 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     if not GROQ_API_KEY:
         return  # APIキー未設定時は無反応（オーナーが気付けるようログにだけ出す）
 
+    # 人間が発言した時点で、他Bot連鎖応答のターン数カウンタをリセットする
+    # （bot_reply機能が有効な場合、次にターゲットBotが話し始めたら1ターン目から再度カウントする）
+    _ai_chat_bot_reply_reset_turn_count(message.channel.id)
+
     # サーバー単位の一時停止（オーナーが /ai_chat pause で設定）
     if guild_config.get("ai_chat_paused", False):
         return  # 一時停止中は無反応（オーナーが意図的に止めているため通知もしない）
@@ -6187,6 +6225,99 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     _ai_chat_append_history(message.channel.id, message.author.id, history_user_content, reply_text)
 
     # Discordの1メッセージ2000文字制限に合わせて分割送信
+    chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
+    try:
+        await message.reply(chunks[0], mention_author=False)
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
+    except discord.Forbidden:
+        pass
+
+
+# ====================================================================
+# 他BOTの発言への自動応答（bot_reply機能）
+# ====================================================================
+# ・オーナーが /ai_chat bot_reply add で明示的に登録したBotの発言にのみ反応する。
+# ・対象はAIチャット専用チャンネル（ai_chat_channel_id）に限定。
+# ・無限ループ・高頻度連投を防ぐため、以下の安全対策を必ず経由する:
+#     1. 連鎖ターン数の上限（ai_chat_bot_reply_max_turns）— 人間の発言でリセットされる
+#     2. チャンネル単位のクールダウン（ai_chat_bot_reply_cooldown_seconds）
+#     3. 自分自身（このBot）の発言には反応しない（on_message冒頭のmessage.author.botチェックで
+#        そもそもBot全般が弾かれ、bot_reply_target_idsに登録されたIDのみ通過するため、
+#        このBot自身のIDを誤って登録しない限り自己応答は起こらない）
+# ====================================================================
+
+async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict):
+    """登録済みの他Botの発言に対し、安全対策を経た上でAIチャットチャンネルにて自動応答します。"""
+    if not GROQ_API_KEY:
+        return
+
+    # 安全対策0: 自分自身のIDが誤って登録されていた場合の自己応答ループを確実に防ぐ
+    if bot.user is not None and message.author.id == bot.user.id:
+        return
+
+    if guild_config.get("ai_chat_paused", False):
+        return  # サーバー全体のAIチャット一時停止中は、他Botへの応答も止める
+
+    content = message.content.strip()
+    if not content:
+        return  # 他Bot側がEmbedのみ等でテキスト本文が無い場合は反応しない（誤爆防止）
+
+    channel_id = message.channel.id
+
+    # 安全対策1: 連鎖ターン数の上限チェック
+    max_turns = guild_config.get("ai_chat_bot_reply_max_turns", 4)
+    current_turns = _ai_chat_bot_reply_turn_count.get(channel_id, 0)
+    if current_turns >= max_turns:
+        return  # 上限に達した場合は無反応（人間が発言するまで再開しない）
+
+    # 安全対策2: クールダウンチェック
+    cooldown_seconds = guild_config.get("ai_chat_bot_reply_cooldown_seconds", 15)
+    last_time = _ai_chat_bot_reply_last_time.get(channel_id)
+    if last_time is not None and cooldown_seconds > 0:
+        remaining = cooldown_seconds - (time.time() - last_time)
+        if remaining > 0:
+            return  # クールダウン中は無反応（他Bot側にエラーメッセージを送っても意味がないため）
+
+    system_prompt = AI_CHAT_SYSTEM_PROMPT + (
+        "\n\n（補足: 今、会話相手は人間ではなく別のBotです。"
+        "自然な相槌や短めの受け答えを意識し、同じような話を無限に広げすぎないようにしてください。）"
+    )
+
+    # 履歴はチャンネル単位・「Bot同士の会話」専用のuser_id（0）で管理し、
+    # 人間ユーザーとの会話履歴（_handle_ai_chat_message側）とは混同しない
+    _BOT_REPLY_HISTORY_USER_ID = 0
+    history = _ai_chat_get_history(channel_id, _BOT_REPLY_HISTORY_USER_ID)
+    messages = [{"role": "system", "content": system_prompt}] + history + [
+        {"role": "user", "content": content}
+    ]
+
+    provider_override = guild_config.get("ai_provider", "auto")
+    if provider_override not in ("groq", "cerebras", "mistral"):
+        provider_override = None
+
+    try:
+        async with message.channel.typing():
+            reply_text, _used_provider = await _ai_call_llm_with_fallback(
+                messages, provider_override=provider_override
+            )
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError):
+        # レート制限時は他Botに向けてエラーメッセージを送らず、静かに諦める
+        print(f"[AIチャット/bot_reply] レート制限のため応答を見送りました（channel_id={channel_id}）")
+        return
+    except Exception as e:
+        print(f"[AIチャット/bot_reply] 応答生成エラー: {e}")
+        return
+
+    if not reply_text:
+        return
+
+    # ターン数・クールダウンを記録（実際に応答した場合のみカウントする）
+    _ai_chat_bot_reply_turn_count[channel_id] = current_turns + 1
+    _ai_chat_bot_reply_last_time[channel_id] = time.time()
+
+    _ai_chat_append_history(channel_id, _BOT_REPLY_HISTORY_USER_ID, content, reply_text)
+
     chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
     try:
         await message.reply(chunks[0], mention_author=False)
@@ -6556,6 +6687,154 @@ async def ai_chat_dm_status(interaction: discord.Interaction):
     embed.add_field(name="状態", value="有効" if global_cfg.get("dm_ai_chat_enabled", True) else "無効", inline=True)
     embed.add_field(name="クールダウン", value=f"{global_cfg.get('dm_ai_chat_cooldown_seconds', 10)}秒", inline=True)
     embed.add_field(name="ブロック中ユーザー数", value=f"{len(global_cfg.get('dm_ai_chat_blocked_users', []))}人", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /ai_chat bot_reply — 他BOTの発言への自動応答（安全対策付き・オーナー専用）
+# --------------------------------------------------------------------
+
+ai_chat_bot_reply_group = app_commands.Group(
+    name="bot_reply",
+    description="【オーナー限定】他BOTの発言へのAI自動応答（会話）を管理します",
+    parent=ai_chat_group
+)
+
+
+@ai_chat_bot_reply_group.command(name="toggle", description="【オーナー限定】他BOTの発言への自動応答機能そのものを有効/無効にします")
+@app_commands.describe(状態="on: 有効化 / off: 無効化")
+@app_commands.choices(状態=[
+    app_commands.Choice(name="有効にする", value="on"),
+    app_commands.Choice(name="無効にする", value="off"),
+])
+async def ai_chat_bot_reply_toggle(interaction: discord.Interaction, 状態: app_commands.Choice[str]):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_bot_reply_enabled"] = (状態.value == "on")
+    save_data(all_data)
+
+    if 状態.value == "on" and not guild_config.get("ai_chat_bot_reply_target_ids"):
+        await interaction.response.send_message(
+            "他BOTへの自動応答を **有効** にしましたが、対象Botがまだ1件も登録されていません。\n"
+            "`/ai_chat bot_reply add` で反応させたいBotを登録してください。それまでは実際には反応しません。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"他BOTの発言への自動応答を **{'有効' if 状態.value == 'on' else '無効'}** にしました。\n"
+        f"（対象はAIチャット専用チャンネル内・登録済みBotの発言のみです）",
+        ephemeral=True
+    )
+
+
+@ai_chat_bot_reply_group.command(name="add", description="【オーナー限定】自動応答の対象とするBotを登録します")
+@app_commands.describe(bot_user="反応させたい相手のBotユーザー")
+async def ai_chat_bot_reply_add(interaction: discord.Interaction, bot_user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if not bot_user.bot:
+        await interaction.response.send_message("指定したユーザーはBotではありません。Botを指定してください。", ephemeral=True)
+        return
+
+    if bot.user is not None and bot_user.id == bot.user.id:
+        await interaction.response.send_message(
+            "自分自身（このBot）を登録することはできません（無限ループになるため）。", ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    target_ids = guild_config.setdefault("ai_chat_bot_reply_target_ids", [])
+
+    if bot_user.id in target_ids:
+        await interaction.response.send_message(f"{bot_user.mention} は既に登録されています。", ephemeral=True)
+        return
+
+    target_ids.append(bot_user.id)
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"{bot_user.mention} を自動応答の対象として登録しました。\n"
+        f"AIチャット専用チャンネルでこのBotが発言すると、設定に応じて自動で返信します。\n"
+        f"（`/ai_chat bot_reply toggle 状態:有効にする` が別途必要です）",
+        ephemeral=True
+    )
+
+
+@ai_chat_bot_reply_group.command(name="remove", description="【オーナー限定】自動応答の対象Botを登録解除します")
+@app_commands.describe(bot_user="登録解除したい相手のBot")
+async def ai_chat_bot_reply_remove(interaction: discord.Interaction, bot_user: discord.User):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    target_ids = guild_config.setdefault("ai_chat_bot_reply_target_ids", [])
+
+    if bot_user.id not in target_ids:
+        await interaction.response.send_message(f"{bot_user.mention} は登録されていません。", ephemeral=True)
+        return
+
+    target_ids.remove(bot_user.id)
+    save_data(all_data)
+    await interaction.response.send_message(f"{bot_user.mention} の登録を解除しました。", ephemeral=True)
+
+
+@ai_chat_bot_reply_group.command(name="set_max_turns", description="【オーナー限定】1つの会話連鎖で連続応答する最大ターン数を設定します（無限ループ防止）")
+@app_commands.describe(ターン数="人間の発言がないまま連続で応答してよい最大回数（1〜20、既定4）")
+async def ai_chat_bot_reply_set_max_turns(interaction: discord.Interaction, ターン数: app_commands.Range[int, 1, 20]):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_bot_reply_max_turns"] = ターン数
+    save_data(all_data)
+
+    await interaction.response.send_message(f"連続応答の最大ターン数を **{ターン数}回** に設定しました。", ephemeral=True)
+
+
+@ai_chat_bot_reply_group.command(name="set_cooldown", description="【オーナー限定】他BOTへ応答してから次に応答するまでの最短間隔を設定します")
+@app_commands.describe(秒数="クールダウン秒数（0で制限なし、既定15秒）")
+async def ai_chat_bot_reply_set_cooldown(interaction: discord.Interaction, 秒数: app_commands.Range[int, 0, 3600]):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_bot_reply_cooldown_seconds"] = 秒数
+    save_data(all_data)
+
+    await interaction.response.send_message(f"他BOTへの応答クールダウンを **{秒数}秒** に設定しました。", ephemeral=True)
+
+
+@ai_chat_bot_reply_group.command(name="status", description="他BOTの発言への自動応答機能の設定状況を確認します")
+async def ai_chat_bot_reply_status(interaction: discord.Interaction):
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    target_ids = guild_config.get("ai_chat_bot_reply_target_ids", [])
+    target_text = "\n".join(f"・<@{uid}>（`{uid}`）" for uid in target_ids) or "（未登録）"
+
+    embed = discord.Embed(title="他BOTへの自動応答 設定状況", color=discord.Color.blue())
+    embed.add_field(name="状態", value="有効" if guild_config.get("ai_chat_bot_reply_enabled", False) else "無効", inline=True)
+    embed.add_field(name="連続応答の最大ターン数", value=f"{guild_config.get('ai_chat_bot_reply_max_turns', 4)}回", inline=True)
+    embed.add_field(name="応答クールダウン", value=f"{guild_config.get('ai_chat_bot_reply_cooldown_seconds', 15)}秒", inline=True)
+    embed.add_field(name="登録済みBot", value=target_text, inline=False)
+    ai_chat_channel_id = guild_config.get("ai_chat_channel_id")
+    embed.add_field(
+        name="対象チャンネル",
+        value=(f"<#{ai_chat_channel_id}>" if ai_chat_channel_id else "（AIチャット専用チャンネルが未設定です。`/ai_chat set_channel` で設定してください）"),
+        inline=False
+    )
+    embed.set_footer(text="対象はAIチャット専用チャンネル内・登録済みBotの発言のみです（無関係なBotには反応しません）")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
