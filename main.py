@@ -464,6 +464,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
         ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）。オーナーが /ai_chat set_provider で設定
+        ("ai_chat_guild_system_prompt", None),  # サーバー全体の既定AI人格（システムプロンプト）。未設定ならコード内蔵の既定文を使用。オーナーが /ai_chat set_personality で設定
         # --- AIチャット：他BOTの発言への自動応答（安全対策付き・オーナー専用） ---
         ("ai_chat_bot_reply_enabled", False),   # True: 登録済みBotの発言にAIチャットチャンネルで自動応答する
         ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
@@ -4726,6 +4727,17 @@ AI_CHAT_SYSTEM_PROMPT = (
     "日本語で、簡潔かつ丁寧に回答してください。Discordのメッセージとして自然な長さを意識してください。"
 )
 
+AI_CHAT_GUILD_PROMPT_MAX_LENGTH = 1500  # サーバー既定人格として登録できる最大文字数（オーナー専用設定のため一般ユーザーより広め）
+
+
+def _ai_chat_resolve_default_system_prompt(guild_config: dict) -> str:
+    """
+    そのサーバーの「既定」システムプロンプトを解決します（ユーザー個別設定は含まない）。
+    サーバー既定プロンプトが設定されていればそれを、無ければコード内蔵の既定プロンプトを返します。
+    優先順位: ユーザー個別設定 > サーバー既定（本関数の戻り値） > コード内蔵の既定プロンプト
+    """
+    return guild_config.get("ai_chat_guild_system_prompt") or AI_CHAT_SYSTEM_PROMPT
+
 # {(channel_id, user_id): {"messages": [{"role":..., "content":...}, ...], "last_used": epoch_seconds}}
 _ai_chat_histories: dict = {}
 
@@ -6133,7 +6145,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
             pass
         return
 
-    system_prompt = user_setting["system_prompt"] or AI_CHAT_SYSTEM_PROMPT
+    system_prompt = user_setting["system_prompt"] or _ai_chat_resolve_default_system_prompt(guild_config)
     model = user_setting["model"] or None  # Noneなら _ai_chat_call_groq側でGROQ_MODELが使われる
 
     history = _ai_chat_get_history(message.channel.id, message.author.id)
@@ -6279,7 +6291,7 @@ async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict
         if remaining > 0:
             return  # クールダウン中は無反応（他Bot側にエラーメッセージを送っても意味がないため）
 
-    system_prompt = AI_CHAT_SYSTEM_PROMPT + (
+    system_prompt = _ai_chat_resolve_default_system_prompt(guild_config) + (
         "\n\n（補足: 今、会話相手は人間ではなく別のBotです。"
         "自然な相槌や短めの受け答えを意識し、同じような話を無限に広げすぎないようにしてください。）"
     )
@@ -6388,7 +6400,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
         if user_setting["blocked"]:
             await interaction.followup.send("このコマンドの利用が制限されています。", ephemeral=True)
             return
-        system_prompt = user_setting["system_prompt"] or AI_CHAT_SYSTEM_PROMPT
+        system_prompt = user_setting["system_prompt"] or _ai_chat_resolve_default_system_prompt(guild_config)
         model = user_setting["model"] or None
         provider_override = guild_config.get("ai_provider", "auto")
         if provider_override not in ("groq", "cerebras", "mistral"):
@@ -9121,6 +9133,105 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
         f"※画像添付時のAIチャット応答は、対応の都合上、この設定によらず固定のプロバイダが使用されます。",
         ephemeral=True
     )
+
+
+class AIChatGuildPersonalityModal(discord.ui.Modal, title="サーバー既定のAI人格設定"):
+    """
+    /ai_chat set_personality をtext引数なしで実行した際に開くModal。
+    サーバー全体の既定人格はオーナー専用設定のため、文字数上限はAI_CHAT_GUILD_PROMPT_MAX_LENGTH
+    （一般ユーザー個別設定の500文字より広め）まで許容し、AIによる内容チェックも行わない。
+    """
+    prompt_text = discord.ui.TextInput(
+        label="このサーバーでのAIの既定人格・対応方針",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: あなたはこのサーバーの看板キャラクター「〇〇」です。語尾に「〜なのだ」を付けてください。",
+        required=True,
+        max_length=AI_CHAT_GUILD_PROMPT_MAX_LENGTH
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _ai_chat_process_guild_personality_submission(interaction, self.prompt_text.value)
+
+
+async def _ai_chat_process_guild_personality_submission(interaction: discord.Interaction, text: str):
+    """set_personalityコマンド・Modalの両方から呼ばれる共通の保存処理。"""
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    text = text.strip()
+    if not text:
+        await interaction.response.send_message("空の文章は登録できません。", ephemeral=True)
+        return
+
+    if len(text) > AI_CHAT_GUILD_PROMPT_MAX_LENGTH:
+        await interaction.response.send_message(
+            f"文字数が上限（{AI_CHAT_GUILD_PROMPT_MAX_LENGTH}文字）を超えています。"
+            f"（現在: {len(text)}文字）短くして再度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["ai_chat_guild_system_prompt"] = text
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        "[設定完了] このサーバーの既定AI人格を登録しました。\n"
+        "以降、個別のシステムプロンプトを設定していないメンバーの発言・`/ai`コマンド・他BOTへの自動応答すべてにこの人格が適用されます。\n"
+        "（メンバーが `/ai_chat my_prompt set` で自分専用の人格を設定している場合は、そちらが優先されます）",
+        ephemeral=True
+    )
+
+
+@ai_chat_group.command(name="set_personality", description="【オーナー限定】このサーバー全体の既定AI人格（システムプロンプト）を設定します")
+@app_commands.describe(text=f"AIに与える既定の人格・対応方針の指示文（最大{AI_CHAT_GUILD_PROMPT_MAX_LENGTH}文字）。省略すると入力フォーム（Modal）が開きます")
+async def ai_chat_set_personality(interaction: discord.Interaction, text: Optional[str] = None):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if text is None:
+        await interaction.response.send_modal(AIChatGuildPersonalityModal())
+        return
+
+    await _ai_chat_process_guild_personality_submission(interaction, text)
+
+
+@ai_chat_group.command(name="reset_personality", description="【オーナー限定】このサーバー全体の既定AI人格をリセットし、標準の人格に戻します")
+async def ai_chat_reset_personality(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    if guild_config.get("ai_chat_guild_system_prompt") is None:
+        await interaction.response.send_message("このサーバーには既定AI人格が設定されていません。", ephemeral=True)
+        return
+
+    guild_config["ai_chat_guild_system_prompt"] = None
+    save_data(all_data)
+
+    await interaction.response.send_message("[リセット] このサーバーの既定AI人格を削除し、標準の人格に戻しました。", ephemeral=True)
+
+
+@ai_chat_group.command(name="show_personality", description="このサーバーの既定AI人格（システムプロンプト）を確認します")
+async def ai_chat_show_personality(interaction: discord.Interaction):
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    custom_prompt = guild_config.get("ai_chat_guild_system_prompt")
+
+    embed = discord.Embed(title="このサーバーの既定AI人格", color=discord.Color.blue())
+    if custom_prompt:
+        embed.description = custom_prompt[:4000]
+        embed.set_footer(text="オーナーが /ai_chat set_personality で設定したカスタム人格です")
+    else:
+        embed.description = AI_CHAT_SYSTEM_PROMPT
+        embed.set_footer(text="カスタム人格は未設定のため、標準の人格が使用されています")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 
