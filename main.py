@@ -378,6 +378,10 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("alt_check_days", 30),
         ("alt_check_action", "notify"),
         ("iplogger_check_enabled", False),
+        ("ip_ban_check_enabled", False),   # True: ウェブ認証時にBAN済みIPと照合してブロック
+        ("ip_ban_action", "ban"),          # "notify" / "kick" / "ban"
+        ("ip_hashes", {}),                 # {user_id_str: ip_hash} 認証時に記録した直近IPのハッシュ
+        ("banned_ip_hashes", {}),          # {ip_hash: {"banned_user_id": str, "date": str}} BAN済みユーザーのIPハッシュ一覧
         ("polls", {}),
         ("poll_next_id", 1),
         ("giveaways", {}),
@@ -1912,6 +1916,41 @@ def _generate_web_auth_state(guild_id: int, user_id: int) -> str:
 
 
 GUILD_DASHBOARD_TOKEN_TTL = 1800  # サーバー管理ダッシュボードの個人専用リンクの有効期限（秒）= 30分
+
+
+def _get_client_ip(request) -> Optional[str]:
+    """
+    リクエストの接続元IPアドレスを取得します。
+    Render/Railway/Replit等のリバースプロキシ環境では request.remote が
+    プロキシ自身のIPになってしまうため、X-Forwarded-For ヘッダーを優先して参照します。
+    X-Forwarded-For は "クライアントIP, プロキシ1のIP, プロキシ2のIP, ..." の形式で
+    複数値が入る場合があるため、先頭（最も末端＝実際のクライアントに近い値）を採用します。
+    """
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return ip
+    xri = request.headers.get("X-Real-IP")
+    if xri:
+        return xri.strip()
+    if request.remote:
+        return request.remote
+    return None
+
+
+def _hash_ip(ip: str) -> str:
+    """
+    IPアドレスをそのまま保存せず、ソルト付きハッシュ化して保存するための関数です。
+    同一IPかどうかの照合はできますが、ハッシュから元のIPアドレスを復元することはできません。
+    """
+    import hmac
+    import hashlib
+    return hmac.new(
+        OAUTH_SECRET_KEY.encode(),
+        ip.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
 
 def _generate_guild_dashboard_token(guild_id: int, user_id: int) -> str:
@@ -6458,6 +6497,38 @@ async def on_member_join(member: discord.Member):
 
 
 @bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    """
+    メンバーがBANされた際に発火します（/moderation ban 経由でも、Discord標準のBAN機能でも、
+    alt_check・ip_ban_check自身のBANでも発火します）。
+    IP対策(ip_ban_check)が有効な場合、このユーザーが直近のウェブ認証時に記録したIPハッシュを
+    「BAN済みIPハッシュ一覧」へ移行します。以降、同じIPで別アカウントが認証しに来ると検知されます。
+    """
+    try:
+        all_data = load_data()
+        guild_id_str = str(guild.id)
+        cfg = get_guild_config(all_data, guild_id_str)
+
+        if not cfg.get("ip_ban_check_enabled", False):
+            return
+
+        ip_hashes = cfg.get("ip_hashes", {})
+        ip_hash = ip_hashes.pop(str(user.id), None)
+        if not ip_hash:
+            return  # このユーザーはウェブ認証を経由していない（IPを記録していない）
+
+        banned_ip_hashes = cfg.setdefault("banned_ip_hashes", {})
+        banned_ip_hashes[ip_hash] = {
+            "banned_user_id": str(user.id),
+            "date": discord.utils.utcnow().strftime("%Y/%m/%d %H:%M")
+        }
+        save_data(all_data)
+        print(f"[ip_ban_check] {user} (guild={guild.id}) のIPハッシュをBAN済みリストへ登録しました")
+    except Exception as e:
+        print(f"[ip_ban_check] on_member_ban処理エラー: {e}")
+
+
+@bot.event
 async def on_member_remove(member: discord.Member):
     embed = discord.Embed(
         title="[ログ] メンバー退出",
@@ -6856,6 +6927,7 @@ async def help_command(interaction: discord.Interaction):
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
             "`/server protect iplogger_check` : URLがIPロガーでないかチェックします\n"
+            "`/server protect ip_ban_check` : ウェブ認証を利用したBAN逃れ（同一IP）対策を設定します\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
             "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
             "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
@@ -12303,6 +12375,79 @@ async def iplogger_check(interaction: discord.Interaction, 状態: discord.app_c
 
 
 # --------------------------------------------------------------------
+# /server protect ip_ban_check — ウェブ認証を利用したBAN逃れ（IP）対策
+# --------------------------------------------------------------------
+
+@server_protect_group.command(name="ip_ban_check", description="【管理者専用】ウェブ認証を利用したBAN逃れ対策（同一IP検知）を設定します")
+@app_commands.describe(
+    操作="有効化 / 無効化 / 現在の設定確認",
+    アクション="同一IPを検知した際の処置（onの場合のみ）"
+)
+@discord.app_commands.choices(
+    操作=[
+        discord.app_commands.Choice(name="有効にする", value="on"),
+        discord.app_commands.Choice(name="無効にする", value="off"),
+        discord.app_commands.Choice(name="設定確認", value="status"),
+    ],
+    アクション=[
+        discord.app_commands.Choice(name="通知のみ（認証は継続させる）", value="notify"),
+        discord.app_commands.Choice(name="キック", value="kick"),
+        discord.app_commands.Choice(name="BAN", value="ban"),
+    ]
+)
+async def ip_ban_check(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    アクション: discord.app_commands.Choice[str] = None
+):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if 操作.value == "status":
+        embed = discord.Embed(title="ip_ban_check 設定状況", color=discord.Color.blue())
+        embed.add_field(name="状態", value="有効" if cfg.get("ip_ban_check_enabled") else "無効", inline=True)
+        action_label = {"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(cfg.get("ip_ban_action", "ban"), "不明")
+        embed.add_field(name="アクション", value=action_label, inline=True)
+        embed.add_field(name="記録済みBAN済みIP件数", value=str(len(cfg.get("banned_ip_hashes", {}))), inline=True)
+        embed.set_footer(text="ウェブ認証(/web_auth)を経由したユーザーのみが対象です（IPはハッシュ化して保存されます）")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if 操作.value == "off":
+        cfg["ip_ban_check_enabled"] = False
+        save_data(all_data)
+        await interaction.response.send_message("IP対策（BAN逃れ検知）を無効にしました。", ephemeral=True)
+        return
+
+    # on
+    cfg["ip_ban_check_enabled"] = True
+    if アクション:
+        cfg["ip_ban_action"] = アクション.value
+    save_data(all_data)
+
+    action_label = {"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(cfg.get("ip_ban_action", "ban"), "BAN")
+    await interaction.response.send_message(
+        "IP対策（BAN逃れ検知）を **有効** にしました。\n"
+        f"・アクション: **{action_label}**\n\n"
+        "【仕組み】\n"
+        "・ウェブ認証(/web_auth)を通過したユーザーの接続元IPを、ハッシュ化して記録します。\n"
+        "・そのユーザーが後でBANされると、記録済みのIPハッシュが「BAN済みIP」として登録されます。\n"
+        "・別アカウントが同じIPからウェブ認証を試みると、BAN逃れとして検知・処置されます。\n\n"
+        "⚠️ 注意点\n"
+        "・IP検知はウェブ認証を経由したユーザーのみが対象です（通常参加のみのユーザーは対象外）。\n"
+        "・スマホの回線切替やVPN、公共Wi-Fi等では同居人・同施設利用者を誤検知する可能性があります。\n"
+        "　誤爆が心配な場合はまず「通知のみ」で運用し、ログを見ながら判断することをおすすめします。\n"
+        "・ログチャンネルを設定していない場合は通知が届きません（`/automod modlog_set` で設定してください）。",
+        ephemeral=True
+    )
+
+
+# --------------------------------------------------------------------
 # /embed builder — GUIでEmbedを作成して送信（任意でModal付き回答パネルにできる）
 # --------------------------------------------------------------------
 
@@ -14820,7 +14965,72 @@ async def _oauth2_callback_handler(request):
     action_label = "BAN" if action == "ban" else "キック"
 
     # =========================================================
-    # ① サブ垢（新規アカウント）対策 — alt_check_enabled がONの場合のみ
+    # ① IP対策（BAN逃れ検知） — ip_ban_check_enabled がONの場合のみ
+    #    このサーバーでBAN済みのユーザーが記録した接続元IPと一致する場合、
+    #    別アカウントによるBAN逃れとみなして対処します。
+    #    IPは生のまま保存せずソルト付きハッシュのみ保存・照合します。
+    # =========================================================
+    client_ip = _get_client_ip(request)
+    ip_hash = _hash_ip(client_ip) if client_ip else None
+
+    if cfg.get("ip_ban_check_enabled", False) and ip_hash:
+        banned_ip_hashes = cfg.get("banned_ip_hashes", {})
+        hit = banned_ip_hashes.get(ip_hash)
+        if hit:
+            ip_action = cfg.get("ip_ban_action", "ban")
+            print(f"[ウェブ認証/ip_ban_check] ユーザー {user_id} が BAN済みIPと一致（元アカウント: {hit.get('banned_user_id')}） -> action={ip_action}")
+
+            log_ch_id = cfg.get("server_blacklist_log_channel_id") or cfg.get("mod_log_channel_id")
+            if log_ch_id and target_guild:
+                log_ch = target_guild.get_channel(log_ch_id)
+                if log_ch:
+                    ip_embed = discord.Embed(
+                        title="[!] ウェブ認証: BAN逃れの疑い（同一IP検知）",
+                        color=discord.Color.dark_red()
+                    )
+                    ip_embed.add_field(name="対象ユーザー", value=f"<@{user_id}> (`{user_id}`)", inline=False)
+                    ip_embed.add_field(name="一致したBAN済みアカウント", value=f"<@{hit.get('banned_user_id')}> (`{hit.get('banned_user_id')}`)", inline=False)
+                    ip_embed.add_field(name="BAN日時", value=hit.get("date", "不明"), inline=True)
+                    ip_embed.add_field(
+                        name="実行アクション",
+                        value={"notify": "通知のみ（認証は継続）", "kick": "キック", "ban": "BAN"}.get(ip_action, ip_action),
+                        inline=True
+                    )
+                    ip_embed.add_field(name="検出経路", value="ウェブ認証 (OAuth2) - IPハッシュ照合", inline=True)
+                    ip_embed.timestamp = discord.utils.utcnow()
+                    try:
+                        await log_ch.send(embed=ip_embed)
+                    except Exception:
+                        pass
+
+            if ip_action in ("kick", "ban"):
+                if target_guild:
+                    member = target_guild.get_member(user_id)
+                    if member:
+                        try:
+                            if ip_action == "ban":
+                                await target_guild.ban(
+                                    discord.Object(id=user_id),
+                                    reason=f"ウェブ認証/ip_ban_check: BAN済みアカウント {hit.get('banned_user_id')} と同一IPを検知"
+                                )
+                            else:
+                                await member.kick(
+                                    reason=f"ウェブ認証/ip_ban_check: BAN済みアカウント {hit.get('banned_user_id')} と同一IPを検知"
+                                )
+                        except Exception as e:
+                            print(f"[ウェブ認証/ip_ban_check] {ip_action}実行エラー: {e}")
+
+                ip_action_label = "BAN" if ip_action == "ban" else "キック"
+                return _html_page(
+                    title="参加不可",
+                    message="このサーバーには参加できません",
+                    sub=f"BAN逃れの疑いがあるため（IP対策）、{ip_action_label}されました。",
+                    ok=False
+                )
+            # ip_action == "notify" の場合は弾かずに以降のチェックへ進む
+
+    # =========================================================
+    # ② サブ垢（新規アカウント）対策 — alt_check_enabled がONの場合のみ
     #    /server protect alt_check の設定をウェブ認証にも適用します。
     #    アクションが「通知のみ」の場合はここでは弾かず、通知のみ行って認証は継続させます。
     # =========================================================
@@ -14885,7 +15095,7 @@ async def _oauth2_callback_handler(request):
             # alt_action == "notify" の場合は弾かずに以降のBL照合へ進む
 
     # =========================================================
-    # ② 荒らしリスト（ブラックリスト）照合 — 常時実行
+    # ③ 荒らしリスト（ブラックリスト）照合 — 常時実行
     #    サーバーBL機能のON/OFFに関わらず、荒らしリストに登録済みなら弾く
     # =========================================================
     troll_list = global_cfg_bl.get("troll_list", {})
@@ -14960,10 +15170,20 @@ async def _oauth2_callback_handler(request):
         )
 
     # =========================================================
-    # ③ サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
+    # ④ サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
     # =========================================================
+    def _record_ip_hash_if_enabled():
+        """認証OK確定時、ip_ban_check_enabled であれば今回の接続元IPハッシュを記録します。
+        後でこのユーザーがBANされた際、記録済みのこのハッシュが banned_ip_hashes に登録されます。"""
+        if cfg.get("ip_ban_check_enabled", False) and ip_hash:
+            fresh_data = load_data()
+            fresh_cfg = get_guild_config(fresh_data, str(guild_id))
+            fresh_cfg.setdefault("ip_hashes", {})[str(user_id)] = ip_hash
+            save_data(fresh_data)
+
     if not cfg.get("server_blacklist_enabled", True):
         # 機能が無効になっていれば認証OK。ロール付与は「認証完了」ボタン押下時に確定させる
+        _record_ip_hash_if_enabled()
         complete_token = _generate_web_auth_state(guild_id, user_id)
         complete_url = _build_complete_url(complete_token)
         return aiohttp.web.Response(
@@ -15044,6 +15264,7 @@ async def _oauth2_callback_handler(request):
         # ブラックリスト対象サーバーに参加していない -> 認証OK。
         # ロール付与は「認証完了」ボタン押下時に確定させる
         print(f"[サーバーBL] ユーザー {user_id} はBL対象サーバーに在籍なし -> 認証OK")
+        _record_ip_hash_if_enabled()
         complete_token = _generate_web_auth_state(guild_id, user_id)
         complete_url = _build_complete_url(complete_token)
         return aiohttp.web.Response(
@@ -16422,6 +16643,7 @@ DASHBOARD_TOGGLE_KEYS = {
     "economy_enabled":          "経済システム（コイン）",
     "alt_check_enabled":        "複垢（垢ban逃れ）チェック",
     "iplogger_check_enabled":   "IPロガーリンク検知",
+    "ip_ban_check_enabled":     "IP対策（BAN逃れ検知/ウェブ認証）",
 }
 
 
