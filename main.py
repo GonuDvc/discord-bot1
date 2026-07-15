@@ -476,6 +476,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("invite_join_log", {}),              # {member_user_id_str: inviter_user_id_str} 誰が誰を招待したか（最新の参加分）
         # --- AFK機能（/afk） ---
         ("afk_users", {}),                    # {user_id_str: {"reason": str, "since": unix_timestamp, "old_nick": str|None}}
+        # --- 自動翻訳機能（特定チャンネルに投稿されたメッセージを自動翻訳） ---
+        ("translate_channel_id", None),        # 自動翻訳の対象チャンネルID（未設定なら機能OFF）
+        ("translate_secondary_lang", "en"),    # 投稿者の言語が日本語だった場合の翻訳先言語コード（既定: 英語）
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -4615,6 +4618,12 @@ async def on_message(message: discord.Message):
             await _handle_ai_chat_message(message, guild_config)
             return  # AIチャットチャンネルでは他のコマンド解釈を行わない
 
+        # 7.5 自動翻訳: 専用チャンネルでの発言を検出・翻訳してembedで返信
+        # AIチャット専用チャンネルとは独立した機能のため、returnせず後続処理と並行して動作させる
+        translate_channel_id = guild_config.get("translate_channel_id")
+        if translate_channel_id and message.channel.id == translate_channel_id:
+            await _handle_auto_translate(message, guild_config)
+
     await bot.process_commands(message)
 
 
@@ -4826,6 +4835,110 @@ async def _ai_chat_moderate_system_prompt(text: str, guild_id: Optional[int] = N
     except (json.JSONDecodeError, AttributeError, TypeError):
         # 判定結果を正しく解析できない場合も安全側に倒す
         return False, "判定結果の解析に失敗したため設定できませんでした"
+
+
+# ====================================================================
+# 自動翻訳機能（特定チャンネルに投稿されたメッセージをLLM経由で自動翻訳）
+# ====================================================================
+# ・追加のAPIを使わず、既存のGroq/Cerebras/Mistral LLM呼び出しを流用する。
+# ・1回のLLM呼び出しで「言語検出」と「翻訳」を同時に行い、JSON形式で受け取る。
+# ・投稿者の言語が日本語以外 -> 日本語へ翻訳
+#   投稿者の言語が日本語 -> guild_config["translate_secondary_lang"]（既定: 英語）へ翻訳
+# ====================================================================
+
+TRANSLATE_SYSTEM_PROMPT = (
+    "あなたは高精度な翻訳エンジンです。ユーザーから渡された文章について、まずその文章が"
+    "何語で書かれているかを判定してください。\n"
+    "・判定した言語が日本語（ja）でない場合は、日本語に翻訳してください。\n"
+    "・判定した言語が日本語（ja）である場合は、指定されたターゲット言語コードに翻訳してください。\n"
+    "絵文字やメンション（<@...>や<#...>等のDiscord記法）、URLはそのまま保持し、翻訳しないでください。\n"
+    "出力は必ず次のJSON形式のみとし、説明文やコードブロック記法は一切付けないでください。\n"
+    '{"detected_lang": "言語コード(例: ja, en, ko, zh 等)", "translated_text": "翻訳後の文章"}'
+)
+
+
+def _ai_extract_json_response(raw: str) -> Optional[dict]:
+    """LLM応答からJSONオブジェクトを取り出します。コードブロック記法が付いていても除去します。"""
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+
+async def _translate_message_text(text: str, secondary_lang: str, guild_id: Optional[int] = None) -> Optional[Tuple[str, str]]:
+    """
+    メッセージ本文の言語を検出し、必要な言語へ翻訳します。
+    戻り値: (detected_lang, translated_text)。翻訳する必要がない・失敗した場合はNone。
+    """
+    if not text or not text.strip():
+        return None
+
+    user_prompt = (
+        f"ターゲット言語コード（投稿者が日本語で書いていた場合の翻訳先）: {secondary_lang}\n\n"
+        f"翻訳対象の文章:\n{text}"
+    )
+    messages = [
+        {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
+    except Exception as e:
+        print(f"[自動翻訳] LLM呼び出しエラー: {e}")
+        return None
+
+    parsed = _ai_extract_json_response(raw)
+    if not parsed:
+        return None
+
+    detected_lang = str(parsed.get("detected_lang", "")).strip().lower()
+    translated_text = str(parsed.get("translated_text", "")).strip()
+    if not translated_text:
+        return None
+
+    return detected_lang, translated_text
+
+
+async def _handle_auto_translate(message: discord.Message, guild_config: dict):
+    """
+    自動翻訳対象チャンネルに投稿されたメッセージを翻訳し、embedで返信します。
+    AIチャットの自動応答（returnして他処理を止める仕組み）とは独立しており、
+    この処理自体が他の機能をブロックすることはありません。
+    """
+    if not message.content or not message.content.strip():
+        return
+    if not GROQ_API_KEY:
+        return
+
+    secondary_lang = guild_config.get("translate_secondary_lang", "en")
+    result = await _translate_message_text(message.content, secondary_lang, guild_id=message.guild.id if message.guild else None)
+    if not result:
+        return
+
+    detected_lang, translated_text = result
+    if not translated_text or translated_text.strip() == message.content.strip():
+        return
+
+    embed = discord.Embed(description=translated_text, color=discord.Color.blurple())
+    embed.set_author(
+        name=f"{message.author.display_name} の翻訳（検出言語: {detected_lang or '不明'}）",
+        icon_url=message.author.display_avatar.url if message.author.display_avatar else None
+    )
+
+    try:
+        await message.reply(embed=embed, mention_author=False)
+    except discord.Forbidden:
+        try:
+            await message.channel.send(embed=embed)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[自動翻訳] embed送信エラー: {e}")
 
 
 class GroqAPIError(RuntimeError):
@@ -6195,6 +6308,145 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
             await interaction.channel.send(chunk)
         except Exception:
             pass
+
+
+# ====================================================================
+# /reply_suggest コマンド（グループDMの会話をスキャンし、AIが返信候補を提案する）
+# ====================================================================
+# ・対象はグループDM（discord.GroupChannel）のみ。1対1DMやサーバー内チャンネルは対象外。
+# ・BotとユーザーのAIチャットとは異なり、あくまで「実行ユーザー本人が次に返信するとしたら」
+#   という候補をAIに生成させ、ephemeral=True（実行ユーザーにのみ見える）で返す。
+#   別途DMを送るより、グループDM内で完結するephemeral応答の方が自然なため。
+# ・DM/グループDM系AI機能の有効/ブロック/クールダウン設定（dm_ai_chat_*）をそのまま流用する。
+# ====================================================================
+
+_REPLY_SUGGEST_SYSTEM_PROMPT = (
+    "あなたはDiscordのグループDMでの会話分析アシスタントです。"
+    "これから、話者名付きの直近の会話履歴（古い順）を提示します。"
+    "会話の流れを踏まえ、指定された本人が次に返信するとしたら自然にありえる返信文の候補を"
+    "日本語で提案してください。候補同士は、丁寧/カジュアル、賛成/質問/茶々を入れる、等の"
+    "毛色が異なるバリエーションにしてください。過度に長い文章にはせず、実際にDMで送るような"
+    "自然な長さにしてください。\n"
+    "出力は必ず次のJSON形式のみとし、説明文やコードブロック記法は一切付けないでください。\n"
+    '{"suggestions": ["候補1", "候補2", "候補3"]}'
+)
+
+_REPLY_SUGGEST_DM_GUILD_KEY = -1  # /ai コマンド用の疑似ギルドID(0)とは別のクールダウン管理キー
+
+
+@bot.tree.command(
+    name="reply_suggest",
+    description="グループDMの会話をスキャンし、次の返信候補をAIが提案します（自分にだけ見える形で表示）"
+)
+@app_commands.describe(件数="提案してほしい候補数（2〜3、既定2）")
+@app_commands.allowed_contexts(guilds=False, dms=False, private_channels=True)
+@app_commands.allowed_installs(guilds=False, users=True)
+async def reply_suggest_command(interaction: discord.Interaction, 件数: app_commands.Range[int, 2, 3] = 2):
+    if not isinstance(interaction.channel, discord.GroupChannel):
+        await interaction.response.send_message("このコマンドはグループDM内でのみ使用できます。", ephemeral=True)
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "現在この機能は利用できません（Botの設定が未完了です）。", ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+
+    if not global_cfg.get("dm_ai_chat_enabled", True):
+        await interaction.response.send_message(
+            "現在この機能は無効化されています。管理者にお問い合わせください。", ephemeral=True
+        )
+        return
+
+    if interaction.user.id in global_cfg.get("dm_ai_chat_blocked_users", []):
+        await interaction.response.send_message("このコマンドの利用が制限されています。", ephemeral=True)
+        return
+
+    cooldown_seconds = global_cfg.get("dm_ai_chat_cooldown_seconds", 10)
+    remaining = _ai_chat_check_cooldown(_REPLY_SUGGEST_DM_GUILD_KEY, interaction.user.id, cooldown_seconds)
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # 直近の会話履歴を取得（話者の表示名と本文のみ。新しい順で取得し、あとで古い順に並び替える）
+    transcript_lines = []
+    try:
+        async for msg in interaction.channel.history(limit=30, oldest_first=False):
+            if msg.author.bot:
+                continue
+            if not msg.content or not msg.content.strip():
+                continue
+            transcript_lines.append(f"{msg.author.display_name}: {msg.content.strip()}")
+    except Exception as e:
+        print(f"[/reply_suggest] 履歴取得エラー: {e}")
+        await interaction.followup.send("会話履歴の取得に失敗しました。", ephemeral=True)
+        return
+
+    if not transcript_lines:
+        await interaction.followup.send("分析できる会話履歴が見つかりませんでした。", ephemeral=True)
+        return
+
+    transcript_lines.reverse()  # 古い順に並び替え
+    transcript_text = "\n".join(transcript_lines[-40:])  # 念のため上限を設ける
+
+    user_prompt = (
+        f"返信候補を{件数}件提案してください。次に返信するのは「{interaction.user.display_name}」本人です。\n\n"
+        f"=== 直近の会話履歴（古い順） ===\n{transcript_text}"
+    )
+    messages = [
+        {"role": "system", "content": _REPLY_SUGGEST_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    _ai_chat_record_request(_REPLY_SUGGEST_DM_GUILD_KEY, interaction.user.id)
+
+    try:
+        raw, _used_provider = await _ai_call_llm_with_fallback(messages)
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
+        wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
+        limit_scope = getattr(e, "limit_scope", None)
+        if limit_scope in ("TPD", "RPD"):
+            scope_text = "本日の利用上限"
+        elif limit_scope in ("TPM", "RPM"):
+            scope_text = "レート制限（短時間の利用集中）"
+        else:
+            scope_text = "レート制限"
+        await interaction.followup.send(
+            f"現在{scope_text}に引っかかっています。BOTを少し休ませてください。{wait_hint}\n"
+            "しばらく時間をおいてから、もう一度お試しください。",
+            ephemeral=True
+        )
+        return
+    except Exception as e:
+        print(f"[/reply_suggest] 応答生成エラー: {e}")
+        await interaction.followup.send("返信候補の生成に失敗しました。時間をおいて再度お試しください。", ephemeral=True)
+        return
+
+    parsed = _ai_extract_json_response(raw)
+    suggestions = []
+    if parsed:
+        suggestions = [str(s).strip() for s in parsed.get("suggestions", []) if str(s).strip()]
+
+    if not suggestions:
+        await interaction.followup.send("返信候補の生成に失敗しました。もう一度お試しください。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="返信候補",
+        description="直近の会話を踏まえたAIによる返信候補です（この結果はあなたにのみ表示されています）",
+        color=discord.Color.green()
+    )
+    for i, suggestion in enumerate(suggestions[:件数], start=1):
+        embed.add_field(name=f"候補 {i}", value=suggestion[:1000], inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 ai_chat_dm_group = app_commands.Group(name="dm", description="【オーナー限定】/ai コマンド（DM等での汎用AI質問）の管理", parent=ai_chat_group)
@@ -8330,6 +8582,103 @@ async def ai_chat_unset_channel(interaction: discord.Interaction):
         await interaction.response.send_message("AIチャット機能を無効化しました。", ephemeral=True)
     else:
         await interaction.response.send_message("このサーバーではAIチャットは設定されていません。", ephemeral=True)
+
+
+ai_chat_translate_group = app_commands.Group(
+    name="translate", description="【オーナー限定】特定チャンネルでのメッセージ自動翻訳機能の設定", parent=ai_chat_group
+)
+
+
+@ai_chat_translate_group.command(name="set_channel", description="【オーナー限定】メッセージを自動翻訳するチャンネルを設定します")
+@app_commands.describe(channel="自動翻訳の対象にするチャンネル")
+async def ai_chat_translate_set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "GROQ_API_KEY が設定されていません。Botの環境変数に設定してから再度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.send_messages or not perms.view_channel:
+        await interaction.response.send_message(
+            f"Botに {channel.mention} での発言権限がありません。チャンネル権限を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["translate_channel_id"] = channel.id
+    save_data(all_data)
+
+    secondary_lang = guild_config.get("translate_secondary_lang", "en")
+    await interaction.response.send_message(
+        f"[設定完了] {channel.mention} を自動翻訳チャンネルに設定しました。\n"
+        f"投稿者の言語を自動検出し、日本語以外なら日本語に、日本語なら `{secondary_lang}` に翻訳してembedで返信します。",
+        ephemeral=True
+    )
+
+
+@ai_chat_translate_group.command(name="unset_channel", description="【オーナー限定】メッセージ自動翻訳機能を無効化します")
+async def ai_chat_translate_unset_channel(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    had_channel = guild_config.pop("translate_channel_id", None)
+    save_data(all_data)
+
+    if had_channel:
+        await interaction.response.send_message("自動翻訳機能を無効化しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("このサーバーでは自動翻訳は設定されていません。", ephemeral=True)
+
+
+@ai_chat_translate_group.command(name="set_secondary_lang", description="【オーナー限定】投稿者が日本語で書いた場合の翻訳先言語コードを設定します")
+@app_commands.describe(言語コード="翻訳先の言語コード（例: en, ko, zh, fr など）")
+async def ai_chat_translate_set_secondary_lang(interaction: discord.Interaction, 言語コード: str):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild: return
+
+    lang_code = 言語コード.strip().lower()
+    if not lang_code or len(lang_code) > 10:
+        await interaction.response.send_message("言語コードは1〜10文字で指定してください（例: en, ko, zh）。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["translate_secondary_lang"] = lang_code
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"投稿者が日本語で書いた場合の翻訳先言語を `{lang_code}` に設定しました。", ephemeral=True
+    )
+
+
+@ai_chat_translate_group.command(name="status", description="このサーバーの自動翻訳設定を確認します")
+async def ai_chat_translate_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    channel_id = guild_config.get("translate_channel_id")
+    secondary_lang = guild_config.get("translate_secondary_lang", "en")
+
+    embed = discord.Embed(title="自動翻訳 設定状況", color=discord.Color.blue())
+    embed.add_field(
+        name="対象チャンネル",
+        value=f"<#{channel_id}>" if channel_id else "未設定（機能OFF）",
+        inline=False
+    )
+    embed.add_field(name="日本語投稿時の翻訳先", value=f"`{secondary_lang}`", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @ai_chat_group.command(name="clear_history", description="AIチャットの会話履歴をクリアします（自分の履歴、または管理者は全員分）")
