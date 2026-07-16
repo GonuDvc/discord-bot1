@@ -1938,7 +1938,7 @@ class NewspaperPublishView(discord.ui.View):
         await interaction.response.send_modal(NewspaperModal(self.target_channel, self.issue_number))
 
 
-@newspaper_group.command(name="setup", description="【管理者専用】帝国新聞を発行できる「新聞係」ロールを設定します")
+@newspaper_group.command(name="setup", description="【管理者専用】帝国新聞を発行できる「新聞係」ロールを決めておきます")
 @discord.app_commands.describe(role="新聞発行を許可するロール")
 async def newspaper_setup(interaction: discord.Interaction, role: discord.Role):
     if not await is_guild_admin(interaction):
@@ -4797,7 +4797,12 @@ AI_CHAT_SEARCH_USAGE_GUIDE = (
     "\n\nあなたには「web_search」というツールが利用可能な場合があります。"
     "自分の知識が古い可能性がある質問（最新ニュース、現在の状況、最近のリリース情報など）には"
     "積極的にこのツールを使って調べてから回答してください。"
-    "検索結果を使って回答する場合は、簡潔に情報源（サイト名程度でよい）に触れてください。"
+    "検索結果を使って回答する場合、情報源に触れるときは記事の出典サイト名"
+    "（例: 「〇〇新聞によると」「公式サイトの発表では」など、検索結果に含まれる記事自体の発信元）"
+    "のみを使ってください。"
+    "「Tavilyによると」「Exa.aiの検索結果では」のように、検索ツール自体の名称"
+    "（Tavily・Exa・Firecrawl等）を情報源として言及することは絶対にしないでください"
+    "（それらはあなたが検索に使っている裏側の仕組みであり、記事の出典ではありません）。"
 )
 
 
@@ -5411,7 +5416,17 @@ async def _web_search_fallback(query: str, max_results: int = 5, guild_config: O
             continue
         tried_any = True
         try:
-            return await search_func(query, max_results)
+            result_text = await search_func(query, max_results)
+            # 検索結果本文にツール結果として直接付与する念押し。
+            # AIが「Tavilyによると」「Exa.aiの検索結果では」のように検索ツール自体の名称を
+            # 情報源として書いてしまう不具合を防ぐため、tool結果の中にも明記しておく
+            # （システムプロンプトより優先度の高い位置に効かせる狙い）。
+            return (
+                result_text
+                + "\n\n（注: 上記は検索ツールを使って取得した結果です。回答内で情報源に触れる場合は、"
+                  "各結果に記載の記事タイトルや出典URLのサイト名を使ってください。"
+                  "検索に使用したツールやサービス名自体には言及しないでください。）"
+            )
         except Exception as e:
             print(f"[Web検索] {name} が失敗したため次のプロバイダへフォールバックします: {e}")
             continue
@@ -6447,7 +6462,7 @@ async def _ai_debate_launch(
     await interaction.followup.send(embed=embed)
 
 
-@ai_debate_group.command(name="start", description="【オーナー限定】2つの人格を設定し、AI同士の自動会話をこのチャンネルで開始します")
+@ai_debate_group.command(name="start", description="【オーナー限定】2つの人格を決めて、AI同士がこのチャンネルで会話するのを見てみます")
 @app_commands.describe(
     お題="会話のお題・シチュエーション",
     人格a名前="1人目のAIの名前（表示名）",
@@ -6500,7 +6515,7 @@ async def ai_debate_start(
     )
 
 
-@ai_debate_random_group.command(name="start", description="【オーナー限定】お題・2人格をAIにランダム生成させ、AI同士の自動会話をこのチャンネルで開始します")
+@ai_debate_random_group.command(name="start", description="【オーナー限定】お題と2つの人格をAIにおまかせで決めさせて、AI同士の会話をこのチャンネルで始めます")
 @app_commands.describe(
     発言間隔秒="次の発言までの待機秒数（既定10秒、5〜600秒）",
     最大ターン数="指定した往復数に達すると自動終了します（未指定なら無制限、stopするまで継続）",
@@ -6565,7 +6580,7 @@ async def ai_debate_random_start(
     )
 
 
-@ai_debate_group.command(name="stop", description="【オーナー限定】このチャンネルで進行中のAIディベートを停止します")
+@ai_debate_group.command(name="stop", description="【オーナー限定】このチャンネルで進んでいるAIディベートを止めます")
 async def ai_debate_stop(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -6590,7 +6605,7 @@ async def ai_debate_stop(interaction: discord.Interaction):
     )
 
 
-@ai_debate_group.command(name="status", description="現在このサーバーで実行中のAIディベートの状況を確認します")
+@ai_debate_group.command(name="status", description="今このサーバーでAIディベートが動いているか確認できます")
 async def ai_debate_status(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -6898,7 +6913,7 @@ async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict
 _AI_COMMAND_DM_GUILD_KEY = 0  # DM/グループDMからの /ai 利用時に使う疑似ギルドID（クールダウン管理用）
 
 
-@bot.tree.command(name="ai", description="AIに質問します（DM・グループDM・サーバー内どこでも使えます）")
+@bot.tree.command(name="ai", description="AIに何でも聞けます（DMでもグループDMでもサーバー内でも使えます）")
 @app_commands.describe(質問="AIに聞きたい内容を入力してください")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -7110,7 +7125,7 @@ async def _generate_image_with_fallback(prompt: str, width: int, height: int) ->
     raise last_error or RuntimeError("画像生成に失敗しました。")
 
 
-@bot.tree.command(name="image", description="AIに画像を生成させます（無料）")
+@bot.tree.command(name="image", description="AIに好きな画像を作ってもらえます（無料）")
 @app_commands.describe(
     プロンプト="生成したい画像の内容（日本語も可。具体的・詳細なほど精度が上がります）",
     横幅=f"画像の幅（ピクセル、{IMAGE_COMMAND_MIN_SIZE}〜{IMAGE_COMMAND_MAX_SIZE}、省略時は1024）",
@@ -7329,7 +7344,7 @@ async def reply_suggest_command(interaction: discord.Interaction, 件数: app_co
 ai_chat_dm_group = app_commands.Group(name="dm", description="【オーナー限定】/ai コマンド（DM等での汎用AI質問）の管理", parent=ai_chat_group)
 
 
-@ai_chat_dm_group.command(name="toggle", description="【オーナー限定】/ai コマンドの利用可否を切り替えます")
+@ai_chat_dm_group.command(name="toggle", description="【オーナー限定】/ai コマンドを使えるようにするか止めるか切り替えます")
 @app_commands.describe(状態="on: 有効化 / off: 無効化")
 @app_commands.choices(状態=[
     app_commands.Choice(name="有効にする", value="on"),
@@ -7348,7 +7363,7 @@ async def ai_chat_dm_toggle(interaction: discord.Interaction, 状態: app_comman
     )
 
 
-@ai_chat_dm_group.command(name="set_cooldown", description="【オーナー限定】/ai コマンドの連投制限（クールダウン秒数）を設定します")
+@ai_chat_dm_group.command(name="set_cooldown", description="【オーナー限定】/ai コマンドの連投を防ぐ待ち時間（秒）を決めます")
 @app_commands.describe(秒数="連投を制限する秒数（0で制限なし）")
 async def ai_chat_dm_set_cooldown(interaction: discord.Interaction, 秒数: app_commands.Range[int, 0, 3600]):
     if not await is_owner_check(interaction): return
@@ -7363,7 +7378,7 @@ async def ai_chat_dm_set_cooldown(interaction: discord.Interaction, 秒数: app_
     )
 
 
-@ai_chat_dm_group.command(name="block", description="【オーナー限定】指定ユーザーの /ai コマンド利用をブロックします")
+@ai_chat_dm_group.command(name="block", description="【オーナー限定】指定したユーザーが /ai コマンドを使えないようにします")
 @app_commands.describe(user="ブロックするユーザー")
 async def ai_chat_dm_block(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -7379,7 +7394,7 @@ async def ai_chat_dm_block(interaction: discord.Interaction, user: discord.User)
         await interaction.response.send_message(f"{user.mention} は既にブロックされています。", ephemeral=True)
 
 
-@ai_chat_dm_group.command(name="unblock", description="【オーナー限定】指定ユーザーの /ai コマンドブロックを解除します")
+@ai_chat_dm_group.command(name="unblock", description="【オーナー限定】指定したユーザーの /ai コマンド利用ブロックを解いてあげます")
 @app_commands.describe(user="ブロックを解除するユーザー")
 async def ai_chat_dm_unblock(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -7395,7 +7410,7 @@ async def ai_chat_dm_unblock(interaction: discord.Interaction, user: discord.Use
         await interaction.response.send_message(f"{user.mention} はブロックされていません。", ephemeral=True)
 
 
-@ai_chat_dm_group.command(name="status", description="/ai コマンドの現在の設定状況を確認します")
+@ai_chat_dm_group.command(name="status", description="/ai コマンドが今どんな設定になっているか見られます")
 async def ai_chat_dm_status(interaction: discord.Interaction):
     all_data = load_data()
     global_cfg = get_global_config(all_data)
@@ -7417,7 +7432,7 @@ ai_chat_bot_reply_group = app_commands.Group(
 )
 
 
-@ai_chat_bot_reply_group.command(name="toggle", description="【オーナー限定】他BOTの発言への自動応答機能そのものを有効/無効にします")
+@ai_chat_bot_reply_group.command(name="toggle", description="【オーナー限定】他のBotの発言に自動で返事する機能自体をON・OFFできます")
 @app_commands.describe(状態="on: 有効化 / off: 無効化")
 @app_commands.choices(状態=[
     app_commands.Choice(name="有効にする", value="on"),
@@ -7447,7 +7462,7 @@ async def ai_chat_bot_reply_toggle(interaction: discord.Interaction, 状態: app
     )
 
 
-@ai_chat_bot_reply_group.command(name="add", description="【オーナー限定】自動応答の対象とするBotを登録します")
+@ai_chat_bot_reply_group.command(name="add", description="【オーナー限定】自動で返事する相手として、Botを登録しておきます")
 @app_commands.describe(bot_user="反応させたい相手のBotユーザー")
 async def ai_chat_bot_reply_add(interaction: discord.Interaction, bot_user: discord.User):
     if not await is_owner_check(interaction): return
@@ -7482,7 +7497,7 @@ async def ai_chat_bot_reply_add(interaction: discord.Interaction, bot_user: disc
     )
 
 
-@ai_chat_bot_reply_group.command(name="remove", description="【オーナー限定】自動応答の対象Botを登録解除します")
+@ai_chat_bot_reply_group.command(name="remove", description="【オーナー限定】登録していたBotを自動応答の対象から外します")
 @app_commands.describe(bot_user="登録解除したい相手のBot")
 async def ai_chat_bot_reply_remove(interaction: discord.Interaction, bot_user: discord.User):
     if not await is_owner_check(interaction): return
@@ -7501,7 +7516,7 @@ async def ai_chat_bot_reply_remove(interaction: discord.Interaction, bot_user: d
     await interaction.response.send_message(f"{bot_user.mention} の登録を解除しました。", ephemeral=True)
 
 
-@ai_chat_bot_reply_group.command(name="set_max_turns", description="【オーナー限定】1つの会話連鎖で連続応答する最大ターン数を設定します（無限ループ防止）")
+@ai_chat_bot_reply_group.command(name="set_max_turns", description="【オーナー限定】Bot同士の会話が延々と続かないよう、最大何往復まで応答するか決めます")
 @app_commands.describe(ターン数="人間の発言がないまま連続で応答してよい最大回数（1〜20、既定4）")
 async def ai_chat_bot_reply_set_max_turns(interaction: discord.Interaction, ターン数: app_commands.Range[int, 1, 20]):
     if not await is_owner_check(interaction): return
@@ -7515,7 +7530,7 @@ async def ai_chat_bot_reply_set_max_turns(interaction: discord.Interaction, タ�
     await interaction.response.send_message(f"連続応答の最大ターン数を **{ターン数}回** に設定しました。", ephemeral=True)
 
 
-@ai_chat_bot_reply_group.command(name="set_cooldown", description="【オーナー限定】他BOTへ応答してから次に応答するまでの最短間隔を設定します")
+@ai_chat_bot_reply_group.command(name="set_cooldown", description="【オーナー限定】他のBotに返事してから次に返事するまで、最低どれくらい間を空けるか決めます")
 @app_commands.describe(秒数="クールダウン秒数（0で制限なし、既定15秒）")
 async def ai_chat_bot_reply_set_cooldown(interaction: discord.Interaction, 秒数: app_commands.Range[int, 0, 3600]):
     if not await is_owner_check(interaction): return
@@ -7529,7 +7544,7 @@ async def ai_chat_bot_reply_set_cooldown(interaction: discord.Interaction, 秒�
     await interaction.response.send_message(f"他BOTへの応答クールダウンを **{秒数}秒** に設定しました。", ephemeral=True)
 
 
-@ai_chat_bot_reply_group.command(name="status", description="他BOTの発言への自動応答機能の設定状況を確認します")
+@ai_chat_bot_reply_group.command(name="status", description="他のBotへの自動応答機能が今どんな設定になっているか確認できます")
 async def ai_chat_bot_reply_status(interaction: discord.Interaction):
     if not interaction.guild: return
 
@@ -8365,7 +8380,7 @@ async def sync_command_error(ctx, error):
 # 「グローバル同期」のみ利用できる。
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="sync", description="【オーナー限定】スラッシュコマンドの同期を行います")
+@bot.tree.command(name="sync", description="【オーナー限定】スラッシュコマンドをDiscordに同期し直します")
 @app_commands.describe(範囲="同期の範囲を選択してください（省略時はサーバーへ即時同期）")
 @app_commands.choices(範囲=[
     app_commands.Choice(name="このサーバーへ即時同期（テスト用・数秒で反映）", value="guild"),
@@ -8462,7 +8477,7 @@ class HelpQuickActionView(discord.ui.View):
             self.add_item(HelpQuickActionSelect(actions))
 
 
-@bot.tree.command(name="help", description="利用可能なコマンド一覧をカテゴリ別に表示します")
+@bot.tree.command(name="help", description="使えるコマンドをカテゴリごとにまとめて見せてくれます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def help_command(interaction: discord.Interaction):
@@ -8651,7 +8666,7 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=HelpQuickActionView(quick_actions), ephemeral=True)
 
 
-@my_group.command(name="scan", description="サーバー情報、または指定ユーザーの基本情報を確認します")
+@my_group.command(name="scan", description="サーバーの情報や、指定したユーザーの基本情報をさっと確認できます")
 async def my_scan(interaction: discord.Interaction, target_user: discord.User = None):
     if target_user:
         embed = discord.Embed(title="ユーザーデータスキャン結果", color=discord.Color.teal())
@@ -8682,7 +8697,7 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-@bot.tree.command(name="apology", description="セレクトメニューから謝罪文を組み立てて送信します")
+@bot.tree.command(name="apology", description="メニューから選ぶだけで謝罪文を組み立てて送ってくれます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def apology(interaction: discord.Interaction):
@@ -8696,7 +8711,7 @@ async def apology(interaction: discord.Interaction):
 
 
 
-@say_group.command(name="text", description="Botに指定したメッセージを代わりに発言させます")
+@say_group.command(name="text", description="指定したメッセージをBotに代わりに発言してもらいます")
 @app_commands.describe(
     message="Botに発言させる内容",
     reply_to_message_id="このメッセージID宛に返信（リプライ）形式で送信したい場合に指定します（省略時は通常送信）"
@@ -8810,7 +8825,7 @@ _SAY_EMBED_COLORS = {
 }
 
 
-@say_group.command(name="embed", description="Botに指定した内容でEmbedメッセージを代わりに発言させます")
+@say_group.command(name="embed", description="指定した内容でEmbedメッセージをBotに代わりに送ってもらいます")
 @app_commands.describe(
     本文="Embedの本文（説明文）",
     タイトル="Embedのタイトル（省略可）",
@@ -8922,7 +8937,7 @@ async def say_embed(
         )
 
 
-@my_group.command(name="scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャンします")
+@my_group.command(name="scan_channels", description="サーバー内のチャンネル構造とカスタム権限をひととおり洗い出します")
 async def my_scan_channels(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
@@ -8956,7 +8971,7 @@ async def my_scan_channels(interaction: discord.Interaction):
     )
 
 
-@my_group.command(name="audit_perms", description="@everyoneの権限設定をスキャンします")
+@my_group.command(name="audit_perms", description="@everyoneロールの権限設定をチェックします")
 async def my_audit_perms(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
@@ -8982,7 +8997,7 @@ async def my_audit_perms(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed, ephemeral=False)
 
 
-@my_group.command(name="check_url", description="URLの安全性をVirusTotalでチェックします")
+@my_group.command(name="check_url", description="そのURLが安全かどうかVirusTotalで調べます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def my_check_url(interaction: discord.Interaction, url: str):
@@ -9017,7 +9032,7 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
-@server_group.command(name="status", description="現在の各種機能の設定状況を確認します")
+@server_group.command(name="status", description="今このサーバーの各機能がどう設定されているか確認できます")
 async def server_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -9056,7 +9071,7 @@ async def server_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@server_group.command(name="list_users", description="使用許可リストの確認・編集を行います")
+@server_group.command(name="list_users", description="使用を許可しているユーザーのリストを見たり編集したりできます")
 async def server_list_users(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -9347,7 +9362,7 @@ async def role_permission_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@server_group.command(name="create_channel", description="新しいテキストチャンネルを作成します")
+@server_group.command(name="create_channel", description="新しいテキストチャンネルをサクッと作れます")
 async def server_create_channel(interaction: discord.Interaction, name: str, category: discord.CategoryChannel = None):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -9359,7 +9374,7 @@ async def server_create_channel(interaction: discord.Interaction, name: str, cat
         await interaction.followup.send(f"作成失敗: {e}", ephemeral=True)
 
 
-@server_group.command(name="role_bulk_create", description="【管理者専用】複数のロールをカンマ区切りで一気に作成します")
+@server_group.command(name="role_bulk_create", description="【管理者専用】カンマ区切りで名前を並べるだけで、複数のロールをまとめて作れます")
 @app_commands.describe(
     role_names="作成したいロール名をカンマ（,）区切りで入力してください（例: 初心者,中級者,上級者）",
     color="作成する全ロールに適用する色（16進数カラーコード、例: ff0000）。省略時はデフォルト色",
@@ -9439,7 +9454,7 @@ async def server_role_bulk_create(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@server_group.command(name="disable_external_apps", description="【管理者専用】サーバー内すべてのロールの『外部アプリの使用』権限をOFFにします")
+@server_group.command(name="disable_external_apps", description="【管理者専用】サーバー内の全ロールから『外部アプリの使用』権限を一括で外します")
 async def server_disable_external_apps(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -9494,7 +9509,7 @@ async def server_disable_external_apps(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@server_group.command(name="role_lockdown_channels", description="【管理者専用】指定ロールのすべてのチャンネル権限で『@everyoneメンション』『外部アプリ使用』を不可にします")
+@server_group.command(name="role_lockdown_channels", description="【管理者専用】指定したロールについて、全チャンネルで『@everyoneメンション』と『外部アプリ使用』をまとめて禁止にします")
 @app_commands.describe(role="制限を適用するロール")
 async def server_role_lockdown_channels(interaction: discord.Interaction, role: discord.Role):
     if not await is_guild_admin(interaction): return
@@ -9561,7 +9576,7 @@ async def server_role_lockdown_channels(interaction: discord.Interaction, role: 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@ai_chat_group.command(name="set_channel", description="【オーナー限定】このサーバーでAIチャットを自動応答させるチャンネルを設定します")
+@ai_chat_group.command(name="set_channel", description="【オーナー限定】AIチャットが自動で返事してくれるチャンネルを決めます")
 @app_commands.describe(channel="AIチャット専用にするチャンネル")
 async def ai_chat_set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await is_owner_check(interaction): return
@@ -9594,7 +9609,7 @@ async def ai_chat_set_channel(interaction: discord.Interaction, channel: discord
     )
 
 
-@ai_chat_group.command(name="unset_channel", description="【オーナー限定】このサーバーのAIチャット自動応答を無効化します")
+@ai_chat_group.command(name="unset_channel", description="【オーナー限定】このサーバーでのAIチャット自動応答を止めます")
 async def ai_chat_unset_channel(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -9615,7 +9630,7 @@ ai_chat_translate_group = app_commands.Group(
 )
 
 
-@ai_chat_translate_group.command(name="set_channel", description="【オーナー限定】メッセージを自動翻訳するチャンネルを設定します")
+@ai_chat_translate_group.command(name="set_channel", description="【オーナー限定】メッセージを自動で翻訳してくれるチャンネルを決めます")
 @app_commands.describe(channel="自動翻訳の対象にするチャンネル")
 async def ai_chat_translate_set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await is_owner_check(interaction): return
@@ -9649,7 +9664,7 @@ async def ai_chat_translate_set_channel(interaction: discord.Interaction, channe
     )
 
 
-@ai_chat_translate_group.command(name="unset_channel", description="【オーナー限定】メッセージ自動翻訳機能を無効化します")
+@ai_chat_translate_group.command(name="unset_channel", description="【オーナー限定】自動翻訳機能をオフにします")
 async def ai_chat_translate_unset_channel(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -9665,7 +9680,7 @@ async def ai_chat_translate_unset_channel(interaction: discord.Interaction):
         await interaction.response.send_message("このサーバーでは自動翻訳は設定されていません。", ephemeral=True)
 
 
-@ai_chat_translate_group.command(name="set_secondary_lang", description="【オーナー限定】投稿者が日本語で書いた場合の翻訳先言語コードを設定します")
+@ai_chat_translate_group.command(name="set_secondary_lang", description="【オーナー限定】日本語で投稿された時に、何語へ翻訳するか言語コードで指定します")
 @app_commands.describe(言語コード="翻訳先の言語コード（例: en, ko, zh, fr など）")
 async def ai_chat_translate_set_secondary_lang(interaction: discord.Interaction, 言語コード: str):
     if not await is_owner_check(interaction): return
@@ -9686,7 +9701,7 @@ async def ai_chat_translate_set_secondary_lang(interaction: discord.Interaction,
     )
 
 
-@ai_chat_translate_group.command(name="status", description="このサーバーの自動翻訳設定を確認します")
+@ai_chat_translate_group.command(name="status", description="このサーバーの自動翻訳が今どう設定されているか確認できます")
 async def ai_chat_translate_status(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
@@ -9707,7 +9722,7 @@ async def ai_chat_translate_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ai_chat_group.command(name="clear_history", description="AIチャットの会話履歴をクリアします（自分の履歴、または管理者は全員分）")
+@ai_chat_group.command(name="clear_history", description="AIチャットの会話履歴を消せます（自分の分だけ、管理者なら全員分もまとめて）")
 @app_commands.describe(全員分="管理者権限がある場合、このチャンネルの全ユーザーの履歴をクリアします")
 async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: bool = False):
     if not interaction.guild:
@@ -9733,7 +9748,7 @@ async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: boo
         await interaction.response.send_message("あなたのAIチャット履歴をクリアしました。", ephemeral=True)
 
 
-@ai_chat_group.command(name="pause", description="【オーナー限定】このサーバーのAIチャット自動応答を一時停止します")
+@ai_chat_group.command(name="pause", description="【オーナー限定】このサーバーのAIチャット自動応答をいったん止めます")
 async def ai_chat_pause(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -9755,7 +9770,7 @@ async def ai_chat_pause(interaction: discord.Interaction):
     )
 
 
-@ai_chat_group.command(name="resume", description="【オーナー限定】このサーバーのAIチャット自動応答の一時停止を解除します")
+@ai_chat_group.command(name="resume", description="【オーナー限定】止めていたAIチャット自動応答をまた動かします")
 async def ai_chat_resume(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -9773,7 +9788,7 @@ async def ai_chat_resume(interaction: discord.Interaction):
     await interaction.response.send_message("[再開] このサーバーのAIチャット自動応答を再開しました。", ephemeral=True)
 
 
-@ai_chat_group.command(name="set_cooldown", description="【オーナー限定】このサーバーのAIチャット連投制限（クールダウン秒数）を設定します")
+@ai_chat_group.command(name="set_cooldown", description="【オーナー限定】AIチャットの連投を防ぐ待ち時間（秒）を決めます")
 @app_commands.describe(seconds="1リクエストあたりのクールダウン秒数（0を指定すると制限を無効化）")
 async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 3600]):
     if not await is_owner_check(interaction): return
@@ -9794,7 +9809,7 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
         )
 
 
-@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使用するAIプロバイダを切り替えます")
+@ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使うAIプロバイダを切り替えられます")
 @app_commands.describe(provider="使用するAIプロバイダ。autoは既定の自動フォールバックです")
 @app_commands.choices(provider=[
     app_commands.Choice(name="auto（既定：利用状況に応じて自動切替）", value="auto"),
@@ -9890,7 +9905,7 @@ async def _ai_chat_process_guild_personality_submission(interaction: discord.Int
     )
 
 
-@ai_chat_group.command(name="set_personality", description="【オーナー限定】このサーバー全体の既定AI人格（システムプロンプト）を設定します")
+@ai_chat_group.command(name="set_personality", description="【オーナー限定】このサーバー全体で使うAIの人格（システムプロンプト）を決めます")
 @app_commands.describe(text=f"AIに与える既定の人格・対応方針の指示文（最大{AI_CHAT_GUILD_PROMPT_MAX_LENGTH}文字）。省略すると入力フォーム（Modal）が開きます")
 async def ai_chat_set_personality(interaction: discord.Interaction, text: Optional[str] = None):
     if not await is_owner_check(interaction): return
@@ -9903,7 +9918,7 @@ async def ai_chat_set_personality(interaction: discord.Interaction, text: Option
     await _ai_chat_process_guild_personality_submission(interaction, text)
 
 
-@ai_chat_group.command(name="reset_personality", description="【オーナー限定】このサーバー全体の既定AI人格をリセットし、標準の人格に戻します")
+@ai_chat_group.command(name="reset_personality", description="【オーナー限定】設定していたAIの人格をリセットして、標準の人格に戻します")
 async def ai_chat_reset_personality(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -9921,7 +9936,7 @@ async def ai_chat_reset_personality(interaction: discord.Interaction):
     await interaction.response.send_message("[リセット] このサーバーの既定AI人格を削除し、標準の人格に戻しました。", ephemeral=True)
 
 
-@ai_chat_group.command(name="show_personality", description="このサーバーの既定AI人格（システムプロンプト）を確認します")
+@ai_chat_group.command(name="show_personality", description="このサーバーで今使われているAIの人格（システムプロンプト）を確認できます")
 async def ai_chat_show_personality(interaction: discord.Interaction):
     if not interaction.guild: return
 
@@ -9939,7 +9954,7 @@ async def ai_chat_show_personality(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ai_chat_group.command(name="search_status", description="【管理者専用】AIチャットのWeb検索（最新情報取得）機能が利用可能かを確認します")
+@ai_chat_group.command(name="search_status", description="【管理者専用】AIチャットがWeb検索（最新情報の取得）を使える状態か確認できます")
 async def ai_chat_search_status(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
@@ -10024,7 +10039,7 @@ class AIChatSearchToggleView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-@ai_chat_group.command(name="set_search", description="【管理者専用】このサーバーのAIチャットWeb検索機能をボタンでON/OFF切り替えます")
+@ai_chat_group.command(name="set_search", description="【管理者専用】AIチャットのWeb検索機能を、ボタン一つでON/OFFできます")
 async def ai_chat_set_search(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
@@ -10059,17 +10074,25 @@ class AIChatSearchProviderSelect(discord.ui.Select):
     検索プロバイダの優先順位（1番目に試すプロバイダ）を選ぶセレクトメニュー。
     プロバイダ名は他Bot運営者への模倣防止のため具体名を出さず、「プロバイダ1/2/3」の
     表記で統一する（search_status等の既存表示と揃える）。
+    「auto」を選ぶとカスタム設定をクリアし、コード既定の優先順位に戻せる。
     """
-    def __init__(self, guild_id: int, current_order: list):
+    def __init__(self, guild_id: int, current_order: list, is_custom: bool):
         self.guild_id = guild_id
-        options = []
+        options = [
+            discord.SelectOption(
+                label="auto（既定の優先順位に戻す）",
+                value="auto",
+                description="このサーバー専用の設定をクリアします",
+                default=(not is_custom)
+            )
+        ]
         for i, (pid, _name, is_configured, _fn) in enumerate(_WEB_SEARCH_PROVIDERS, start=1):
             label = f"プロバイダ{i}を優先"
             options.append(discord.SelectOption(
                 label=label,
                 value=pid,
                 description="設定済み" if is_configured() else "未設定（APIキーなし）",
-                default=(len(current_order) > 0 and current_order[0] == pid)
+                default=(is_custom and len(current_order) > 0 and current_order[0] == pid)
             ))
         super().__init__(
             placeholder="最優先で使う検索プロバイダを選択...",
@@ -10084,11 +10107,28 @@ class AIChatSearchProviderSelect(discord.ui.Select):
             return
 
         chosen_pid = self.values[0]
-        remaining = [pid for pid in _WEB_SEARCH_PROVIDER_IDS if pid != chosen_pid]
-        new_order = [chosen_pid] + remaining
-
         all_data = load_data()
         guild_config = get_guild_config(all_data, str(self.guild_id))
+
+        if chosen_pid == "auto":
+            guild_config["ai_chat_search_provider_order"] = None
+            save_data(all_data)
+
+            default_order_display = "\n".join(
+                f"{i}. プロバイダ{i}"
+                for i in range(1, len(_WEB_SEARCH_PROVIDERS) + 1)
+            )
+            embed = discord.Embed(
+                title="AIチャット Web検索プロバイダの優先順位",
+                description=f"autoに戻しました。既定の優先順位が使用されます。\n\n{default_order_display}",
+                color=discord.Color.green()
+            )
+            new_view = AIChatSearchProviderView(self.guild_id, _WEB_SEARCH_PROVIDER_IDS, is_custom=False)
+            await interaction.response.edit_message(embed=embed, view=new_view)
+            return
+
+        remaining = [pid for pid in _WEB_SEARCH_PROVIDER_IDS if pid != chosen_pid]
+        new_order = [chosen_pid] + remaining
         guild_config["ai_chat_search_provider_order"] = new_order
         save_data(all_data)
 
@@ -10102,17 +10142,18 @@ class AIChatSearchProviderSelect(discord.ui.Select):
                         "先頭のプロバイダが未設定・失敗した場合、自動的に次の順位のプロバイダへフォールバックします。",
             color=discord.Color.green()
         )
-        await interaction.response.edit_message(embed=embed, view=self.view)
+        new_view = AIChatSearchProviderView(self.guild_id, new_order, is_custom=True)
+        await interaction.response.edit_message(embed=embed, view=new_view)
 
 
 class AIChatSearchProviderView(discord.ui.View):
     """検索プロバイダの優先順位切り替え用ビュー（セレクトメニュー1つ）。"""
-    def __init__(self, guild_id: int, current_order: list):
+    def __init__(self, guild_id: int, current_order: list, is_custom: bool = True):
         super().__init__(timeout=120)
-        self.add_item(AIChatSearchProviderSelect(guild_id, current_order))
+        self.add_item(AIChatSearchProviderSelect(guild_id, current_order, is_custom))
 
 
-@ai_chat_group.command(name="set_search_provider", description="【管理者専用】このサーバーで最優先に使う検索プロバイダを切り替えます")
+@ai_chat_group.command(name="set_search_provider", description="【管理者専用】検索でどのプロバイダを最優先に使うか選べます（autoを選べば既定の順番に戻せます）")
 async def ai_chat_set_search_provider(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
@@ -10128,6 +10169,7 @@ async def ai_chat_set_search_provider(interaction: discord.Interaction):
 
     all_data = load_data()
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    is_custom = bool(guild_config.get("ai_chat_search_provider_order"))
     current_order_ids = [pid for pid, _n, _c, _f in _resolve_search_provider_order(guild_config)]
 
     order_display = "\n".join(
@@ -10136,15 +10178,18 @@ async def ai_chat_set_search_provider(interaction: discord.Interaction):
     )
     embed = discord.Embed(
         title="AIチャット Web検索プロバイダの優先順位",
-        description=f"現在の優先順位:\n\n{order_display}\n\n下のメニューから最優先にしたいプロバイダを選んでください。",
+        description=(
+            f"現在の優先順位（{'カスタム設定' if is_custom else 'auto＝既定'}）:\n\n{order_display}\n\n"
+            "下のメニューから最優先にしたいプロバイダを選んでください。「auto」を選ぶと既定順に戻せます。"
+        ),
         color=discord.Color.blue()
     )
-    view = AIChatSearchProviderView(interaction.guild.id, current_order_ids)
+    view = AIChatSearchProviderView(interaction.guild.id, current_order_ids, is_custom=is_custom)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 
-@ai_chat_group.command(name="user_config", description="【オーナー限定】特定ユーザーのAIチャット設定（使用モデル・システムプロンプト）をカスタマイズします")
+@ai_chat_group.command(name="user_config", description="【オーナー限定】特定のユーザーだけAIチャットの設定（使うモデル・人格）を変えられます")
 @app_commands.describe(
     user="設定を変更するユーザー",
     model="このユーザーに使用させるモデル名（管理者向け・未指定なら変更しない）",
@@ -10205,7 +10250,7 @@ async def ai_chat_user_config(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ai_chat_group.command(name="user_block", description="【オーナー限定】特定ユーザーのAIチャット利用を禁止（ブロック）します")
+@ai_chat_group.command(name="user_block", description="【オーナー限定】特定のユーザーがAIチャットを使えないようにします")
 @app_commands.describe(user="ブロックするユーザー")
 async def ai_chat_user_block(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -10225,7 +10270,7 @@ async def ai_chat_user_block(interaction: discord.Interaction, user: discord.Use
     )
 
 
-@ai_chat_group.command(name="user_unblock", description="【オーナー限定】特定ユーザーのAIチャット利用禁止（ブロック）を解除します")
+@ai_chat_group.command(name="user_unblock", description="【オーナー限定】ブロックしていたユーザーのAIチャット利用をまた許可します")
 @app_commands.describe(user="ブロックを解除するユーザー")
 async def ai_chat_user_unblock(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -10250,7 +10295,7 @@ async def ai_chat_user_unblock(interaction: discord.Interaction, user: discord.U
     await interaction.response.send_message(f"[解除] {user.mention} のAIチャット利用禁止を解除しました。", ephemeral=True)
 
 
-@ai_chat_group.command(name="user_reset", description="【オーナー限定】特定ユーザーのAIチャット個別設定（モデル・プロンプト・ブロック）を全てリセットします")
+@ai_chat_group.command(name="user_reset", description="【オーナー限定】特定のユーザーに設定していたモデル・人格・ブロックを全部リセットします")
 @app_commands.describe(user="設定をリセットするユーザー")
 async def ai_chat_user_reset(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -10271,7 +10316,7 @@ async def ai_chat_user_reset(interaction: discord.Interaction, user: discord.Use
     await interaction.response.send_message(f"[リセット] {user.mention} のAIチャット個別設定を全てリセットしました。", ephemeral=True)
 
 
-@ai_chat_group.command(name="user_status", description="【オーナー限定】特定ユーザーのAIチャット個別設定を確認します")
+@ai_chat_group.command(name="user_status", description="【オーナー限定】特定のユーザーに設定しているAIチャット設定を確認できます")
 @app_commands.describe(user="確認するユーザー")
 async def ai_chat_user_status(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction): return
@@ -10428,7 +10473,7 @@ class AIChatOwnerPromptModal(discord.ui.Modal, title="あなた専用のAI人格
         await _ai_chat_process_my_prompt_submission(interaction, self.prompt_text.value)
 
 
-@ai_chat_my_prompt_group.command(name="set", description="自分専用のAIチャット人格設定（システムプロンプト）を登録します（最大500文字、オーナーは無制限）")
+@ai_chat_my_prompt_group.command(name="set", description="自分だけのAI人格（システムプロンプト）を登録できます（最大500文字、オーナーは文字数無制限）")
 @app_commands.describe(text="AIに与える人格・対応方針の指示文（最大500文字、オーナーは無制限）。省略すると入力フォーム（Modal）が開きます")
 async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: Optional[str] = None):
     if not interaction.guild:
@@ -10454,7 +10499,7 @@ async def ai_chat_my_prompt_set(interaction: discord.Interaction, text: Optional
     await _ai_chat_process_my_prompt_submission(interaction, text)
 
 
-@ai_chat_my_prompt_group.command(name="reset", description="自分専用のAIチャット人格設定を削除し、既定のプロンプトに戻します")
+@ai_chat_my_prompt_group.command(name="reset", description="登録していた自分専用のAI人格を削除して、既定のプロンプトに戻します")
 async def ai_chat_my_prompt_reset(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -10479,7 +10524,7 @@ async def ai_chat_my_prompt_reset(interaction: discord.Interaction):
     await interaction.response.send_message("[リセット] あなた専用の人格設定を削除し、既定の人格に戻しました。", ephemeral=True)
 
 
-@ai_chat_my_prompt_group.command(name="show", description="自分専用のAIチャット人格設定（システムプロンプト）を確認します")
+@ai_chat_my_prompt_group.command(name="show", description="今登録している自分専用のAI人格を確認できます")
 async def ai_chat_my_prompt_show(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -10504,7 +10549,7 @@ async def ai_chat_my_prompt_show(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ai_chat_summary_group.command(name="run", description="【オーナー限定】サーバー活動のAIサマリーを今すぐ生成して投稿します")
+@ai_chat_summary_group.command(name="run", description="【オーナー限定】サーバー活動のAIサマリーを、今この場で作って投稿します")
 @app_commands.describe(channel="投稿先チャンネル（省略時はこのチャンネル）")
 async def ai_chat_summary_run(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     if not await is_owner_check(interaction): return
@@ -10551,7 +10596,7 @@ async def ai_chat_summary_run(interaction: discord.Interaction, channel: Optiona
     await interaction.followup.send(f"[完了] {target_channel.mention} にサーバー活動サマリーを投稿しました。", ephemeral=True)
 
 
-@ai_chat_summary_group.command(name="config", description="【オーナー限定】サーバー活動AIサマリーの定期自動実行を設定します")
+@ai_chat_summary_group.command(name="config", description="【オーナー限定】サーバー活動のAIサマリーを定期的に自動で作らせる設定ができます")
 @app_commands.describe(
     enabled="定期自動実行を有効にするか",
     channel="投稿先チャンネル",
@@ -10621,7 +10666,7 @@ async def ai_chat_summary_config(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@ai_chat_summary_group.command(name="status", description="【オーナー限定】サーバー活動AIサマリーの現在の設定を確認します")
+@ai_chat_summary_group.command(name="status", description="【オーナー限定】サーバー活動AIサマリーが今どう設定されているか確認できます")
 async def ai_chat_summary_status(interaction: discord.Interaction):
     if not await is_owner_check(interaction): return
     if not interaction.guild: return
@@ -10650,7 +10695,7 @@ async def ai_chat_summary_status(interaction: discord.Interaction):
 
 
 
-@server_group.command(name="role_panel", description="【管理者専用】指定ロールを取得できるボタン付きパネルを設置します")
+@server_group.command(name="role_panel", description="【管理者専用】ボタンを押すと指定したロールがもらえるパネルを設置できます")
 @discord.app_commands.describe(
     title="パネルのタイトル",
     description="パネルの説明文",
@@ -10692,7 +10737,7 @@ async def server_role_panel(
     await interaction.followup.send(f"ロールパネルを設置しました（{len(roles)}個のロール）。", ephemeral=True)
 
 
-@server_forward_group.command(name="setup", description="メッセージ転送元のチャンネルと転送先を設定します")
+@server_forward_group.command(name="setup", description="メッセージをどこからどこへ転送するか、チャンネルを決めておきます")
 async def server_forward_setup(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10703,7 +10748,7 @@ async def server_forward_setup(interaction: discord.Interaction, from_channel: d
     await interaction.response.send_message("転送設定を保存しました。", ephemeral=True)
 
 
-@server_forward_group.command(name="reset", description="チャンネルの転送設定を解除します")
+@server_forward_group.command(name="reset", description="設定していたメッセージ転送をやめます")
 async def server_forward_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10714,7 +10759,7 @@ async def server_forward_reset(interaction: discord.Interaction):
     await interaction.response.send_message("転送設定を解除しました。", ephemeral=True)
 
 
-@server_announce_group.command(name="setup", description="お知らせ用のチャンネルとロールを設定します")
+@server_announce_group.command(name="setup", description="お知らせを送るチャンネルと、メンションするロールを決めておきます")
 async def server_announce_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10725,7 +10770,7 @@ async def server_announce_setup(interaction: discord.Interaction, channel: disco
     await interaction.response.send_message("お知らせ設定を保存しました。", ephemeral=True)
 
 
-@server_announce_group.command(name="send", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
+@server_announce_group.command(name="send", description="設定済みのチャンネルへ、ロールメンション付きでお知らせを送ります")
 async def server_announce_send(interaction: discord.Interaction, message: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10740,7 +10785,7 @@ async def server_announce_send(interaction: discord.Interaction, message: str):
         await interaction.response.send_message("設定が不完全です。", ephemeral=True)
 
 
-@server_verify_group.command(name="setup", description="認証用ロールと送信チャンネルを設定します")
+@server_verify_group.command(name="setup", description="認証で付与するロールと、パネルを送るチャンネルを決めておきます")
 async def server_verify_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10751,7 +10796,7 @@ async def server_verify_setup(interaction: discord.Interaction, channel: discord
     await interaction.response.send_message("認証設定を保存しました。", ephemeral=True)
 
 
-@server_verify_group.command(name="btn", description="設定されたチャンネルに認証用ボタンパネルを送信します")
+@server_verify_group.command(name="btn", description="設定済みのチャンネルに、認証用のボタンパネルを送ります")
 async def server_verify_btn(interaction: discord.Interaction, title: str = "サーバー認証", description: str = "ボタンを押すと認証が完了します。", image_file: discord.Attachment = None):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10776,7 +10821,7 @@ async def server_verify_btn(interaction: discord.Interaction, title: str = "サ�
     await interaction.followup.send("認証パネルを送信しました。", ephemeral=True)
 
 
-@server_mention_group.command(name="setup", description="指定chへの投稿時、指定メッセージ＆指定ロールで元の文章を含めて返信（Reply）します")
+@server_mention_group.command(name="setup", description="指定したチャンネルに投稿があった時、元の文章を引用しつつ指定メッセージ＆ロールで返信します")
 async def server_mention_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role, text: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10800,7 +10845,7 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@server_mention_group.command(name="reset", description="自動ロールメンションの監視・返信設定を解除します")
+@server_mention_group.command(name="reset", description="設定していた自動ロールメンションの監視と返信をやめます")
 async def server_mention_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10817,7 +10862,7 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@server_hiroyuki_group.command(name="setup", description="【管理者専用】指定チャンネルでひろゆき構文が発動するように設定します")
+@server_hiroyuki_group.command(name="setup", description="【管理者専用】指定したチャンネルで、ひろゆき構文が発動するようにします")
 @app_commands.describe(
     channel="ひろゆき構文の対象にするチャンネル",
     mode="発動モード（ランダム発動 / NGワード検知時のみ発動）",
@@ -10871,7 +10916,7 @@ async def server_hiroyuki_setup(
         await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@server_hiroyuki_group.command(name="reset", description="【管理者専用】ひろゆき構文（全モード）の設定を解除（OFF）します")
+@server_hiroyuki_group.command(name="reset", description="【管理者専用】ひろゆき構文の設定を全モードまとめてOFFにします")
 async def server_hiroyuki_reset(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10892,7 +10937,7 @@ async def server_hiroyuki_reset(interaction: discord.Interaction):
 hiroyuki_ngword_group = app_commands.Group(name="hiroyuki_ngword", description="【管理者専用】ひろゆき構文NGワード検知モードの単語を管理")
 
 
-@hiroyuki_ngword_group.command(name="add", description="ひろゆき構文が反応するNGワードを追加します")
+@hiroyuki_ngword_group.command(name="add", description="ひろゆき構文が反応するNGワードを新しく追加できます")
 async def hiroyuki_ngword_add(interaction: discord.Interaction, word: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10905,7 +10950,7 @@ async def hiroyuki_ngword_add(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"NGワード「{word}」を追加しました。（登録数: {len(ng_words)}件）", ephemeral=True)
 
 
-@hiroyuki_ngword_group.command(name="remove", description="ひろゆき構文のNGワードを削除します")
+@hiroyuki_ngword_group.command(name="remove", description="登録済みのNGワードを削除できます")
 async def hiroyuki_ngword_remove(interaction: discord.Interaction, word: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10921,7 +10966,7 @@ async def hiroyuki_ngword_remove(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"NGワード「{word}」を削除しました。（登録数: {len(ng_words)}件）", ephemeral=True)
 
 
-@hiroyuki_ngword_group.command(name="list", description="登録済みのひろゆき構文NGワード一覧を表示します")
+@hiroyuki_ngword_group.command(name="list", description="今登録されているNGワードの一覧を見られます")
 async def hiroyuki_ngword_list(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10935,7 +10980,7 @@ async def hiroyuki_ngword_list(interaction: discord.Interaction):
     await interaction.response.send_message(f"登録済みNGワード（{len(ng_words)}件）:\n{text}", ephemeral=True)
 
 
-@hiroyuki_ngword_group.command(name="setreply", description="NGワード検知時にひろゆき構文が返す固定メッセージを変更します")
+@hiroyuki_ngword_group.command(name="setreply", description="NGワードを検知した時にひろゆき構文が返す固定メッセージを変えられます")
 async def hiroyuki_ngword_setreply(interaction: discord.Interaction, text: str):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10949,7 +10994,7 @@ async def hiroyuki_ngword_setreply(interaction: discord.Interaction, text: str):
 bot.tree.add_command(hiroyuki_ngword_group)
 
 
-@server_config_group.command(name="backup", description="サーバーのロール・チャンネル構成・権限設定をJSONファイルとしてバックアップします")
+@server_config_group.command(name="backup", description="サーバーのロール・チャンネル・権限設定をまるごとJSONファイルに保存できます")
 async def server_backup(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -10997,7 +11042,7 @@ async def server_backup(interaction: discord.Interaction):
     print(f"[バックアップ] {interaction.guild.name} のバックアップを作成しました (by {interaction.user})")
 
 
-@server_config_group.command(name="restore", description="バックアップJSONを添付してサーバー構成を復元します")
+@server_config_group.command(name="restore", description="バックアップしたJSONファイルを添付して、サーバー構成を元に戻せます")
 async def server_restore(interaction: discord.Interaction, backup_file: discord.Attachment):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
@@ -11056,7 +11101,7 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
     print(f"[リストア確認] {interaction.guild.name} でリストア確認画面を表示 (by {interaction.user})")
 
 
-@server_config_group.command(name="copy", description="【許可制】指定した別のサーバーの構成（ロール・チャンネル等）をこのサーバーに上書きコピーします")
+@server_config_group.command(name="copy", description="【許可制】別のサーバーの構成（ロール・チャンネルなど）を、このサーバーにそっくりコピーします")
 async def server_copy(interaction: discord.Interaction, コピー元のサーバーid: str):
     if not await is_trusted_user(interaction):
         return
@@ -11111,7 +11156,7 @@ async def server_copy(interaction: discord.Interaction, コピー元のサーバ
     print(f"[サーバーコピー確認] {interaction.guild.name} でコピー確認画面を表示 (by {interaction.user})")
 
 
-@antinuke_group.command(name="toggle", description="不審な連続操作の自動検出をON/OFFします")
+@antinuke_group.command(name="toggle", description="怪しい連続操作を自動で見張る機能をON/OFFできます")
 @discord.app_commands.choices(状態=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -11136,7 +11181,7 @@ async def antinuke(interaction: discord.Interaction, 状態: discord.app_command
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@antinuke_group.command(name="level", description="検出時の対応レベルを設定します（ロール剥奪 or BAN）")
+@antinuke_group.command(name="level", description="怪しい操作を検出した時、ロールを剥奪するかBANするか決めておきます")
 @discord.app_commands.choices(対応=[
     discord.app_commands.Choice(name="ロール剥奪のみ（推奨）", value="role_strip"),
     discord.app_commands.Choice(name="BANを試行する", value="ban"),
@@ -11153,7 +11198,7 @@ async def antinuke_level(interaction: discord.Interaction, 対応: discord.app_c
     await interaction.response.send_message(f"対応レベルを「{対応.name}」に設定しました。", ephemeral=True)
 
 
-@antinuke_group.command(name="threshold", description="何秒間に何回の操作で検出するかを設定します（デフォルト: 10秒で3回）")
+@antinuke_group.command(name="threshold", description="何秒間に何回操作したら検出するか、しきい値を決められます（デフォルトは10秒で3回）")
 async def antinuke_threshold(
     interaction: discord.Interaction,
     回数: app_commands.Range[int, 1, 50],
@@ -11175,7 +11220,7 @@ async def antinuke_threshold(
     )
 
 
-@antinuke_group.command(name="notify", description="通知先チャンネルと、検出から除外するロールを設定します")
+@antinuke_group.command(name="notify", description="検出時の通知先チャンネルと、対象から外したいロールを設定できます")
 async def antinuke_notify(
     interaction: discord.Interaction,
     通知先チャンネル: discord.TextChannel = None,
@@ -11213,7 +11258,7 @@ async def antinuke_notify(
     await interaction.response.send_message("\n".join(changed), ephemeral=True)
 
 
-@antinuke_group.command(name="status", description="現在のantinuke設定状況を確認します")
+@antinuke_group.command(name="status", description="antinuke機能が今どう設定されているか確認できます")
 async def antinuke_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction):
         return
@@ -11226,7 +11271,7 @@ async def antinuke_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@server_protect_group.command(name="role_channel_mute", description="【管理者専用】指定ロールの、指定した複数チャンネルでの発言・スレッド作成権限をまとめてOFFにします")
+@server_protect_group.command(name="role_channel_mute", description="【管理者専用】指定したロールの発言・スレッド作成権限を、複数チャンネルまとめてOFFにできます")
 @discord.app_commands.describe(
     role="発言・スレッド作成を禁止するロール",
     channel1="対象チャンネル1（必須）",
@@ -11291,7 +11336,7 @@ async def role_channel_mute(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@server_protect_group.command(name="arasi_setup", description="【管理者専用】荒らし対策：隔離ロール作成＋新規ロールの権限自動制限を設定します")
+@server_protect_group.command(name="arasi_setup", description="【管理者専用】荒らし対策として、隔離ロールの作成と新規ロールの権限自動制限をまとめて設定します")
 @discord.app_commands.describe(
     隔離ロール名="作成する隔離ロールの名前（未指定時は「隔離」）。既に同名ロールがあれば再利用します",
     認証チャンネル="隔離ロールでも閲覧を許可するチャンネル（認証用チャンネルなど。任意）",
@@ -11396,7 +11441,7 @@ async def arasi_setup(
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-@moderation_group.command(name="warn", description="【モデレーター専用】ユーザーに警告を与えます")
+@moderation_group.command(name="warn", description="【モデレーター専用】ユーザーに警告を出せます")
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -11413,7 +11458,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
         pass
 
 
-@moderation_group.command(name="warnings", description="【モデレーター専用】ユーザーの警告履歴を確認します")
+@moderation_group.command(name="warnings", description="【モデレーター専用】そのユーザーが今まで受けた警告を確認できます")
 async def warnings(interaction: discord.Interaction, user: discord.Member):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -11429,7 +11474,7 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@moderation_group.command(name="mute", description="【モデレーター専用】ユーザーを一時的にミュート（タイムアウト）します")
+@moderation_group.command(name="mute", description="【モデレーター専用】ユーザーを一定時間ミュート（タイムアウト）できます")
 async def mute(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -11481,7 +11526,7 @@ class BanTrollListView(discord.ui.View):
         )
 
 
-@moderation_group.command(name="ban", description="【モデレーター専用】ユーザーをBANします")
+@moderation_group.command(name="ban", description="【モデレーター専用】ユーザーをBANできます")
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -11497,7 +11542,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
         await interaction.response.send_message("権限が不足しているためBANできません。", ephemeral=True)
 
 
-@moderation_group.command(name="kick", description="【モデレーター専用】ユーザーをキックします")
+@moderation_group.command(name="kick", description="【モデレーター専用】ユーザーをキックできます")
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
@@ -11507,7 +11552,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: s
         await interaction.response.send_message("権限が不足しているためキックできません。", ephemeral=True)
 
 
-@moderation_group.command(name="purge", description="【モデレーター専用】現在のチャンネルのメッセージを一括削除します")
+@moderation_group.command(name="purge", description="【モデレーター専用】今いるチャンネルのメッセージをまとめて削除できます")
 async def purge(interaction: discord.Interaction, amount: int):
     if not await is_moderator(interaction): return
     if amount < 1 or amount > 100:
@@ -11521,7 +11566,7 @@ async def purge(interaction: discord.Interaction, amount: int):
         await interaction.followup.send("権限が不足しているため削除できません。", ephemeral=True)
 
 
-@moderation_group.command(name="purge_user", description="【モデレーター専用】指定チャンネル内の指定メンバーのメッセージを一括削除します")
+@moderation_group.command(name="purge_user", description="【モデレーター専用】指定したチャンネルで、指定したメンバーのメッセージだけまとめて削除します")
 @app_commands.describe(
     member="メッセージを削除する対象メンバー",
     channel="対象チャンネル（省略時は現在のチャンネル）",
@@ -11659,7 +11704,7 @@ class PurgeExternalAppsAllChannelsConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="キャンセルしました。", view=self)
 
 
-@moderation_group.command(name="purge_external_apps", description="【モデレーター専用】外部アプリ（他Bot）のコマンド実行によって送信されたメッセージを一括削除します")
+@moderation_group.command(name="purge_external_apps", description="【モデレーター専用】他Botのコマンド実行で送られたメッセージをまとめて削除します")
 @app_commands.describe(
     channel="対象チャンネル（省略時は現在のチャンネル）",
     all_channels="Trueにするとサーバー内の全テキストチャンネルを対象にします（channel指定より優先、実行前に確認あり）",
@@ -11744,7 +11789,7 @@ async def purge_external_apps(
         await interaction.followup.send(f"削除中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@automod_group.command(name="toggle", description="【モデレーター専用】自動モデレーションのON/OFFを切り替えます")
+@automod_group.command(name="toggle", description="【モデレーター専用】自動モデレーションをON/OFF切り替えできます")
 @discord.app_commands.choices(機能=[
     discord.app_commands.Choice(name="スパム検知", value="spam"),
     discord.app_commands.Choice(name="招待リンク削除", value="invite"),
@@ -11778,7 +11823,7 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
     )
 
 
-@automod_group.command(name="ngword_add", description="【モデレーター専用】NGワードを追加します")
+@automod_group.command(name="ngword_add", description="【モデレーター専用】NGワードを新しく登録できます")
 async def automod_ngword_add(interaction: discord.Interaction, word: str):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -11790,7 +11835,7 @@ async def automod_ngword_add(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"[追加] NGワードに「{word}」を追加しました。", ephemeral=True)
 
 
-@automod_group.command(name="ngword_remove", description="【モデレーター専用】NGワードを削除します")
+@automod_group.command(name="ngword_remove", description="【モデレーター専用】登録済みのNGワードを削除できます")
 async def automod_ngword_remove(interaction: discord.Interaction, word: str):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -11802,7 +11847,7 @@ async def automod_ngword_remove(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"[削除] NGワードから「{word}」を削除しました。", ephemeral=True)
 
 
-@automod_group.command(name="modlog_set", description="【モデレーター専用】監査ログの出力先チャンネルを設定します")
+@automod_group.command(name="modlog_set", description="【モデレーター専用】監査ログを送るチャンネルを決めておきます")
 async def modlog_set(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not await is_moderator(interaction): return
     all_data = load_data()
@@ -11817,7 +11862,7 @@ async def modlog_set(interaction: discord.Interaction, channel: discord.TextChan
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@owner_group.command(name="status", description="【オーナー限定】Botの視聴中ステータスの文字を変更、またはローテーション表示に戻します（reset指定）")
+@owner_group.command(name="status", description="【オーナー限定】Botの「視聴中」ステータス文言を変えたり、resetを指定して元のローテーション表示に戻したりできます")
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
@@ -11839,7 +11884,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@owner_group.command(name="guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
+@owner_group.command(name="guilds", description="【オーナー限定】Botが入っているサーバー一覧を見て、好きなサーバーから脱退できます")
 async def owner_guilds(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -11852,7 +11897,7 @@ async def owner_guilds(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@owner_group.command(name="guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
+@owner_group.command(name="guild_detail", description="【オーナー限定】サーバーの詳しい情報と招待リンクを取得できます")
 async def owner_guild_detail(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -11869,7 +11914,7 @@ async def owner_guild_detail(interaction: discord.Interaction):
     )
 
 
-@owner_group.command(name="broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します")
+@owner_group.command(name="broadcast", description="【オーナー限定】指定したサーバーへ、Embed形式でお知らせを一斉送信できます")
 async def owner_broadcast(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -11885,7 +11930,7 @@ async def owner_broadcast(interaction: discord.Interaction):
     )
 
 
-@owner_trust_group.command(name="add", description="【オーナー限定】強力なコマンドを実行できる信頼ユーザーを追加します")
+@owner_trust_group.command(name="add", description="【オーナー限定】強い権限のコマンドを任せられる、信頼ユーザーを追加できます")
 async def owner_trust_add(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction):
         return
@@ -11900,7 +11945,7 @@ async def owner_trust_add(interaction: discord.Interaction, user: discord.User):
     await interaction.response.send_message(f"{user.mention} を信頼リストに追加しました。", ephemeral=True)
 
 
-@owner_trust_group.command(name="remove", description="【オーナー限定】信頼ユーザーリストから削除します")
+@owner_trust_group.command(name="remove", description="【オーナー限定】信頼ユーザーリストからユーザーを外せます")
 async def owner_trust_remove(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction):
         return
@@ -11915,7 +11960,7 @@ async def owner_trust_remove(interaction: discord.Interaction, user: discord.Use
     await interaction.response.send_message(f"{user.mention} を信頼リストから削除しました。", ephemeral=True)
 
 
-@owner_trust_group.command(name="list", description="【オーナー限定】現在の信頼ユーザー一覧を表示します")
+@owner_trust_group.command(name="list", description="【オーナー限定】今の信頼ユーザー一覧を見られます")
 async def owner_trust_list(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -12074,7 +12119,7 @@ async def owner_set_avatar(
 # /moderation slowmode
 # --------------------------------------------------------------------
 
-@moderation_group.command(name="slowmode", description="【モデレーター専用】チャンネルのスロウモードを設定・解除します")
+@moderation_group.command(name="slowmode", description="【モデレーター専用】チャンネルのスロウモードを設定したり解除したりできます")
 async def slowmode(
     interaction: discord.Interaction,
     秒数: app_commands.Range[int, 0, 21600],
@@ -12175,7 +12220,7 @@ def _build_result_embed(record: dict, *, title: str = "[STATS] 現在の投票�
     return embed
 
 
-@bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能）")
+@bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作れます（サーバーでもDMでもグループDMでも使えます）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def poll(
@@ -12368,7 +12413,7 @@ class PollView(discord.ui.View):
 # /server protect welcome_setup — ウェルカムメッセージ設定
 # --------------------------------------------------------------------
 
-@server_protect_group.command(name="welcome_setup", description="【管理者専用】メンバー参加時のウェルカムメッセージを設定します")
+@server_protect_group.command(name="welcome_setup", description="【管理者専用】新しいメンバーが参加した時のウェルカムメッセージを設定できます")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="設定する", value="set"),
     discord.app_commands.Choice(name="解除する", value="reset"),
@@ -12509,7 +12554,7 @@ async def _stats_loop(guild: discord.Guild):
         await asyncio.sleep(300)  # 5分ごとに更新
 
 
-@server_group.command(name="stats", description="【管理者専用】サーバー統計をリアルタイムでチャンネル名に表示します")
+@server_group.command(name="stats", description="【管理者専用】サーバーの統計情報をチャンネル名にリアルタイムで表示できます")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="設定する（カテゴリを指定）", value="set"),
     discord.app_commands.Choice(name="解除する", value="reset"),
@@ -12672,7 +12717,7 @@ async def server_stats(
 # /owner_dm send — 特定ユーザーへのDM送信
 # --------------------------------------------------------------------
 
-@owner_dm_group.command(name="send", description="【オーナー・許可ユーザー専用】指定したユーザーにBotからDMを送信します")
+@owner_dm_group.command(name="send", description="【オーナー・許可ユーザー専用】指定したユーザーへBotからDMを送れます")
 async def dm_user(
     interaction: discord.Interaction,
     ユーザー: discord.User,
@@ -12734,7 +12779,7 @@ async def dm_user(
         await _send_mod_log(interaction.guild, log_embed)
 
 
-@owner_dm_group.command(name="purge", description="【オーナー・許可ユーザー専用】指定したユーザーとのDMでBotが送信したメッセージをすべて削除します")
+@owner_dm_group.command(name="purge", description="【オーナー・許可ユーザー専用】そのユーザーとのDMでBotが送ったメッセージをまとめて削除できます")
 @app_commands.describe(
     ユーザー="対象ユーザー（Botと過去にDMのやり取りがある相手のみ指定可能）",
     件数="遡って確認するメッセージ件数（1〜1000、既定200）"
@@ -12812,7 +12857,7 @@ async def dm_purge(
 #      名前を渡す方式にしています）
 # ====================================================================
 
-@customtrigger_group.command(name="add", description="【オーナー限定】特定の単語に自動返信するカスタムトリガーを追加します")
+@customtrigger_group.command(name="add", description="【オーナー限定】特定の単語に反応して自動返信する、カスタムトリガーを追加できます")
 @discord.app_commands.choices(一致方法=[
     discord.app_commands.Choice(name="部分一致（文章にこの単語が含まれていれば反応）", value="contains"),
     discord.app_commands.Choice(name="完全一致（メッセージ全体がこの単語と同じ場合のみ反応）", value="exact"),
@@ -12860,7 +12905,7 @@ async def customtrigger_add(
     )
 
 
-@customtrigger_group.command(name="remove", description="【オーナー限定】登録済みのカスタムトリガーを選択して削除します")
+@customtrigger_group.command(name="remove", description="【オーナー限定】登録済みのカスタムトリガーから選んで削除できます")
 async def customtrigger_remove(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -12879,7 +12924,7 @@ async def customtrigger_remove(interaction: discord.Interaction):
     await interaction.response.send_message("削除したいカスタムトリガーをメニューから選んでください：", view=view, ephemeral=True)
 
 
-@customtrigger_group.command(name="list", description="【オーナー限定】登録済みのカスタムトリガー一覧を表示します")
+@customtrigger_group.command(name="list", description="【オーナー限定】今登録されているカスタムトリガーの一覧を見られます")
 async def customtrigger_list(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -12909,7 +12954,7 @@ async def customtrigger_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@customcmd_manage_group.command(name="add", description="【オーナー限定】「/customcmd 名前」で動くカスタムコマンドを追加します")
+@customcmd_manage_group.command(name="add", description="【オーナー限定】「/customcmd 名前」で呼び出せるカスタムコマンドを追加できます")
 async def customcmd_add(interaction: discord.Interaction, 名前: str, 返信内容: str):
     if not await is_owner_check(interaction):
         return
@@ -12943,7 +12988,7 @@ async def customcmd_add(interaction: discord.Interaction, 名前: str, 返信内
         )
 
 
-@customcmd_manage_group.command(name="remove", description="【オーナー限定】登録済みのカスタムコマンドを選択して削除します")
+@customcmd_manage_group.command(name="remove", description="【オーナー限定】登録済みのカスタムコマンドから選んで削除できます")
 async def customcmd_remove(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -12962,7 +13007,7 @@ async def customcmd_remove(interaction: discord.Interaction):
     await interaction.response.send_message("削除したいカスタムコマンドをメニューから選んでください：", view=view, ephemeral=True)
 
 
-@customcmd_manage_group.command(name="list", description="【オーナー限定】登録済みのカスタムコマンド一覧を表示します")
+@customcmd_manage_group.command(name="list", description="【オーナー限定】今登録されているカスタムコマンドの一覧を見られます")
 async def customcmd_list(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -13002,7 +13047,7 @@ async def customcmd_name_autocomplete(interaction: discord.Interaction, current:
     ]
 
 
-@bot.tree.command(name="customcmd", description="登録されたカスタムコマンドを実行します")
+@bot.tree.command(name="customcmd", description="登録済みのカスタムコマンドを実行できます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.autocomplete(名前=customcmd_name_autocomplete)
@@ -13428,7 +13473,7 @@ async def _ensure_voice_connected(interaction: discord.Interaction) -> discord.V
     return voice_client
 
 
-@voice_group.command(name="join", description="あなたが参加しているボイスチャンネルにBotを参加させます")
+@voice_group.command(name="join", description="今あなたがいるボイスチャンネルにBotを呼べます")
 async def voice_join(interaction: discord.Interaction):
     voice_client = await _ensure_voice_connected(interaction)
     if voice_client is None:
@@ -13436,7 +13481,7 @@ async def voice_join(interaction: discord.Interaction):
     await interaction.response.send_message(f"{voice_client.channel.mention} に参加しました。", ephemeral=True)
 
 
-@voice_group.command(name="leave", description="ボイスチャンネルからBotを退出させます")
+@voice_group.command(name="leave", description="ボイスチャンネルからBotを退出させられます")
 async def voice_leave(interaction: discord.Interaction):
     if not interaction.guild or not interaction.guild.voice_client:
         await interaction.response.send_message("Botは現在どのボイスチャンネルにも参加していません。", ephemeral=True)
@@ -13446,7 +13491,7 @@ async def voice_leave(interaction: discord.Interaction):
     await interaction.response.send_message(f"「{channel_name}」から退出しました。", ephemeral=True)
 
 
-@voice_group.command(name="play", description="ボイスチャンネルで音声ファイルを再生します（添付または登録済み音源）")
+@voice_group.command(name="play", description="ボイスチャンネルで音声を再生できます（ファイル添付でも、登録済みの音源でもOK）")
 async def voice_play(
     interaction: discord.Interaction,
     添付ファイル: discord.Attachment = None,
@@ -13605,7 +13650,7 @@ async def voice_play(
     )
 
 
-@voice_sound_group.command(name="add", description="サーバーで使い回せる音源を名前付きで登録します（誰でも使用可能）")
+@voice_sound_group.command(name="add", description="サーバーで使い回せる音源を、名前を付けて登録できます（誰でも使えます）")
 async def voice_sound_add(interaction: discord.Interaction, 登録名: str, ファイル: discord.Attachment):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -13653,7 +13698,7 @@ async def voice_sound_add(interaction: discord.Interaction, 登録名: str, フ�
         )
 
 
-@voice_sound_group.command(name="remove", description="【オーナー限定】登録済みの音源を削除します")
+@voice_sound_group.command(name="remove", description="【オーナー限定】登録済みの音源を削除できます")
 async def voice_sound_remove(interaction: discord.Interaction, 登録名: str):
     if not await is_owner_check(interaction):
         return
@@ -13678,7 +13723,7 @@ async def voice_sound_remove(interaction: discord.Interaction, 登録名: str):
     await interaction.response.send_message(f"登録名「{登録名}」を削除しました。", ephemeral=True)
 
 
-@voice_sound_group.command(name="list", description="登録済みの音源一覧を表示します")
+@voice_sound_group.command(name="list", description="今登録されている音源の一覧を見られます")
 async def voice_sound_list(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -13740,7 +13785,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # セクション 11: eval コマンド（オーナー限定・コード実行）
 # ====================================================================
 
-@owner_group.command(name="eval", description="【オーナー限定】Pythonコードを実行して結果を返します")
+@owner_group.command(name="eval", description="【オーナー限定】Pythonコードをその場で実行して、結果を返してくれます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def eval_command(interaction: discord.Interaction, コード: str):
@@ -13867,7 +13912,7 @@ async def eval_command(interaction: discord.Interaction, コード: str):
 # /calc — 数式計算
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="calc", description="数式を計算して結果を返します")
+@bot.tree.command(name="calc", description="数式を入力すると計算して答えを返してくれます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
 async def calc(interaction: discord.Interaction, 数式: str):
@@ -14198,7 +14243,7 @@ async def _run_giveaway(channel: discord.TextChannel, message_id: int, guild_id:
         _giveaway_tasks.pop(message_id, None)
 
 
-@bot.tree.command(name="giveaway", description="【管理者専用】プレゼント企画を開始します")
+@bot.tree.command(name="giveaway", description="【管理者専用】プレゼント企画をこの場で始められます")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="開始する", value="start"),
     discord.app_commands.Choice(name="終了する（即時抽選）", value="end"),
@@ -14307,7 +14352,7 @@ async def giveaway(
 # /server protect alt_check — 新規アカウント検知設定
 # --------------------------------------------------------------------
 
-@server_protect_group.command(name="alt_check", description="【管理者専用】新規アカウント（垢BAN逃れ）の自動検知を設定します")
+@server_protect_group.command(name="alt_check", description="【管理者専用】作られたばかりのアカウント（垢BAN逃れの疑いがあるもの）を自動で検知する設定ができます")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -14371,7 +14416,7 @@ async def alt_check(
 # /server protect iplogger_check — IPロガー自動検知設定
 # --------------------------------------------------------------------
 
-@server_protect_group.command(name="iplogger_check", description="【管理者専用】IPロガー・フィッシングリンクの自動検知・削除を設定します")
+@server_protect_group.command(name="iplogger_check", description="【管理者専用】IPロガーやフィッシングリンクを自動で見つけて削除する設定ができます")
 @discord.app_commands.choices(状態=[
     discord.app_commands.Choice(name="有効にする", value="on"),
     discord.app_commands.Choice(name="無効にする", value="off"),
@@ -14403,7 +14448,7 @@ async def iplogger_check(interaction: discord.Interaction, 状態: discord.app_c
 # /server protect ip_ban_check — ウェブ認証を利用したBAN逃れ（IP）対策
 # --------------------------------------------------------------------
 
-@server_protect_group.command(name="ip_ban_check", description="【管理者専用】ウェブ認証を利用したBAN逃れ対策（同一IP検知）を設定します")
+@server_protect_group.command(name="ip_ban_check", description="【管理者専用】ウェブ認証を使って、同じIPからのBAN逃れを検知する対策を設定できます")
 @app_commands.describe(
     操作="有効化 / 無効化 / 現在の設定確認",
     アクション="同一IPを検知した際の処置（onの場合のみ）"
@@ -15070,7 +15115,7 @@ class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
         await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
 
 
-@embed_group.command(name="builder", description="【管理者専用】GUIでEmbedメッセージを作成してチャンネルに送信します")
+@embed_group.command(name="builder", description="【管理者専用】画面上でEmbedメッセージを組み立てて、チャンネルに送信できます")
 async def embed_builder(
     interaction: discord.Interaction,
     送信先チャンネル: discord.TextChannel = None,
@@ -15121,7 +15166,7 @@ def _format_currency(guild_config: dict, amount: int) -> str:
 # /economy setup — 経済システムの有効化・各種パラメータ設定
 # --------------------------------------------------------------------
 
-@economy_group.command(name="setup", description="【管理者専用】通貨システム（メッセージ報酬・workコマンド）を設定します")
+@economy_group.command(name="setup", description="【管理者専用】メッセージ報酬やworkコマンドなど、通貨システムまわりを設定できます")
 @discord.app_commands.describe(
     有効化="経済システムを有効化するか",
     通貨名="表示する通貨の名前（例: コイン、ポイント）",
@@ -15216,7 +15261,7 @@ async def economy_setup(
 # /balance — 所持金確認（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@economy_group.command(name="balance", description="自分または指定したユーザーのMコイン所持金（財布・銀行）を確認します")
+@economy_group.command(name="balance", description="自分や、指定したユーザーが今いくらMコインを持っているか（財布・銀行）確認できます")
 async def balance(interaction: discord.Interaction, ユーザー: discord.Member = None):
     target = ユーザー or interaction.user
     all_data = load_data()
@@ -15240,7 +15285,7 @@ async def balance(interaction: discord.Interaction, ユーザー: discord.Member
 # /work — 全サーバー共通クールダウンでMコインを稼ぐ
 # --------------------------------------------------------------------
 
-@economy_group.command(name="work", description="働いてMコインを稼ぎます（2時間ごとに1回・全サーバー共通）")
+@economy_group.command(name="work", description="働いてMコインを稼げます（2時間に1回まで、全サーバー共通のクールダウンです）")
 async def work(interaction: discord.Interaction):
     all_data = load_data()
 
@@ -15313,7 +15358,7 @@ async def work(interaction: discord.Interaction):
 # /economy give — オーナーによる手動付与・没収（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@economy_group.command(name="give", description="【オーナー専用】指定ユーザーのMコイン（財布）を増減させます")
+@economy_group.command(name="give", description="【オーナー専用】指定したユーザーのMコイン（財布）を増やしたり減らしたりできます")
 @discord.app_commands.describe(
     ユーザー="対象ユーザー",
     金額="増減させる金額（負の数を指定すると没収）"
@@ -15347,7 +15392,7 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
 # /gift — 他のユーザーへコインをギフト
 # --------------------------------------------------------------------
 
-@economy_group.command(name="gift", description="自分のコインを他のユーザーに贈ります")
+@economy_group.command(name="gift", description="持っているコインを他のユーザーにプレゼントできます")
 @discord.app_commands.describe(
     ユーザー="贈り先のユーザー",
     金額="贈る金額（1以上）",
@@ -15576,7 +15621,7 @@ async def _refresh_role_shop_panel(guild: discord.Guild, guild_config: dict):
         pass
 
 
-@roleshop_group.command(name="add", description="【管理者専用】ロールショップに商品を追加します")
+@roleshop_group.command(name="add", description="【管理者専用】ロールショップに新しい商品を追加できます")
 @discord.app_commands.describe(ロール="販売するロール", 価格="購入に必要な通貨額", 表示名="ショップに表示する商品名")
 async def roleshop_add(interaction: discord.Interaction, ロール: discord.Role, 価格: int, 表示名: str = None):
     if not await is_admin_or_allowed(interaction):
@@ -15614,7 +15659,7 @@ async def roleshop_add(interaction: discord.Interaction, ロール: discord.Role
     )
 
 
-@roleshop_group.command(name="remove", description="【管理者専用】ロールショップから商品を削除します")
+@roleshop_group.command(name="remove", description="【管理者専用】ロールショップから商品を削除できます")
 @discord.app_commands.describe(商品id="削除する商品のID（/roleshop panel で確認できます）")
 async def roleshop_remove(interaction: discord.Interaction, 商品id: int):
     if not await is_admin_or_allowed(interaction):
@@ -15639,7 +15684,7 @@ async def roleshop_remove(interaction: discord.Interaction, 商品id: int):
         )
 
 
-@roleshop_group.command(name="panel", description="【管理者専用】このチャンネルにロールショップパネルを設置します")
+@roleshop_group.command(name="panel", description="【管理者専用】このチャンネルにロールショップのパネルを設置できます")
 async def roleshop(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction):
         return
@@ -15942,7 +15987,7 @@ async def _fetch_vending_file(guild: discord.Guild, item: dict):
     return discord.File(io.BytesIO(file_bytes), filename=filename)
 
 
-@vendingmachine_group.command(name="add", description="【管理者専用】自販機に商品を追加します（テキスト or ファイル）")
+@vendingmachine_group.command(name="add", description="【管理者専用】自販機に商品を追加できます（テキストでもファイルでもOK）")
 @discord.app_commands.describe(
     商品名="自販機に表示する商品名",
     価格="購入に必要な通貨額",
@@ -16022,7 +16067,7 @@ async def vendingmachine_add(
     )
 
 
-@vendingmachine_group.command(name="remove", description="【管理者専用】自販機から商品を削除します")
+@vendingmachine_group.command(name="remove", description="【管理者専用】自販機から商品を削除できます")
 @discord.app_commands.describe(商品id="削除する商品のID（/vendingmachine panel で確認できます）")
 async def vendingmachine_remove(interaction: discord.Interaction, 商品id: int):
     if not await is_admin_or_allowed(interaction):
@@ -16058,7 +16103,7 @@ async def vendingmachine_remove(interaction: discord.Interaction, 商品id: int)
         )
 
 
-@vendingmachine_group.command(name="panel", description="【管理者専用】このチャンネルに自販機パネルを設置します")
+@vendingmachine_group.command(name="panel", description="【管理者専用】このチャンネルに自販機のパネルを設置できます")
 async def vendingmachine(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction):
         return
@@ -16106,7 +16151,7 @@ server_blacklist_group = app_commands.Group(
 )
 
 
-@server_blacklist_group.command(name="toggle", description="サーバーブラックリスト機能のON/OFFを切り替えます")
+@server_blacklist_group.command(name="toggle", description="サーバーブラックリスト機能をON/OFF切り替えできます")
 async def sbl_toggle(interaction: discord.Interaction):
     if not await is_moderator(interaction):
         return
@@ -16135,7 +16180,7 @@ async def sbl_toggle(interaction: discord.Interaction):
     )
 
 
-@server_blacklist_group.command(name="add", description="【オーナー専用・全サーバー共通】ブラックリストにDiscordサーバーIDを追加します")
+@server_blacklist_group.command(name="add", description="【オーナー専用・全サーバー共通】DiscordサーバーIDをブラックリストに追加できます")
 @app_commands.describe(server_id="BANの対象とするDiscordサーバーID")
 async def sbl_add(interaction: discord.Interaction, server_id: str):
     if not await is_owner_check(interaction):
@@ -16166,7 +16211,7 @@ async def sbl_add(interaction: discord.Interaction, server_id: str):
     )
 
 
-@server_blacklist_group.command(name="remove", description="【オーナー専用・全サーバー共通】ブラックリストからDiscordサーバーIDを削除します")
+@server_blacklist_group.command(name="remove", description="【オーナー専用・全サーバー共通】ブラックリストからDiscordサーバーIDを削除できます")
 @app_commands.describe(server_id="削除するDiscordサーバーID")
 async def sbl_remove(interaction: discord.Interaction, server_id: str):
     if not await is_owner_check(interaction):
@@ -16193,7 +16238,7 @@ async def sbl_remove(interaction: discord.Interaction, server_id: str):
     await interaction.response.send_message(f"[OK] サーバーID `{sid}` を全サーバー共通ブラックリストから削除しました。", ephemeral=True)
 
 
-@server_blacklist_group.command(name="list", description="【全サーバー共通】ブラックリストに登録されているサーバーID一覧を表示します")
+@server_blacklist_group.command(name="list", description="【全サーバー共通】今ブラックリストに入っているサーバーIDの一覧を見られます")
 async def sbl_list(interaction: discord.Interaction):
     if not await is_moderator(interaction):
         return
@@ -16231,7 +16276,7 @@ async def sbl_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@server_blacklist_group.command(name="action", description="ブラックリスト対象者への処置を設定します")
+@server_blacklist_group.command(name="action", description="ブラックリスト対象者が来た時、どう対処するか設定できます")
 @app_commands.describe(action="ban: BAN / kick: キック")
 @app_commands.choices(action=[
     app_commands.Choice(name="BAN（永久追放）", value="ban"),
@@ -16252,7 +16297,7 @@ async def sbl_action(interaction: discord.Interaction, action: str):
     await interaction.response.send_message(f"[OK] ブラックリスト対象者への処置を **{label}** に設定しました。", ephemeral=True)
 
 
-@server_blacklist_group.command(name="setup", description="ウェブ認証の誘導方式を設定します（パネル設置 or 参加時DM自動送信）")
+@server_blacklist_group.command(name="setup", description="ウェブ認証への誘導方法を選べます（パネル設置か、参加時のDM自動送信）")
 @app_commands.describe(
     mode="認証誘導方式（パネル設置 or 参加時DM自動送信）",
     verified_role="認証完了時に付与するロール（省略可）",
@@ -16358,7 +16403,7 @@ async def sbl_setup(
         await interaction.edit_original_response(content=None, embed=result_embed)
 
 
-@server_blacklist_group.command(name="role_clear", description="認証完了時に付与するロールの設定を解除します")
+@server_blacklist_group.command(name="role_clear", description="認証完了時に付けていたロールの設定を解除できます")
 async def sbl_role_clear(interaction: discord.Interaction):
     if not await is_moderator(interaction):
         return
@@ -18011,7 +18056,7 @@ async def _start_web_server():
 # 銀行機能 (/bank) — 預け入れ・引き出し・残高確認
 # --------------------------------------------------------------------
 
-@economy_group.command(name="bank", description="Mコインの銀行機能（預け入れ・引き出し）を使います")
+@economy_group.command(name="bank", description="Mコインを銀行に預けたり引き出したりできます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(操作=[
@@ -18098,7 +18143,7 @@ async def bank(
 # Mコイン設定（オーナー専用） — /owner mcoin_setup
 # --------------------------------------------------------------------
 
-@owner_group.command(name="mcoin_setup", description="【オーナー限定】グローバルMコインの設定を変更します（全サーバー共通）")
+@owner_group.command(name="mcoin_setup", description="【オーナー限定】全サーバー共通のグローバルMコイン設定を変更できます")
 @discord.app_commands.describe(
     コイン名="コインの名前（デフォルト: Mコイン）",
     work最小報酬="/workコマンドの最小報酬",
@@ -18173,7 +18218,7 @@ async def owner_mcoin_setup(
 # 荒らしリスト — /troll list
 # --------------------------------------------------------------------
 
-@troll_group.command(name="list", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）を確認します")
+@troll_group.command(name="list", description="【モデレーター専用】全サーバーで共有している荒らしBANリストを確認できます")
 @discord.app_commands.choices(操作=[
     discord.app_commands.Choice(name=" 一覧表示", value="list"),
     discord.app_commands.Choice(name=" ユーザー検索", value="search"),
@@ -18302,7 +18347,7 @@ async def troll_list(
 # Discord AutoMod バッジ: https://support-dev.discord.com/hc/ja/articles/13847462843543
 # --------------------------------------------------------------------
 
-@automod_group.command(name="badge_setup", description="【管理者専用】DiscordのAutoModバッジを取得するための設定をガイドします")
+@automod_group.command(name="badge_setup", description="【管理者専用】DiscordのAutoModバッジを取るための設定を、順を追って案内してくれます")
 async def automod_badge_setup(interaction: discord.Interaction):
     """
     Discord AutoModバッジ（開発者バッジ）を取得するための設定を自動化します。
@@ -18448,7 +18493,7 @@ async def automod_badge_setup(interaction: discord.Interaction):
 
 SELL_COOLDOWN_SECONDS = 7 * 24 * 3600  # 1週間
 
-@economy_group.command(name="sell", description="週に一回、Mコインを売ってポイントを受け取ります")
+@economy_group.command(name="sell", description="週に1回、Mコインを売ってポイントに交換できます")
 @discord.app_commands.describe(amount="売るMコインの枚数（1以上）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
@@ -18794,7 +18839,7 @@ class GuildDashboardView(discord.ui.View):
         return callback
 
 
-@bot.tree.command(name="dashboard", description="【管理者専用】サーバーの統計・設定状況をまとめて確認できる管理ダッシュボードを表示します")
+@bot.tree.command(name="dashboard", description="【管理者専用】サーバーの統計や設定状況をまとめて見られる、管理ダッシュボードを開けます")
 async def dashboard_command(interaction: discord.Interaction):
     """
     サーバー管理者向けの統合ダッシュボードを表示します。
@@ -19280,7 +19325,7 @@ async def _board_bump_reminder_task(user_id: int, guild_id: int, guild_name: str
         print(f"[サーバー掲示板] bumpリマインダーDM送信失敗: {e}")
 
 
-@board_group.command(name="manage", description="【管理者専用】サーバー掲示板の登録・編集ページへの本人専用リンクを発行します")
+@board_group.command(name="manage", description="【管理者専用】サーバー掲示板の登録・編集ページに入れる、本人専用のリンクを発行できます")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def board_manage_command(interaction: discord.Interaction):
@@ -19312,7 +19357,7 @@ async def board_manage_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@board_group.command(name="list", description="サーバー掲示板の一覧ページのURLを表示します")
+@board_group.command(name="list", description="サーバー掲示板の一覧ページのURLを教えてくれます")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def board_command(interaction: discord.Interaction):
@@ -19332,7 +19377,7 @@ async def board_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@board_group.command(name="bump", description="このサーバーをサーバー掲示板の上位に上げます（1時間に1回）")
+@board_group.command(name="bump", description="サーバー掲示板でこのサーバーを上位に押し上げられます（1時間に1回まで）")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.allowed_installs(guilds=True, users=False)
 async def bump_command(interaction: discord.Interaction):
@@ -20134,7 +20179,7 @@ async def _close_ticket_channel(interaction: discord.Interaction):
         pass
 
 
-@ticket_group.command(name="setup", description="【管理者専用】このチャンネルに問い合わせチケットパネルを設置します")
+@ticket_group.command(name="setup", description="【管理者専用】このチャンネルに問い合わせ用のチケットパネルを設置できます")
 @discord.app_commands.describe(
     タイトル="パネルに表示するタイトル",
     説明="パネルに表示する説明文",
@@ -20182,7 +20227,7 @@ async def ticket_setup(
     )
 
 
-@ticket_group.command(name="close", description="現在のチャンネルがチケットの場合、クローズします")
+@ticket_group.command(name="close", description="今いるチャンネルがチケットなら、そのままクローズできます")
 async def ticket_close(interaction: discord.Interaction):
     await _close_ticket_channel(interaction)
 
@@ -20191,7 +20236,7 @@ async def ticket_close(interaction: discord.Interaction):
 # 招待トラッキング（/invite stats, /invite leaderboard）
 # ====================================================================
 
-@invite_group.command(name="stats", description="招待した人数のランキング、または指定ユーザーの招待成績を確認します")
+@invite_group.command(name="stats", description="招待した人数のランキングや、指定したユーザーの招待成績を確認できます")
 async def invite_stats_cmd(interaction: discord.Interaction, ユーザー: discord.Member = None):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -20225,7 +20270,7 @@ async def invite_stats_cmd(interaction: discord.Interaction, ユーザー: disco
     await interaction.response.send_message(embed=embed)
 
 
-@invite_group.command(name="leaderboard", description="招待した人数のサーバー内ランキングを表示します")
+@invite_group.command(name="leaderboard", description="サーバー内での招待人数ランキングを見られます")
 async def invite_leaderboard_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -20264,7 +20309,7 @@ async def invite_leaderboard_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@invite_group.command(name="toggle", description="【管理者専用】このサーバーの招待トラッキング機能のON/OFFを切り替えます")
+@invite_group.command(name="toggle", description="【管理者専用】招待トラッキング機能をON/OFF切り替えできます")
 async def invite_toggle_cmd(interaction: discord.Interaction):
     if not await is_guild_admin(interaction):
         return
@@ -20283,7 +20328,7 @@ async def invite_toggle_cmd(interaction: discord.Interaction):
 # Botが「離席中です」と自動で知らせてくれます。本人が次に発言すると
 # 自動的にAFK状態が解除されます。
 
-@bot.tree.command(name="afk", description="離席（AFK）状態に設定します。次に発言すると自動的に解除されます")
+@bot.tree.command(name="afk", description="離席（AFK）中だとみんなに知らせておけます。次に発言すると自動的に解除されます")
 async def afk_cmd(interaction: discord.Interaction, 理由: str = "離席中"):
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -20480,7 +20525,7 @@ async def _handle_interview_decision(interaction: discord.Interaction, action: s
                     pass
 
 
-@interview_group.command(name="setup", description="【管理者専用】面接システムの実施方式・結果通知先などを設定します")
+@interview_group.command(name="setup", description="【管理者専用】面接のやり方や結果の通知先などをまとめて設定できます")
 @discord.app_commands.describe(
     有効化="面接機能を有効にするか",
     結果通知先チャンネル="応募内容をEmbedで送る運営用チャンネル",
@@ -20523,7 +20568,7 @@ async def interview_setup(
 
 
 
-@interview_group.command(name="pass_message", description="【管理者専用】面接合格時に応募者へ追加送信するメッセージ（招待URL等）を設定します")
+@interview_group.command(name="pass_message", description="【管理者専用】面接に合格した人へ追加で送るメッセージ（招待URLなど）を設定できます")
 @discord.app_commands.describe(
     メッセージ="合格時に追加でDM送信するメッセージ。招待URLなども入力できます。空欄のまま実行するとクリア（送信なし）になります"
 )
@@ -20550,7 +20595,7 @@ async def interview_pass_message(interaction: discord.Interaction, メッセー�
         )
 
 
-@interview_question_group.command(name="add", description="【管理者専用】面接の質問を末尾に追加します")
+@interview_question_group.command(name="add", description="【管理者専用】面接の質問リストの最後に、新しい質問を追加できます")
 @discord.app_commands.describe(質問="追加する質問文")
 async def interview_question_add(interaction: discord.Interaction, 質問: str):
     if not await is_admin_or_allowed(interaction):
@@ -20573,7 +20618,7 @@ async def interview_question_add(interaction: discord.Interaction, 質問: str):
     )
 
 
-@interview_question_group.command(name="remove", description="【管理者専用】指定した番号の質問を削除します")
+@interview_question_group.command(name="remove", description="【管理者専用】指定した番号の質問を削除できます")
 @discord.app_commands.describe(番号="削除する質問の番号（/interview question list で確認できます）")
 async def interview_question_remove(interaction: discord.Interaction, 番号: int):
     if not await is_admin_or_allowed(interaction):
@@ -20595,7 +20640,7 @@ async def interview_question_remove(interaction: discord.Interaction, 番号: in
     await interaction.response.send_message(f"[OK] 質問{番号}を削除しました: {removed}", ephemeral=True)
 
 
-@interview_question_group.command(name="list", description="【管理者専用】登録済みの面接質問一覧を表示します")
+@interview_question_group.command(name="list", description="【管理者専用】今登録されている面接質問の一覧を見られます")
 async def interview_question_list(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction):
         return
@@ -20620,7 +20665,7 @@ async def interview_question_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="面接", description="面接（応募）を開始します。質問に順番に回答してください")
+@bot.tree.command(name="面接", description="面接（応募）をここから始められます。質問が順番に届くので答えてください")
 async def interview_start(interaction: discord.Interaction):
     await _start_interview(interaction)
 
@@ -20646,7 +20691,7 @@ class InterviewPanelView(discord.ui.View):
         self.add_item(InterviewStartButton())
 
 
-@interview_group.command(name="panel", description="【管理者専用】このチャンネルに「面接を受ける」ボタン付きパネルを設置します")
+@interview_group.command(name="panel", description="【管理者専用】このチャンネルに「面接を受ける」ボタン付きのパネルを設置できます")
 @discord.app_commands.describe(
     タイトル="パネルに表示するタイトル（未指定の場合は既定文を使用）",
     説明="パネルに表示する説明文（未指定の場合は既定文を使用）"
