@@ -4171,6 +4171,31 @@ def _is_automod_target(author: discord.Member, guild_config: dict, all_data: dic
     return True
 
 
+def _is_invite_automod_target(author: discord.Member, guild_config: dict, all_data: dict) -> bool:
+    """
+    招待リンク削除（automod_invite_enabled）専用の対象判定です。
+    サーバー宣伝・引き抜き対策という性質上、「管理者権限を持つロールが付与された
+    一般メンバー」であっても検知対象に含めます（_is_automod_targetとの唯一の違いは
+    administrator権限による除外を行わない点です）。
+    ただし、Botの設定で明示的に信頼されている人（allowed_users/allowed_roles・
+    Botオーナー・trusted_users）は、他の自動モデレーション機能と同様に引き続き除外します
+    （こちらは「管理者だから」ではなく「運営者が個別に信頼を与えたから」という別の理由のため）。
+    """
+    if author.id in guild_config.get("allowed_users", []):
+        return False
+    allowed_role_ids = set(guild_config.get("allowed_roles", []))
+    if allowed_role_ids:
+        user_role_ids = {r.id for r in author.roles}
+        if user_role_ids & allowed_role_ids:
+            return False
+    if author.id == bot.owner_id:
+        return False
+    global_cfg = get_global_config(all_data)
+    if author.id in global_cfg.get("trusted_users", []):
+        return False
+    return True
+
+
 async def _check_iplogger(message: discord.Message) -> bool:
     """
     メッセージ内のURLをスキャンし、既知のIPロガー系ドメインまたは
@@ -4434,14 +4459,20 @@ def _collect_automod_scan_texts(message: discord.Message) -> list:
     return texts
 
 
-async def _run_automod_checks(message: discord.Message, guild_config: dict) -> bool:
+async def _run_automod_checks(message: discord.Message, guild_config: dict, all_data: dict) -> bool:
     """
     招待リンク削除・NGワード削除・IPロガー検知・画像OCR招待リンク検知を実行します。
     削除した場合は True を返します（呼び出し元でreturnするため）。
     スパム検知はメッセージ送信時のみ対象のため含めていません。
+
+    呼び出し元では通常 _is_automod_target（管理者権限を持つユーザーは除外）でガードされて
+    いますが、招待リンク削除だけはサーバー宣伝・引き抜き対策という性質上、管理者権限を持つ
+    一般メンバーであっても検知したいため、ここで _is_invite_automod_target により
+    改めて個別に判定します（all_data はこの判定のために必要です）。
     """
     # 招待リンク削除（通常のメッセージ本文に加え、転送メッセージのスナップショット・埋め込みも対象）
-    if guild_config.get("automod_invite_enabled", False):
+    # 管理者権限を持つユーザーであっても対象に含める（サーバー宣伝・引き抜き対策のため）。
+    if guild_config.get("automod_invite_enabled", False) and _is_invite_automod_target(message.author, guild_config, all_data):
         scan_texts = _collect_automod_scan_texts(message)
         combined_lower = "\n".join(scan_texts).lower()
         if any(kw in combined_lower for kw in (
@@ -4459,7 +4490,8 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict) -> b
             return True
 
     # NGワード削除（通常のメッセージ本文に加え、転送メッセージのスナップショット・埋め込みも対象）
-    if guild_config.get("automod_ng_words_enabled", False):
+    # こちらは従来通り、管理者権限を持つユーザーは対象外（_is_automod_target）。
+    if guild_config.get("automod_ng_words_enabled", False) and _is_automod_target(message.author, guild_config, all_data):
         ng_words = guild_config.get("ng_words", [])
         scan_texts = _collect_automod_scan_texts(message)
         combined_text = "\n".join(scan_texts)
@@ -4475,13 +4507,14 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict) -> b
                 pass
             return True
 
-    # IPロガー検知
-    if guild_config.get("iplogger_check_enabled", False):
+    # IPロガー検知（従来通り、管理者権限を持つユーザーは対象外）
+    if guild_config.get("iplogger_check_enabled", False) and _is_automod_target(message.author, guild_config, all_data):
         if await _check_iplogger(message):
             return True
 
-    # 画像OCR招待リンク検知（テキスト本文の招待リンク検知とは独立したスイッチ）
-    if guild_config.get("automod_image_ocr_invite_enabled", False):
+    # 画像OCR招待リンク検知（テキスト本文の招待リンク検知とは独立したスイッチ。
+    # こちらも招待リンク対策のため、招待リンク削除と同様に管理者権限があっても対象に含める）
+    if guild_config.get("automod_image_ocr_invite_enabled", False) and _is_invite_automod_target(message.author, guild_config, all_data):
         if await _check_image_invite_link(message):
             return True
 
@@ -4776,13 +4809,16 @@ async def on_message(message: discord.Message):
                     except Exception:
                         pass
 
-            # 2. 招待リンク・NGワード削除（共通ヘルパー呼び出し）
-            if await _run_automod_checks(message, guild_config):
-                return
-
             # 2.5 AI自動モデレーション用キューへ登録（判定は別タスクでバッチ実行）
             if guild_config.get("automod_ai_enabled", False):
                 _ai_automod_enqueue(message)
+
+        # 2. 招待リンク・NGワード・IPロガー・画像OCR招待リンク削除（共通ヘルパー呼び出し）
+        # 招待リンク・画像OCR招待リンクは _run_automod_checks 内部で個別に対象判定
+        # （_is_invite_automod_target）を行うため、ここでは _is_automod_target による
+        # ガードを外側にかけません（管理者権限を持つ一般メンバーも招待リンクは検知対象のため）。
+        if await _run_automod_checks(message, guild_config, all_data):
+            return
 
 
 
@@ -8154,12 +8190,10 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
     guild_config = all_data[guild_id_str]
 
-    # モデレーターは対象外
-    if not _is_automod_target(after.author, guild_config, all_data):
-        return
-
-    # 招待リンク・NGワード削除（共通ヘルパー呼び出し）
-    deleted = await _run_automod_checks(after, guild_config)
+    # 招待リンク削除は管理者権限を持つ一般メンバーも対象に含めるため、
+    # ここでは _is_automod_target による早期returnを行わず、
+    # _run_automod_checks 内部の個別判定（_is_invite_automod_target等）に委ねる。
+    deleted = await _run_automod_checks(after, guild_config, all_data)
     if deleted and guild_config.get("automod_invite_enabled", False):
         after_scan_lower = "\n".join(_collect_automod_scan_texts(after)).lower()
         if any(kw in after_scan_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
@@ -8170,7 +8204,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
                         continue
                     if msg.author.bot:
                         continue
-                    if not _is_automod_target(msg.author, guild_config, all_data):
+                    if not _is_invite_automod_target(msg.author, guild_config, all_data):
                         continue
                     m_scan_lower = "\n".join(_collect_automod_scan_texts(msg)).lower()
                     if any(kw in m_scan_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
