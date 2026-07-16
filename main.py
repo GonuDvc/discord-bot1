@@ -4175,6 +4175,8 @@ async def _check_iplogger(message: discord.Message) -> bool:
     """
     メッセージ内のURLをスキャンし、既知のIPロガー系ドメインまたは
     短縮URLの展開先がIPロガーであれば削除・通知します。
+    通常のメッセージ本文に加え、転送(Forward)メッセージのスナップショット・埋め込みも
+    走査対象に含みます（_collect_automod_scan_texts参照）。
     True を返すと呼び出し元でメッセージ処理を中断します。
     """
     # 既知のIPロガー・フィッシング系ドメイン一覧
@@ -4194,7 +4196,8 @@ async def _check_iplogger(message: discord.Message) -> bool:
     }
 
     import re
-    urls = re.findall(r"https?://[^\s<>\"']+", message.content)
+    scan_text = "\n".join(_collect_automod_scan_texts(message))
+    urls = re.findall(r"https?://[^\s<>\"']+", scan_text)
     if not urls:
         return False
 
@@ -4317,17 +4320,27 @@ async def _check_image_invite_link(message: discord.Message) -> bool:
     メッセージを削除・通知します。True を返すと呼び出し元でメッセージ処理を中断します。
     既存のテキスト本文向け招待リンク検知（automod_invite_enabled）とは独立した機能で、
     OCR_SPACE_API_KEY が未設定の場合は何もせず False を返します。
+    Discordのネイティブ「転送」機能で送られたメッセージは、画像添付が message.attachments
+    ではなく message.message_snapshots[].attachments 側に入るため、そちらも走査します。
     """
-    if not OCR_SPACE_API_KEY or not message.attachments:
+    if not OCR_SPACE_API_KEY:
         return False
 
     _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-    image_url: Optional[str] = None
-    for attachment in message.attachments:
-        filename_lower = (attachment.filename or "").lower()
-        if filename_lower.endswith(_IMAGE_EXTENSIONS):
-            image_url = attachment.url
-            break
+
+    def _first_image_url(attachments) -> Optional[str]:
+        for attachment in attachments or []:
+            filename_lower = (getattr(attachment, "filename", "") or "").lower()
+            if filename_lower.endswith(_IMAGE_EXTENSIONS):
+                return attachment.url
+        return None
+
+    image_url = _first_image_url(message.attachments)
+    if image_url is None:
+        for snapshot in getattr(message, "message_snapshots", None) or []:
+            image_url = _first_image_url(getattr(snapshot, "attachments", None))
+            if image_url is not None:
+                break
 
     if image_url is None:
         return False
@@ -4375,36 +4388,87 @@ async def _check_image_invite_link(message: discord.Message) -> bool:
     return True
 
 
+def _collect_automod_scan_texts(message: discord.Message) -> list:
+    """
+    自動モデレーションの文字列チェック（招待リンク・NGワード等）の対象となるテキストを
+    すべて集めて返します。
+    通常のメッセージ本文（message.content）に加え、Discordのネイティブ「転送」機能で
+    送られたメッセージは本文が空になり、実際の内容は message.message_snapshots に
+    格納されるため、これも走査対象に含めます（未対応だと転送で全てのテキストチェックを
+    回避されてしまうため）。
+    埋め込み（embed）内のタイトル・説明・URLも対象にします。招待リンクのプレビュー埋め込み
+    （サーバー招待カード）はリンク文字列がcontentではなくembedのURLに入るケースがあるため。
+    """
+    texts = []
+    if message.content:
+        texts.append(message.content)
+
+    def _collect_embeds(embeds):
+        for embed in embeds or []:
+            for attr in ("title", "description", "url"):
+                val = getattr(embed, attr, None)
+                if val:
+                    texts.append(str(val))
+            footer = getattr(embed, "footer", None)
+            if footer and getattr(footer, "text", None):
+                texts.append(str(footer.text))
+            author = getattr(embed, "author", None)
+            if author and getattr(author, "name", None):
+                texts.append(str(author.name))
+            for field in getattr(embed, "fields", None) or []:
+                if getattr(field, "name", None):
+                    texts.append(str(field.name))
+                if getattr(field, "value", None):
+                    texts.append(str(field.value))
+
+    _collect_embeds(getattr(message, "embeds", None))
+
+    # 転送(Forward)メッセージのスナップショット。discord.py 2.5+ で利用可能。
+    # 古いバージョンでは属性自体が存在しない可能性があるため getattr で安全に取得する。
+    for snapshot in getattr(message, "message_snapshots", None) or []:
+        snap_content = getattr(snapshot, "content", None)
+        if snap_content:
+            texts.append(str(snap_content))
+        _collect_embeds(getattr(snapshot, "embeds", None))
+
+    return texts
+
+
 async def _run_automod_checks(message: discord.Message, guild_config: dict) -> bool:
     """
     招待リンク削除・NGワード削除・IPロガー検知・画像OCR招待リンク検知を実行します。
     削除した場合は True を返します（呼び出し元でreturnするため）。
     スパム検知はメッセージ送信時のみ対象のため含めていません。
     """
-    # 招待リンク削除
+    # 招待リンク削除（通常のメッセージ本文に加え、転送メッセージのスナップショット・埋め込みも対象）
     if guild_config.get("automod_invite_enabled", False):
-        content_lower = message.content.lower()
-        if any(kw in content_lower for kw in (
+        scan_texts = _collect_automod_scan_texts(message)
+        combined_lower = "\n".join(scan_texts).lower()
+        if any(kw in combined_lower for kw in (
             "discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/"
         )):
             try:
                 await message.delete()
                 await message.channel.send(
-                    f"[!] {message.author.mention} 招待リンクの送信は許可されていません（編集による回避も検知します）。",
+                    f"[!] {message.author.mention} 招待リンクの送信は許可されていません"
+                    "（編集による回避・転送機能による回避も検知します）。",
                     delete_after=5
                 )
             except Exception:
                 pass
             return True
 
-    # NGワード削除
+    # NGワード削除（通常のメッセージ本文に加え、転送メッセージのスナップショット・埋め込みも対象）
     if guild_config.get("automod_ng_words_enabled", False):
         ng_words = guild_config.get("ng_words", [])
-        if any(ng in message.content for ng in ng_words if ng):
+        scan_texts = _collect_automod_scan_texts(message)
+        combined_text = "\n".join(scan_texts)
+        if any(ng in combined_text for ng in ng_words if ng):
             try:
                 await message.delete()
                 await message.channel.send(
-                    f"[!] {message.author.mention} NGワードが含まれているため削除されました（編集による回避も検知します）。",
+                    f"[!] {message.author.mention} NGワードが含まれているため削除されました"
+                    "（編集による回避・転送機能による回避も検知します）。",
                     delete_after=5
                 )
             except Exception:
@@ -8097,8 +8161,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     # 招待リンク・NGワード削除（共通ヘルパー呼び出し）
     deleted = await _run_automod_checks(after, guild_config)
     if deleted and guild_config.get("automod_invite_enabled", False):
-        content_lower = after.content.lower()
-        if any(kw in content_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
+        after_scan_lower = "\n".join(_collect_automod_scan_texts(after)).lower()
+        if any(kw in after_scan_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
             # チャンネル全体の過去メッセージをスキャンして即削除（直近100件）
             try:
                 async for msg in after.channel.history(limit=100):
@@ -8108,8 +8172,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
                         continue
                     if not _is_automod_target(msg.author, guild_config, all_data):
                         continue
-                    m_content_lower = msg.content.lower()
-                    if any(kw in m_content_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
+                    m_scan_lower = "\n".join(_collect_automod_scan_texts(msg)).lower()
+                    if any(kw in m_scan_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
                         try:
                             await msg.delete()
                         except Exception:
