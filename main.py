@@ -10111,6 +10111,50 @@ async def ai_chat_translate_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# BOTのテーマカラー（水色）。確認ダイアログ等の共通アクセントカラーとして使用します。
+THEME_COLOR = discord.Color.from_rgb(0, 200, 240)
+
+
+class AIChatClearHistoryConfirmView(discord.ui.View):
+    """AIチャット履歴クリアの実行確認用「はい/いいえ」ボタンビューです。"""
+
+    def __init__(self, channel_id: int, user_id: int, clear_all: bool):
+        super().__init__(timeout=60)
+        self.channel_id = channel_id
+        self.user_id = user_id
+        self.clear_all = clear_all
+
+    @discord.ui.button(label="はい", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+
+        if self.clear_all:
+            _ai_chat_clear_history(self.channel_id)
+            result_text = "[OK] このチャンネルの全ユーザーのAIチャット履歴をクリアしました。"
+        else:
+            _ai_chat_clear_history(self.channel_id, self.user_id)
+            result_text = "[OK] あなたのAIチャット履歴をクリアしました。"
+
+        try:
+            await interaction.response.edit_message(content=result_text, embed=None, view=self)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="いいえ", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content="キャンセルしました。履歴は削除されていません。", embed=None, view=self)
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
 @ai_chat_group.command(name="clear_history", description="AIチャットの会話履歴を消せます（自分の分だけ、管理者なら全員分もまとめて）")
 @app_commands.describe(全員分="管理者権限がある場合、このチャンネルの全ユーザーの履歴をクリアします")
 async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: bool = False):
@@ -10126,15 +10170,17 @@ async def ai_chat_clear_history(interaction: discord.Interaction, 全員分: boo
         await interaction.response.send_message("このチャンネルはAIチャット専用チャンネルに設定されていません。", ephemeral=True)
         return
 
-    if 全員分:
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("全員分の履歴クリアには管理者権限が必要です。", ephemeral=True)
-            return
-        _ai_chat_clear_history(interaction.channel.id)
-        await interaction.response.send_message("このチャンネルの全ユーザーのAIチャット履歴をクリアしました。", ephemeral=True)
-    else:
-        _ai_chat_clear_history(interaction.channel.id, interaction.user.id)
-        await interaction.response.send_message("あなたのAIチャット履歴をクリアしました。", ephemeral=True)
+    if 全員分 and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("全員分の履歴クリアには管理者権限が必要です。", ephemeral=True)
+        return
+
+    target_desc = "このチャンネルの全ユーザーの" if 全員分 else "あなたの"
+    embed = discord.Embed(
+        description=f"⚠️ AIチャットの会話履歴を削除します。よろしいですか？\n（{target_desc}履歴が対象です）",
+        color=THEME_COLOR,
+    )
+    view = AIChatClearHistoryConfirmView(interaction.channel.id, interaction.user.id, 全員分)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @ai_chat_group.command(name="pause", description="【オーナー限定】このサーバーのAIチャット自動応答をいったん止めます")
