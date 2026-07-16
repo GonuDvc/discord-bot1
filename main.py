@@ -4289,41 +4289,64 @@ async def _check_iplogger(message: discord.Message) -> bool:
 # OCR誤読で起こりやすいゆらぎ（"."が","や"9"に化ける、スペース混入等）を最小限吸収する。
 # 過度に緩めると誤検知が増えAI補助判定のコストも上がるため、実際に起こりやすい誤読パターンに絞る。
 _OCR_INVITE_LINK_PATTERN = re.compile(
-    r"discord[\s.,:;9]{0,3}(gg|com\s*/\s*invite)[\s/]{0,3}[a-z0-9\-]{2,}"
-    r"|dsc[\s.,:;9]{0,3}gg[\s/]{0,3}[a-z0-9\-]{2,}",
+    r"discord[\s.,:;9]{0,3}(gg|com\s*/\s*invite)[\s/]{0,3}[a-z0-9\-_]{2,}"
+    r"|dsc[\s.,:;9]{0,3}gg[\s/]{0,3}[a-z0-9\-_]{2,}"
+    # OCR誤読で「discord」の文字自体が崩れたケース（例: d1scord、discorcl、di5cord）
+    r"|d[il1]sco[rn][dcl][\s.,:;9]{0,3}(gg|com)"
+    # "invite" という単語だけが読み取れたケース（discordの文字が欠落していても拾う）
+    r"|(?<![a-z])invite[\s/]{0,3}[a-z0-9\-_]{4,}"
+    # 「.gg」だけが読み取れ、直前にdiscordが無くても招待コードらしき文字列が続く場合
+    r"|(?<![a-z0-9])\.gg[\s/]{0,3}[a-z0-9\-_]{4,}",
     re.IGNORECASE
 )
 
+# 上記正規表現に一切ヒットしなくても、画像から一定量のテキストが読み取れた場合は
+# AIに丸ごと判定させる（正規表現の再現率がそのまま検知率の上限になるのを避けるため）。
+# サーバー招待の埋め込みプレビューカード（サーバー名・オンライン人数・「サーバーへ移動」ボタン等）は
+# "discord.gg" という文字列自体がカード内に存在しないことが多く、正規表現では原理的に検知できない。
+_OCR_MIN_TEXT_LENGTH_FOR_AI_CHECK = 6
+
 _AI_OCR_INVITE_JUDGE_SYSTEM_PROMPT = (
     "あなたはDiscordの自動モデレーションシステムの一部です。"
-    "OCR（画像文字認識）で画像から読み取ったテキストの断片が渡されます。"
-    "これはOCRの誤読を含む可能性があります（記号の読み間違い、スペースの混入・欠落等）。"
-    "この文字列が実際にDiscordサーバーへの招待リンク（例: discord.gg/xxxxx、"
-    "discord.com/invite/xxxxx）を示していると考えられるかを判定してください。"
-    "単に「discord」という単語が含まれるだけで招待リンクとは無関係な文章（例: "
-    "Discordというアプリの話をしている、discordという英単語（不和の意）を使っている等）は"
-    "flaggedをfalseにしてください。"
+    "OCR（画像文字認識）で画像から読み取ったテキストが渡されます。"
+    "これはOCRの誤読を含む可能性があります（記号の読み間違い、スペースの混入・欠落、"
+    "文字化け、改行位置のずれ、フォントの装飾による誤認識等）。\n\n"
+    "この画像が、Discordサーバーへの招待（招待リンクや招待コード、または「サーバーへ移動」"
+    "「Join Server」等のボタンを含むサーバー招待の埋め込みプレビューカード）を含んでいるかを"
+    "判定してください。次のようなケースはすべて招待とみなしてflaggedをtrueにしてください:\n"
+    "- discord.gg/xxxxx、discord.com/invite/xxxxx 形式のURL（OCR誤読による表記ゆれを含む）\n"
+    "- サーバー名・メンバー数（オンライン人数表示等）・「サーバーへ移動」「Join」ボタンなど、"
+    "Discordのサーバー招待プレビューカードに特有の構成要素が読み取れる場合"
+    "（URLの文字列自体が読み取れていなくても、これらの要素があれば招待とみなしてください）\n"
+    "- 招待コードらしき英数字の羅列＋「invite」「参加」「join」等の語が近くにある場合\n\n"
+    "一方、以下のような場合はflaggedをfalseにしてください:\n"
+    "- 単に「discord」という単語がアプリ名として言及されているだけで、招待の要素が無い場合\n"
+    "- discordという英単語（不和・不一致の意）として使われている場合\n"
+    "- OCRで読み取れたテキストが断片的すぎて、招待かどうか判断できない場合（安全側でfalse）\n\n"
     "必ず以下のJSON形式のみで出力してください（前後に説明文やコードブロック記号は不要）:\n"
     '{"flagged": true または false, "reason": "判定理由を一文で"}'
 )
 
 
-async def _ai_judge_ocr_invite_link(ocr_snippet: str, guild_id: Optional[int] = None) -> Tuple[bool, str]:
+async def _ai_judge_ocr_invite_link(ocr_text: str, guild_id: Optional[int] = None) -> Tuple[bool, str]:
     """
-    OCRで検知した招待リンクらしき文字列の断片をAIに渡し、本当に招待リンクかどうかの
-    誤検知抑制判定を行います。AI呼び出しに失敗した場合は安全側（flagged=True、つまり
-    正規表現の一次判定結果をそのまま採用）にフォールバックします。
+    OCRで画像から読み取ったテキスト全体をAIに渡し、Discordサーバーへの招待
+    （URL・招待コード・招待プレビューカードの構成要素等）が含まれるかを判定します。
+    正規表現による一次フィルタは行わず、一定量のテキストが取れていれば毎回この判定を行います
+    （正規表現はサーバー招待プレビューカードのようにURL文字列自体が画像内に存在しないケースを
+    検知できないため、AI判定を主とし、正規表現はログ用の補助シグナルに留めます）。
+    AI呼び出しに失敗した場合は安全側（flagged=False、誤検知で削除しない）にフォールバックします。
     """
     messages = [
         {"role": "system", "content": _AI_OCR_INVITE_JUDGE_SYSTEM_PROMPT},
-        {"role": "user", "content": ocr_snippet[:200]},
+        {"role": "user", "content": ocr_text[:1000]},
     ]
     try:
         provider_override = await _ai_get_provider_override(guild_id)
         raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
     except Exception as e:
-        print(f"[画像OCR招待リンク検知] AI補助判定の呼び出しに失敗（正規表現の一次判定を採用）: {e}")
-        return True, "OCRパターン一致（AI補助判定は利用できませんでした）"
+        print(f"[画像OCR招待リンク検知] AI判定の呼び出しに失敗（安全側でflagged=False）: {e}")
+        return False, "AI判定を利用できなかったため見送りました"
 
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -4331,12 +4354,12 @@ async def _ai_judge_ocr_invite_link(ocr_snippet: str, guild_id: Optional[int] = 
 
     try:
         parsed = json.loads(cleaned)
-        flagged = bool(parsed.get("flagged", True))
+        flagged = bool(parsed.get("flagged", False))
         reason = str(parsed.get("reason", "")).strip() or "AIが招待リンクと判定しました"
         return flagged, reason
     except (json.JSONDecodeError, AttributeError, ValueError) as e:
-        print(f"[画像OCR招待リンク検知] AI判定結果の解析に失敗（正規表現の一次判定を採用）: {e} / raw={cleaned[:200]}")
-        return True, "OCRパターン一致（AI判定結果の解析に失敗したため一次判定を採用）"
+        print(f"[画像OCR招待リンク検知] AI判定結果の解析に失敗（安全側でflagged=False）: {e} / raw={cleaned[:200]}")
+        return False, "AI判定結果の解析に失敗したため見送りました"
 
 
 async def _check_image_invite_link(message: discord.Message) -> bool:
@@ -4347,45 +4370,54 @@ async def _check_image_invite_link(message: discord.Message) -> bool:
     OCR_SPACE_API_KEY が未設定の場合は何もせず False を返します。
     Discordのネイティブ「転送」機能で送られたメッセージは、画像添付が message.attachments
     ではなく message.message_snapshots[].attachments 側に入るため、そちらも走査します。
+
+    検知方式: 正規表現による一次フィルタは行わず、画像から一定量のOCRテキストが
+    読み取れた場合は常にAIへ判定を委ねます（サーバー招待の埋め込みプレビューカードは
+    "discord.gg" という文字列自体が画像内に存在しないことが多く、正規表現では
+    原理的に検知できないため）。正規表現はログ記録用の補助シグナルとしてのみ使用します。
+    1メッセージに複数枚の画像が添付されている場合、招待の痕跡が見つかるまで順に確認します
+    （最大 _OCR_MAX_IMAGES_PER_MESSAGE 枚まで。無制限に確認するとOCR/AI呼び出しコストが
+    青天井になるため上限を設けています）。
     """
     if not OCR_SPACE_API_KEY:
         return False
 
     _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+    _OCR_MAX_IMAGES_PER_MESSAGE = 3
 
-    def _first_image_url(attachments) -> Optional[str]:
+    def _image_urls(attachments) -> list:
+        urls = []
         for attachment in attachments or []:
             filename_lower = (getattr(attachment, "filename", "") or "").lower()
             if filename_lower.endswith(_IMAGE_EXTENSIONS):
-                return attachment.url
-        return None
+                urls.append(attachment.url)
+        return urls
 
-    image_url = _first_image_url(message.attachments)
-    if image_url is None:
+    image_urls = _image_urls(message.attachments)
+    if not image_urls:
         for snapshot in getattr(message, "message_snapshots", None) or []:
-            image_url = _first_image_url(getattr(snapshot, "attachments", None))
-            if image_url is not None:
+            image_urls = _image_urls(getattr(snapshot, "attachments", None))
+            if image_urls:
                 break
 
-    if image_url is None:
+    if not image_urls:
         return False
 
-    ocr_text = await extract_text_from_image(image_url)
-    if not ocr_text:
-        return False
+    for image_url in image_urls[:_OCR_MAX_IMAGES_PER_MESSAGE]:
+        ocr_text = await extract_text_from_image(image_url)
+        if not ocr_text or len(ocr_text.strip()) < _OCR_MIN_TEXT_LENGTH_FOR_AI_CHECK:
+            continue
 
-    match = _OCR_INVITE_LINK_PATTERN.search(ocr_text)
-    if not match:
-        return False
+        # 正規表現ヒットはログ用の補助シグナル（AI判定の可否には影響しない）
+        regex_hit = bool(_OCR_INVITE_LINK_PATTERN.search(ocr_text))
 
-    # 一次判定に一致した箇所の前後を含めてAIに渡し、誤検知（例: 単なる「discord」という
-    # 単語や無関係な文脈での言及）を抑制する。
-    start = max(0, match.start() - 20)
-    end = min(len(ocr_text), match.end() + 20)
-    snippet = ocr_text[start:end]
-
-    flagged, reason = await _ai_judge_ocr_invite_link(snippet, guild_id=message.guild.id if message.guild else None)
-    if not flagged:
+        flagged, reason = await _ai_judge_ocr_invite_link(ocr_text, guild_id=message.guild.id if message.guild else None)
+        if not flagged:
+            continue
+        if regex_hit:
+            reason = f"{reason}（正規表現パターンにも一致）"
+        break
+    else:
         return False
 
     try:
