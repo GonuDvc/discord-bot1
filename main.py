@@ -501,6 +501,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
         ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）。オーナーが /ai_chat set_provider で設定
         ("ai_chat_guild_system_prompt", None),  # サーバー全体の既定AI人格（システムプロンプト）。未設定ならコード内蔵の既定文を使用。オーナーが /ai_chat set_personality で設定
+        # --- AIチャット：Web検索のON/OFF・使用プロバイダ切り替え（管理者専用） ---
+        ("ai_chat_web_search_enabled", True),   # True: Web検索ツールをAIに提示する（APIキーが1つも無ければ実際は使われない）。管理者が /ai_chat set_search または埋め込みボタンで切り替え
+        ("ai_chat_search_provider_order", None),  # ["tavily","exa","firecrawl"] のような優先順位リスト。未設定(None)ならコード既定の優先順位（Tavily→Exa→Firecrawl）を使用
         # --- AIチャット：他BOTの発言への自動応答（安全対策付き・オーナー専用） ---
         ("ai_chat_bot_reply_enabled", False),   # True: 登録済みBotの発言にAIチャットチャンネルで自動応答する
         ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
@@ -4808,7 +4811,11 @@ def _ai_chat_resolve_default_system_prompt(guild_config: dict) -> str:
     return guild_config.get("ai_chat_guild_system_prompt") or AI_CHAT_SYSTEM_PROMPT
 
 
-def _ai_chat_finalize_system_prompt(system_prompt: str, include_search_guide: bool = True) -> str:
+def _ai_chat_finalize_system_prompt(
+    system_prompt: str,
+    include_search_guide: bool = True,
+    guild_config: Optional[dict] = None
+) -> str:
     """
     実際にAPIへ渡す直前に必ず通す関数。どの経路（コード内蔵/サーバー既定/ユーザー個別）の
     システムプロンプトであっても、モデル秘匿ガードを末尾に付与してから返す。
@@ -4817,9 +4824,13 @@ def _ai_chat_finalize_system_prompt(system_prompt: str, include_search_guide: bo
 
     include_search_guide: False の場合、Web検索案内文を付与しない
     （実際にweb_searchツールを渡さない呼び出し経路、例: Bot同士の会話で使用）。
+    guild_config: 渡された場合、そのサーバーで ai_chat_web_search_enabled が False に
+    設定されていればWeb検索案内文を付与しない（実際にツールも渡されないため、
+    案内文だけ残ると矛盾するのを防ぐ）。
     """
     result = system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD
-    if WEB_SEARCH_AVAILABLE and include_search_guide:
+    search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+    if WEB_SEARCH_AVAILABLE and include_search_guide and search_enabled_for_guild:
         result += AI_CHAT_SEARCH_USAGE_GUIDE
     return result
 
@@ -5358,23 +5369,44 @@ async def _firecrawl_web_search(query: str, max_results: int = 5) -> str:
     return "\n\n".join(lines)
 
 
-# 優先順位付きのプロバイダ一覧: (表示名, APIキーが設定されているか判定する関数, 検索実行関数)
+# 優先順位付きのプロバイダ一覧: (内部ID, 表示名, APIキーが設定されているか判定する関数, 検索実行関数)
+# 内部IDはサーバーごとの優先順位設定（ai_chat_search_provider_order）で参照するために使用する。
 _WEB_SEARCH_PROVIDERS = [
-    ("Tavily", lambda: bool(TAVILY_API_KEY), _tavily_web_search),
-    ("Exa", lambda: bool(EXA_API_KEY), _exa_web_search),
-    ("Firecrawl", lambda: bool(FIRECRAWL_API_KEY), _firecrawl_web_search),
+    ("tavily", "Tavily", lambda: bool(TAVILY_API_KEY), _tavily_web_search),
+    ("exa", "Exa", lambda: bool(EXA_API_KEY), _exa_web_search),
+    ("firecrawl", "Firecrawl", lambda: bool(FIRECRAWL_API_KEY), _firecrawl_web_search),
 ]
+_WEB_SEARCH_PROVIDER_IDS = [p[0] for p in _WEB_SEARCH_PROVIDERS]
 
 
-async def _web_search_fallback(query: str, max_results: int = 5) -> str:
+def _resolve_search_provider_order(guild_config: Optional[dict] = None) -> list:
     """
-    設定済みのWeb検索APIを優先順位（Tavily→Exa→Firecrawl）の順に試し、
-    最初に成功したものの結果を返します。
+    実際に試す順番でプロバイダのタプル一覧を返します。
+    guild_configに ai_chat_search_provider_order（["tavily","firecrawl","exa"]等）が
+    設定されていればその順を使用し、未指定・不正な値が混ざっている場合はコード既定の順序
+    （Tavily→Exa→Firecrawl）にフォールバックします。
+    設定リストに含まれないプロバイダIDがあっても無視し、既定順の末尾に追加はしません
+    （管理者が明示的に選んだプロバイダのみを、指定された順で試す）。
+    """
+    custom_order = (guild_config or {}).get("ai_chat_search_provider_order")
+    if not custom_order or not isinstance(custom_order, list):
+        return _WEB_SEARCH_PROVIDERS
+
+    by_id = {p[0]: p for p in _WEB_SEARCH_PROVIDERS}
+    ordered = [by_id[pid] for pid in custom_order if pid in by_id]
+    # 不正な設定（全IDが無効等）で結果が空になった場合は既定順にフォールバック
+    return ordered or _WEB_SEARCH_PROVIDERS
+
+
+async def _web_search_fallback(query: str, max_results: int = 5, guild_config: Optional[dict] = None) -> str:
+    """
+    設定済みのWeb検索APIを優先順位（既定: Tavily→Exa→Firecrawl。サーバーごとにカスタム順設定可）
+    の順に試し、最初に成功したものの結果を返します。
     どのAPIキーも未設定の場合、または全プロバイダが失敗した場合のみ、
     その旨を示す短いテキストを返します（検索に失敗してもAIチャット自体は継続させたいため）。
     """
     tried_any = False
-    for name, is_configured, search_func in _WEB_SEARCH_PROVIDERS:
+    for _pid, name, is_configured, search_func in _resolve_search_provider_order(guild_config):
         if not is_configured():
             continue
         tried_any = True
@@ -5412,9 +5444,52 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 }
 
 
-async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = None) -> str:
+# 一部のモデル（特に量子化・軽量モデル）はネイティブのtool_callsフィールドではなく、
+# 応答本文(content)の中に直接JSON形式でツール呼び出しを書いてしまうことがある。
+# 例: { "tool": "web_search", "query": "..." } のようなテキストがそのままユーザーに
+# 表示されてしまう不具合を防ぐため、contentがそのようなJSONに見える場合を検知する。
+_JSON_TOOL_CALL_LIKE_PATTERN = re.compile(
+    r'^\s*\{[^{}]*["\']tool["\']\s*:\s*["\']web_search["\'][^{}]*\}\s*$',
+    re.DOTALL
+)
+
+
+def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     """
-    Web検索（Tavily→Exa→Firecrawlの優先順位で自動フォールバック）を使えるGroq呼び出し。
+    Groqモデルがtool_callsフィールドを使わず、本文に直接JSONでツール呼び出しを
+    書いてしまった場合（例: {"tool": "web_search", "query": "..."}）を検知し、
+    パースできればクエリ等を含む辞書を返す。該当しない・パース失敗時はNoneを返す。
+    コードブロック（```json ... ```）で囲まれているケースにも対応する。
+    """
+    if not raw_content:
+        return None
+    candidate = raw_content.strip()
+    # ```json ... ``` や ``` ... ``` で囲まれている場合は中身だけ取り出す
+    fence_match = re.match(r'^```(?:json)?\s*(.*?)\s*```$', candidate, re.DOTALL)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+
+    if not _JSON_TOOL_CALL_LIKE_PATTERN.match(candidate):
+        return None
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    if isinstance(parsed, dict) and parsed.get("tool") == "web_search":
+        return parsed
+    return None
+
+
+async def _ai_chat_call_groq_with_search(
+    messages: list,
+    model: Optional[str] = None,
+    guild_config: Optional[dict] = None
+) -> str:
+    """
+    Web検索（Tavily→Exa→Firecrawlの優先順位で自動フォールバック。サーバーごとに優先順位を
+    カスタム設定可能）を使えるGroq呼び出し。
     どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出し（_ai_chat_call_groq）に
     そのままフォールバックします。
 
@@ -5422,6 +5497,11 @@ async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = 
     通常の会話では従来通り1回のAPI呼び出しで完結します（コスト・速度への影響は最小限）。
     最大2回まで検索ツールを呼ばせ、それ以上は打ち切って最終応答を強制します
     （無限に検索を繰り返してレスポンスが返らなくなることを防ぐため）。
+
+    一部のモデルはtool_callsフィールドを使わず、本文に直接JSONでツール呼び出しを
+    書いてしまうことがある（例: 画像で報告されたような {"tool": "web_search", ...} が
+    そのままユーザーに表示される不具合）。これを検知した場合も正しく検索を実行してから
+    最終応答を生成し直す。
     """
     if not WEB_SEARCH_AVAILABLE:
         return await _ai_chat_call_groq(messages, model=model)
@@ -5486,8 +5566,37 @@ async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = 
 
         tool_calls = message_obj.get("tool_calls")
         if not tool_calls:
-            # 通常の応答（検索不要と判断した、または検索ラウンドを使い切った）
             raw_content = message_obj.get("content") or ""
+
+            # 一部モデルはtool_callsを使わず、本文に直接JSONでツール呼び出しを書いてしまう
+            # ことがある（例: {"tool": "web_search", "query": "..."} がそのまま出力される）。
+            # これを検知した場合、生のJSONをユーザーに見せず、実際に検索を実行してから
+            # 会話履歴に「検索した体」で結果を積み、次のラウンドで最終応答を生成させる。
+            leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is not None and round_idx < max_search_rounds:
+                query = str(leaked_call.get("query", "")).strip()
+                print(f"[AIチャット/Web検索] 本文へのJSON漏れを検知して修復しました。クエリ: {query!r}")
+                if query:
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+                # ネイティブのtool_calls経路と揃え、アシスタント発言＋検索結果を履歴に積んで
+                # 次のラウンドで通常のテキスト応答を生成させる（生JSONは履歴にも残さない）
+                working_messages.append({
+                    "role": "assistant",
+                    "content": "（内部処理: Web検索を実行しました）"
+                })
+                working_messages.append({
+                    "role": "user",
+                    "content": f"（システム）検索結果:\n{search_result_text}\n\n上記の検索結果を踏まえて、通常の文章で回答してください。JSON形式では出力しないでください。"
+                })
+                continue
+
+            # 通常の応答（検索不要と判断した、または検索ラウンドを使い切った）
+            if leaked_call is not None:
+                # 検索ラウンドを使い切った状態でJSON漏れが検知された場合は、
+                # これ以上検索を試みず、生JSONも見せずに簡潔な断り文言を返す
+                return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
             reply_text = _strip_reasoning_tags(raw_content).strip()
             if choice.get("finish_reason") == "length":
                 reply_text += "\n\n*（⚠️ 出力上限のため応答が途中で切れている可能性があります）*"
@@ -5508,7 +5617,7 @@ async def _ai_chat_call_groq_with_search(messages: list, model: Optional[str] = 
                 query = str(func_args.get("query", "")).strip()
                 if query:
                     print(f"[AIチャット/Web検索] クエリ: {query}")
-                    search_result_text = await _web_search_fallback(query)
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
             else:
@@ -5742,6 +5851,7 @@ async def _ai_call_llm_with_fallback(
     model: Optional[str] = None,
     provider_override: Optional[str] = None,
     enable_search: bool = False,
+    guild_config: Optional[dict] = None,
 ) -> Tuple[str, str]:
     """
     Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
@@ -5751,10 +5861,16 @@ async def _ai_call_llm_with_fallback(
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
     enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索
-    （Tavily→Exa→Firecrawlの優先順位で自動フォールバック）機能を
-    持たせます（どのAPIキーも未設定の場合は自動的に検索なし呼び出しにフォールバックします）。
+    （既定: Tavily→Exa→Firecrawlの優先順位で自動フォールバック。guild_configで
+    サーバーごとにON/OFF・優先順位をカスタム設定可能）機能を持たせます
+    （どのAPIキーも未設定の場合、またはそのサーバーで検索が無効化されている場合は
+    自動的に検索なし呼び出しにフォールバックします）。
     フォールバックモデル・Cerebras・Mistralへの切り替え時は検索機能を使いません
     （実装をシンプルに保つため、検索は「メインの1回目の試行」でのみ有効）。
+
+    guild_config: そのサーバーの設定辞書。ai_chat_web_search_enabled（bool）で
+    Web検索の有効/無効を、ai_chat_search_provider_order（リスト）で検索プロバイダの
+    優先順位をサーバーごとに上書きできる。Noneの場合はコード既定の動作（検索有効・既定順）。
 
     provider_override:
       - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebras/Mistralへは切り替えない）
@@ -5786,11 +5902,15 @@ async def _ai_call_llm_with_fallback(
 
     candidate_models = [model] + GROQ_FALLBACK_MODELS
 
+    # サーバーごとの検索ON/OFF設定を反映（未設定なら既定でTrue=有効）
+    search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+    effective_enable_search = enable_search and search_enabled_for_guild
+
     last_error: Optional[Exception] = None
     for idx, candidate in enumerate(candidate_models):
         try:
-            if enable_search and idx == 0:
-                reply_text = await _ai_chat_call_groq_with_search(messages, model=candidate)
+            if effective_enable_search and idx == 0:
+                reply_text = await _ai_chat_call_groq_with_search(messages, model=candidate, guild_config=guild_config)
             else:
                 reply_text = await _ai_chat_call_groq(messages, model=candidate)
             return reply_text, "groq"
@@ -6561,7 +6681,10 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
             pass
         return
 
-    system_prompt = _ai_chat_finalize_system_prompt(user_setting["system_prompt"] or _ai_chat_resolve_default_system_prompt(guild_config))
+    system_prompt = _ai_chat_finalize_system_prompt(
+        user_setting["system_prompt"] or _ai_chat_resolve_default_system_prompt(guild_config),
+        guild_config=guild_config
+    )
     model = user_setting["model"] or None  # Noneなら _ai_chat_call_groq側でGROQ_MODELが使われる
 
     history = _ai_chat_get_history(message.channel.id, message.author.id)
@@ -6599,7 +6722,8 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 if provider_override not in ("groq", "cerebras", "mistral"):
                     provider_override = None
                 reply_text, used_provider = await _ai_call_llm_with_fallback(
-                    messages, model=model, provider_override=provider_override, enable_search=True
+                    messages, model=model, provider_override=provider_override, enable_search=True,
+                    guild_config=guild_config
                 )
                 if used_provider == "groq":
                     used_model = model or GROQ_MODEL
@@ -6813,6 +6937,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
     system_prompt = AI_CHAT_SYSTEM_PROMPT
     model: Optional[str] = None
     provider_override: Optional[str] = None
+    guild_config: Optional[dict] = None
     if interaction.guild is not None:
         guild_config = get_guild_config(all_data, str(interaction.guild.id))
         user_setting = _ai_chat_get_user_setting(guild_config, interaction.user.id)
@@ -6828,7 +6953,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
     # 履歴キー: DM/グループDM/サーバーいずれもチャンネルID単位（既存の自動応答と同じ仕組みを再利用）
     channel_id = interaction.channel_id
     history = _ai_chat_get_history(channel_id, interaction.user.id)
-    messages = [{"role": "system", "content": _ai_chat_finalize_system_prompt(system_prompt)}] + history + [
+    messages = [{"role": "system", "content": _ai_chat_finalize_system_prompt(system_prompt, guild_config=guild_config)}] + history + [
         {"role": "user", "content": 質問}
     ]
 
@@ -6836,7 +6961,8 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
 
     try:
         reply_text, _used_provider = await _ai_call_llm_with_fallback(
-            messages, model=model, provider_override=provider_override, enable_search=True
+            messages, model=model, provider_override=provider_override, enable_search=True,
+            guild_config=guild_config
         )
     except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
@@ -9819,27 +9945,33 @@ async def ai_chat_search_status(interaction: discord.Interaction):
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
         return
 
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    search_enabled_for_guild = guild_config.get("ai_chat_web_search_enabled", True)
+
     embed = discord.Embed(title="AIチャット Web検索機能", color=discord.Color.blue())
 
     # プロバイダ名（Tavily/Exa/Firecrawl等）は他Bot運営者に機能を模倣されないよう、
     # 管理者向け表示であっても具体名は出さず、設定済み数・優先順位のみを示す。
-    configured_flags = [bool(TAVILY_API_KEY), bool(EXA_API_KEY), bool(FIRECRAWL_API_KEY)]
+    provider_order = _resolve_search_provider_order(guild_config)
     status_text = "\n".join(
-        f"{'✅' if configured else '❌'} 検索プロバイダ{i}（優先順位 {i}）"
-        for i, configured in enumerate(configured_flags, start=1)
+        f"{'✅' if is_configured() else '❌'} 検索プロバイダ{i}（優先順位 {i}）"
+        for i, (_pid, _name, is_configured, _fn) in enumerate(provider_order, start=1)
     )
-    configured_count = sum(configured_flags)
+    configured_count = sum(1 for _pid, _name, is_configured, _fn in provider_order if is_configured())
 
     if WEB_SEARCH_AVAILABLE:
         embed.description = (
-            "✅ Web検索機能は有効です。\n"
-            "AIが「最新情報が必要」と判断した質問（最新ニュース・現在の状況など）に対しては、"
+            f"このサーバーでの現在の設定: {'✅ 有効' if search_enabled_for_guild else '⏸️ 無効（管理者により停止中）'}\n\n"
+            "有効な場合、AIが「最新情報が必要」と判断した質問（最新ニュース・現在の状況など）に対しては、"
             "以下の優先順位で設定済みのプロバイダを順に試し、自動的にWeb検索を行ってから回答します"
             "（1つが失敗・上限到達しても次のプロバイダに自動フォールバックします）。\n\n"
             f"{status_text}\n\n"
-            f"設定済み: {configured_count}/{len(configured_flags)}"
+            f"設定済み: {configured_count}/{len(provider_order)}\n\n"
+            "`/ai_chat set_search` でこのサーバーの検索ON/OFFを、"
+            "`/ai_chat set_search_provider` でプロバイダの優先順位を変更できます。"
         )
-        embed.color = discord.Color.green()
+        embed.color = discord.Color.green() if search_enabled_for_guild else discord.Color.orange()
     else:
         embed.description = (
             "❌ 現在無効です（Web検索用のAPIキーが1つも設定されていないため）。\n"
@@ -9848,6 +9980,167 @@ async def ai_chat_search_status(interaction: discord.Interaction):
             "（詳細はBotのソースコード管理者にお問い合わせください）。"
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AIChatSearchToggleView(discord.ui.View):
+    """
+    /ai_chat set_search で表示される、Web検索機能のON/OFFをボタン1つで切り替えられるビュー。
+    管理者権限を持つユーザーのみが操作できるよう、ボタン押下時に権限を再チェックする。
+    """
+    def __init__(self, guild_id: int, enabled: bool):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self._update_button_style(enabled)
+
+    def _update_button_style(self, enabled: bool):
+        self.toggle_button.label = "🔴 検索をOFFにする" if enabled else "🟢 検索をONにする"
+        self.toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+
+    @discord.ui.button(label="切り替え", style=discord.ButtonStyle.secondary)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("このボタンは管理者のみ操作できます。", ephemeral=True)
+            return
+
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(self.guild_id))
+        current = guild_config.get("ai_chat_web_search_enabled", True)
+        new_value = not current
+        guild_config["ai_chat_web_search_enabled"] = new_value
+        save_data(all_data)
+
+        self._update_button_style(new_value)
+
+        embed = discord.Embed(
+            title="AIチャット Web検索機能",
+            description=(
+                f"このサーバーでの設定を **{'✅ 有効' if new_value else '⏸️ 無効'}** に変更しました。\n\n"
+                + ("AIが必要と判断した質問には自動でWeb検索を使って回答します。"
+                   if new_value else
+                   "AIはWeb検索を使わず、学習データの時点までの知識のみで応答します。")
+            ),
+            color=discord.Color.green() if new_value else discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@ai_chat_group.command(name="set_search", description="【管理者専用】このサーバーのAIチャットWeb検索機能をボタンでON/OFF切り替えます")
+async def ai_chat_set_search(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
+        return
+
+    if not WEB_SEARCH_AVAILABLE:
+        await interaction.response.send_message(
+            "❌ Web検索用のAPIキーがBotに1つも設定されていないため、このサーバーでON/OFFを切り替えても"
+            "実際の動作は変わりません（常に検索なしで応答します）。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    search_enabled_for_guild = guild_config.get("ai_chat_web_search_enabled", True)
+
+    embed = discord.Embed(
+        title="AIチャット Web検索機能",
+        description=(
+            f"現在の設定: **{'✅ 有効' if search_enabled_for_guild else '⏸️ 無効'}**\n\n"
+            "下のボタンで切り替えできます。"
+        ),
+        color=discord.Color.green() if search_enabled_for_guild else discord.Color.orange()
+    )
+    view = AIChatSearchToggleView(interaction.guild.id, search_enabled_for_guild)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class AIChatSearchProviderSelect(discord.ui.Select):
+    """
+    検索プロバイダの優先順位（1番目に試すプロバイダ）を選ぶセレクトメニュー。
+    プロバイダ名は他Bot運営者への模倣防止のため具体名を出さず、「プロバイダ1/2/3」の
+    表記で統一する（search_status等の既存表示と揃える）。
+    """
+    def __init__(self, guild_id: int, current_order: list):
+        self.guild_id = guild_id
+        options = []
+        for i, (pid, _name, is_configured, _fn) in enumerate(_WEB_SEARCH_PROVIDERS, start=1):
+            label = f"プロバイダ{i}を優先"
+            options.append(discord.SelectOption(
+                label=label,
+                value=pid,
+                description="設定済み" if is_configured() else "未設定（APIキーなし）",
+                default=(len(current_order) > 0 and current_order[0] == pid)
+            ))
+        super().__init__(
+            placeholder="最優先で使う検索プロバイダを選択...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+
+        chosen_pid = self.values[0]
+        remaining = [pid for pid in _WEB_SEARCH_PROVIDER_IDS if pid != chosen_pid]
+        new_order = [chosen_pid] + remaining
+
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(self.guild_id))
+        guild_config["ai_chat_search_provider_order"] = new_order
+        save_data(all_data)
+
+        order_display = "\n".join(
+            f"{i}. プロバイダ{_WEB_SEARCH_PROVIDER_IDS.index(pid) + 1}"
+            for i, pid in enumerate(new_order, start=1)
+        )
+        embed = discord.Embed(
+            title="AIチャット Web検索プロバイダの優先順位",
+            description=f"優先順位を更新しました。\n\n{order_display}\n\n"
+                        "先頭のプロバイダが未設定・失敗した場合、自動的に次の順位のプロバイダへフォールバックします。",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class AIChatSearchProviderView(discord.ui.View):
+    """検索プロバイダの優先順位切り替え用ビュー（セレクトメニュー1つ）。"""
+    def __init__(self, guild_id: int, current_order: list):
+        super().__init__(timeout=120)
+        self.add_item(AIChatSearchProviderSelect(guild_id, current_order))
+
+
+@ai_chat_group.command(name="set_search_provider", description="【管理者専用】このサーバーで最優先に使う検索プロバイダを切り替えます")
+async def ai_chat_set_search_provider(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
+        return
+
+    if not WEB_SEARCH_AVAILABLE:
+        await interaction.response.send_message(
+            "❌ Web検索用のAPIキーがBotに1つも設定されていないため、プロバイダの優先順位を変更しても"
+            "実際の動作は変わりません。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    current_order_ids = [pid for pid, _n, _c, _f in _resolve_search_provider_order(guild_config)]
+
+    order_display = "\n".join(
+        f"{i}. プロバイダ{_WEB_SEARCH_PROVIDER_IDS.index(pid) + 1}"
+        for i, pid in enumerate(current_order_ids, start=1)
+    )
+    embed = discord.Embed(
+        title="AIチャット Web検索プロバイダの優先順位",
+        description=f"現在の優先順位:\n\n{order_display}\n\n下のメニューから最優先にしたいプロバイダを選んでください。",
+        color=discord.Color.blue()
+    )
+    view = AIChatSearchProviderView(interaction.guild.id, current_order_ids)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 
