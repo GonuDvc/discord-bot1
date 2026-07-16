@@ -5481,7 +5481,7 @@ async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str
     except (KeyError, IndexError, TypeError):
         raise GroqAPIError(f"Groq APIの応答形式が想定と異なります: {data}")
 
-    reply_text = _strip_reasoning_tags(raw_content).strip()
+    reply_text = _sanitize_ai_reply_content(raw_content)
 
     # 推論モデルは思考過程もmax_tokensを消費するため、本文が生成しきれず
     # 途中で打ち切られる（finish_reason == "length"）ことがある。
@@ -6058,6 +6058,38 @@ def _strip_reasoning_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _sanitize_ai_reply_content(raw_content: str) -> str:
+    """
+    Web検索機能を持たない呼び出し経路（_ai_chat_call_groq のフォールバックモデル呼び出し・
+    画像添付時のVisionモデル呼び出し、および _ai_chat_call_cerebras / _ai_chat_call_mistral）
+    向けの共通サニタイズ処理です。
+
+    _ai_chat_call_groq_with_search と同様、一部のモデルがtool_callsフィールドを使わず
+    本文に直接JSON形式のツール呼び出し（例: {"tool": "web_search", "query": "..."}）を
+    書いてしまうことがあります。これらの呼び出し経路では実際に検索して修復することは
+    できないため、代わりに次のように扱います:
+      (A) 先頭にJSON＋ノイズが付着し、後ろに回答文が続く場合 → 先頭部分だけ除去して返す
+      (B) 本文全体がJSON形式のツール呼び出しのみの場合 → 生JSONを見せず、簡潔な断り文言を返す
+      (C) いずれにも該当しない場合 → <think>タグ除去のみ行い、そのまま返す
+    """
+    if not raw_content:
+        return raw_content
+
+    # (A) 先頭のJSON＋ノイズを除去し、後ろに回答文が続いていればそちらを使う
+    stripped_content = _strip_leaked_tool_call_prefix(raw_content)
+    if stripped_content != raw_content:
+        return _strip_reasoning_tags(stripped_content).strip()
+
+    # (B) 本文全体がJSON形式のツール呼び出しのみの場合、生JSONは見せない
+    leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+    if leaked_call is not None:
+        print(f"[AIチャット] 検索非対応の呼び出し経路でJSON漏れを検知しました（生JSONは非表示）: {raw_content[:200]!r}")
+        return "（検索が必要な質問でしたが、この応答方式では検索を実行できませんでした。質問を変えて再度お試しください。）"
+
+    # (C) 通常の応答
+    return _strip_reasoning_tags(raw_content).strip()
+
+
 # ====================================================================
 # Cerebras API（Groqの日次上限到達時の最終フォールバック先）
 # ====================================================================
@@ -6138,7 +6170,7 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
     except (KeyError, IndexError, TypeError):
         raise CerebrasAPIError(f"Cerebras APIの応答形式が想定と異なります: {data}")
 
-    reply_text = _strip_reasoning_tags(raw_content).strip()
+    reply_text = _sanitize_ai_reply_content(raw_content)
     if choice.get("finish_reason") == "length":
         reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
 
@@ -6225,7 +6257,7 @@ async def _ai_chat_call_mistral(messages: list, model: Optional[str] = None) -> 
     except (KeyError, IndexError, TypeError):
         raise MistralAPIError(f"Mistral APIの応答形式が想定と異なります: {data}")
 
-    reply_text = _strip_reasoning_tags(raw_content).strip()
+    reply_text = _sanitize_ai_reply_content(raw_content)
     if choice.get("finish_reason") == "length":
         reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
 
