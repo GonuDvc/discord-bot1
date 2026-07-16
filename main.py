@@ -5461,10 +5461,27 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 
 # 一部のモデル（特に量子化・軽量モデル）はネイティブのtool_callsフィールドではなく、
 # 応答本文(content)の中に直接JSON形式でツール呼び出しを書いてしまうことがある。
-# 例: { "tool": "web_search", "query": "..." } のようなテキストがそのままユーザーに
-# 表示されてしまう不具合を防ぐため、contentがそのようなJSONに見える場合を検知する。
+# パターンは主に2種類ある：
+#   (A) 本文全体がJSONのみ（例: {"tool": "web_search", "query": "..."}）
+#       → ツールがまだ実行されていないので、実際に検索してから応答を作り直す必要がある。
+#   (B) 本文の先頭にJSON（＋"[No output]"等のノイズ）が付着し、その後ろに
+#       モデル自身が生成した回答文が続く（例:
+#       {"tool":"web_search","query":"..."}[No output]現在の日本時間は...です）
+#       → モデルは既に回答を生成してしまっているので、先頭のJSON＋ノイズ部分だけを
+#         取り除き、後続の回答文をそのまま使う（無駄な再呼び出しを避ける）。
 _JSON_TOOL_CALL_LIKE_PATTERN = re.compile(
     r'^\s*\{[^{}]*["\']tool["\']\s*:\s*["\']web_search["\'][^{}]*\}\s*$',
+    re.DOTALL
+)
+
+# (B) 用: 本文の先頭にある「JSONツール呼び出し＋任意のノイズ（[No output]等の短い定型文言）」
+# を検知して取り除くためのパターン。JSON本体をグループ1として、後ろの本文（実際の回答）を
+# 取り出せるようにする。ノイズ部分は「[ ] で囲まれた短い英字混じりの文言」に限定し、
+# 通常の回答文の一部（例: 文中の記号など）を誤って除去しないようにする。
+_LEADING_JSON_TOOL_CALL_PREFIX_PATTERN = re.compile(
+    r'^\s*(\{[^{}]*["\']tool["\']\s*:\s*["\']web_search["\'][^{}]*\})'
+    r'(?:\s*\[[A-Za-z0-9_\-\s]{0,30}\])?'
+    r'\s*',
     re.DOTALL
 )
 
@@ -5475,6 +5492,9 @@ def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     書いてしまった場合（例: {"tool": "web_search", "query": "..."}）を検知し、
     パースできればクエリ等を含む辞書を返す。該当しない・パース失敗時はNoneを返す。
     コードブロック（```json ... ```）で囲まれているケースにも対応する。
+
+    本文全体がJSONのみの場合（後ろに回答文が続いていない場合）のみを対象とする。
+    JSONの後ろに回答文が続くケースは _strip_leaked_tool_call_prefix で別途処理する。
     """
     if not raw_content:
         return None
@@ -5495,6 +5515,45 @@ def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     if isinstance(parsed, dict) and parsed.get("tool") == "web_search":
         return parsed
     return None
+
+
+def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
+    """
+    本文の先頭に「JSON形式のツール呼び出し（＋[No output]等のノイズ）」が付着し、
+    その後ろに実際の回答文が続いているケースを検知し、先頭のノイズ部分だけを
+    取り除いた本文を返す。該当しない場合は raw_content をそのまま返す。
+
+    例: '{"tool":"web_search","query":"現在 日本 時刻"}[No output]現在の日本時間は...'
+        → '現在の日本時間は...'
+
+    このケースではモデルが既に回答文を生成し終えているため、再度APIを呼んで
+    検索させ直すのではなく、ノイズを除去してそのまま使うのが最も自然な対処になる
+    （画像で報告された「JSON＋[No output]＋回答文」がそのまま表示される不具合の修正）。
+    """
+    if not raw_content:
+        return raw_content
+
+    match = _LEADING_JSON_TOOL_CALL_PREFIX_PATTERN.match(raw_content)
+    if not match:
+        return raw_content
+
+    json_part = match.group(1)
+    try:
+        parsed = json.loads(json_part)
+    except json.JSONDecodeError:
+        return raw_content
+
+    if not (isinstance(parsed, dict) and parsed.get("tool") == "web_search"):
+        return raw_content
+
+    remainder = raw_content[match.end():].strip()
+    # 除去した結果、後ろに何も残らない（JSON単体だった）場合は呼び出し元の
+    # 「本文全体がJSON」処理に任せるため、そのまま元の文字列を返す
+    if not remainder:
+        return raw_content
+
+    print(f"[AIチャット/Web検索] 応答本文からJSON漏れの先頭ノイズを除去しました: {json_part!r}")
+    return remainder
 
 
 async def _ai_chat_call_groq_with_search(
@@ -5582,6 +5641,17 @@ async def _ai_chat_call_groq_with_search(
         tool_calls = message_obj.get("tool_calls")
         if not tool_calls:
             raw_content = message_obj.get("content") or ""
+
+            # ケース(B): 先頭にJSON形式のツール呼び出し（＋[No output]等のノイズ）が付着し、
+            # その後ろにモデル自身が生成した回答文が続いているケース。
+            # この場合モデルは既に回答を生成し終えているので、再度検索・再呼び出しはせず、
+            # 先頭のノイズだけを取り除いて残りの本文をそのまま使う。
+            stripped_content = _strip_leaked_tool_call_prefix(raw_content)
+            if stripped_content != raw_content:
+                reply_text = _strip_reasoning_tags(stripped_content).strip()
+                if choice.get("finish_reason") == "length":
+                    reply_text += "\n\n*（⚠️ 出力上限のため応答が途中で切れている可能性があります）*"
+                return reply_text
 
             # 一部モデルはtool_callsを使わず、本文に直接JSONでツール呼び出しを書いてしまう
             # ことがある（例: {"tool": "web_search", "query": "..."} がそのまま出力される）。
