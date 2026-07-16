@@ -87,24 +87,33 @@ MISTRAL_MAX_TOKENS = int(os.getenv("MISTRAL_MAX_TOKENS", "2048"))
 # 各社とも無料枠には月間の上限があるため、1つのAPIが上限に達しても検索機能自体は止まらないよう、
 # 複数のAPIを優先順位付きで用意し、上位から順に試して失敗（レート制限・エラー等）したら
 # 次のAPIに自動フォールバックする（Groq→Cerebras→Mistralと同じ考え方）。
-# 優先順位: Tavily → Exa → Firecrawl
+# 優先順位: Tavily → Exa → Firecrawl → NewsData.io
 # いずれのAPIキーも未設定の場合はWeb検索機能自体が無効になり、AIは自身の知識のみで応答する
 # （既存の動作と同じ）。無料枠の目安（2026年7月時点、各社サイトで要確認・変更されうる）:
 #   Tavily: 月1,000クレジット（カード不要）
 #   Exa: 月1,000検索（カード不要）
 #   Firecrawl: 月1,000クレジット（カード不要）
+#   NewsData.io: 1日200クレジット（カード不要。ニュース記事専門で一般検索とは性質が異なる）
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 # --- Exa Search API（Tavilyが上限に達した際の第2フォールバック先） ---
 # 未設定（EXA_API_KEY未設定）の場合はExaへのフォールバックを行わない。
 EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 
-# --- Firecrawl Search API（最終フォールバック先） ---
+# --- Firecrawl Search API（第3フォールバック先） ---
 # 未設定（FIRECRAWL_API_KEY未設定）の場合はFirecrawlへのフォールバックを行わない。
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
 
+# --- NewsData.io（最終フォールバック先） ---
+# ニュース記事専門の検索API（一般的なWeb検索ではなく報道記事に特化）。
+# 時事ニュース関連の質問では他プロバイダより適合度が高い場合がある一方、
+# ニュース以外の一般的な話題（技術文書、製品情報等）には向かない。
+# 無料枠は1日200クレジットまで（"latest"エンドポイントは直近48時間の記事が対象）。
+# 未設定（NEWSDATA_API_KEY未設定）の場合はNewsData.ioへのフォールバックを行わない。
+NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY", "")
+
 # いずれか1つでもWeb検索APIキーが設定されていれば、Web検索機能（ツール）自体をAIに提示する。
-WEB_SEARCH_AVAILABLE = bool(TAVILY_API_KEY or EXA_API_KEY or FIRECRAWL_API_KEY)
+WEB_SEARCH_AVAILABLE = bool(TAVILY_API_KEY or EXA_API_KEY or FIRECRAWL_API_KEY or NEWSDATA_API_KEY)
 
 # --- 画像生成API（/image コマンド） ---
 # 1社の無料枠上限・障害時でも機能が完全に止まらないよう、優先順位付きでフォールバックする。
@@ -385,6 +394,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "automod_spam_enabled": False,
             "automod_invite_enabled": False,
             "automod_ng_words_enabled": False,
+            "automod_image_ocr_invite_enabled": False,
             "ng_words": [],
             "mod_log_channel_id": None,
             "custom_triggers": [],
@@ -417,6 +427,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("alt_check_days", 30),
         ("alt_check_action", "notify"),
         ("iplogger_check_enabled", False),
+        # True: 画像添付をOCR解析し、画像内に書かれた招待リンク文字列を検知・削除する。
+        # 既存の automod_invite_enabled（テキスト本文の招待リンク検知）とは独立したスイッチ。
+        # OCR結果は誤読が多いため、正規表現での一次検知に加えてAIによる誤検知抑制判定を行う
+        # （OCR_SPACE_API_KEY未設定の場合は機能自体が動作しない）。
+        ("automod_image_ocr_invite_enabled", False),
         ("ip_ban_check_enabled", False),   # True: ウェブ認証時にBAN済みIPと照合してブロック
         ("ip_ban_action", "ban"),          # "notify" / "kick" / "ban"
         ("ip_hashes", {}),                 # {user_id_str: ip_hash} 認証時に記録した直近IPのハッシュ
@@ -503,7 +518,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_guild_system_prompt", None),  # サーバー全体の既定AI人格（システムプロンプト）。未設定ならコード内蔵の既定文を使用。オーナーが /ai_chat set_personality で設定
         # --- AIチャット：Web検索のON/OFF・使用プロバイダ切り替え（管理者専用） ---
         ("ai_chat_web_search_enabled", True),   # True: Web検索ツールをAIに提示する（APIキーが1つも無ければ実際は使われない）。管理者が /ai_chat set_search または埋め込みボタンで切り替え
-        ("ai_chat_search_provider_order", None),  # ["tavily","exa","firecrawl"] のような優先順位リスト。未設定(None)ならコード既定の優先順位（Tavily→Exa→Firecrawl）を使用
+        ("ai_chat_search_provider_order", None),  # ["tavily","exa","firecrawl","newsdata"] のような優先順位リスト。未設定(None)ならコード既定の優先順位（Tavily→Exa→Firecrawl→NewsData.io）を使用
         # --- AIチャット：他BOTの発言への自動応答（安全対策付き・オーナー専用） ---
         ("ai_chat_bot_reply_enabled", False),   # True: 登録済みBotの発言にAIチャットチャンネルで自動応答する
         ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
@@ -4242,9 +4257,127 @@ async def _check_iplogger(message: discord.Message) -> bool:
     return True
 
 
+# OCR結果（画像から読み取ったテキスト）から招待リンクらしき文字列を一次検知する正規表現。
+# OCR誤読で起こりやすいゆらぎ（"."が","や"9"に化ける、スペース混入等）を最小限吸収する。
+# 過度に緩めると誤検知が増えAI補助判定のコストも上がるため、実際に起こりやすい誤読パターンに絞る。
+_OCR_INVITE_LINK_PATTERN = re.compile(
+    r"discord[\s.,:;9]{0,3}(gg|com\s*/\s*invite)[\s/]{0,3}[a-z0-9\-]{2,}"
+    r"|dsc[\s.,:;9]{0,3}gg[\s/]{0,3}[a-z0-9\-]{2,}",
+    re.IGNORECASE
+)
+
+_AI_OCR_INVITE_JUDGE_SYSTEM_PROMPT = (
+    "あなたはDiscordの自動モデレーションシステムの一部です。"
+    "OCR（画像文字認識）で画像から読み取ったテキストの断片が渡されます。"
+    "これはOCRの誤読を含む可能性があります（記号の読み間違い、スペースの混入・欠落等）。"
+    "この文字列が実際にDiscordサーバーへの招待リンク（例: discord.gg/xxxxx、"
+    "discord.com/invite/xxxxx）を示していると考えられるかを判定してください。"
+    "単に「discord」という単語が含まれるだけで招待リンクとは無関係な文章（例: "
+    "Discordというアプリの話をしている、discordという英単語（不和の意）を使っている等）は"
+    "flaggedをfalseにしてください。"
+    "必ず以下のJSON形式のみで出力してください（前後に説明文やコードブロック記号は不要）:\n"
+    '{"flagged": true または false, "reason": "判定理由を一文で"}'
+)
+
+
+async def _ai_judge_ocr_invite_link(ocr_snippet: str, guild_id: Optional[int] = None) -> Tuple[bool, str]:
+    """
+    OCRで検知した招待リンクらしき文字列の断片をAIに渡し、本当に招待リンクかどうかの
+    誤検知抑制判定を行います。AI呼び出しに失敗した場合は安全側（flagged=True、つまり
+    正規表現の一次判定結果をそのまま採用）にフォールバックします。
+    """
+    messages = [
+        {"role": "system", "content": _AI_OCR_INVITE_JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": ocr_snippet[:200]},
+    ]
+    try:
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
+    except Exception as e:
+        print(f"[画像OCR招待リンク検知] AI補助判定の呼び出しに失敗（正規表現の一次判定を採用）: {e}")
+        return True, "OCRパターン一致（AI補助判定は利用できませんでした）"
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        flagged = bool(parsed.get("flagged", True))
+        reason = str(parsed.get("reason", "")).strip() or "AIが招待リンクと判定しました"
+        return flagged, reason
+    except (json.JSONDecodeError, AttributeError, ValueError) as e:
+        print(f"[画像OCR招待リンク検知] AI判定結果の解析に失敗（正規表現の一次判定を採用）: {e} / raw={cleaned[:200]}")
+        return True, "OCRパターン一致（AI判定結果の解析に失敗したため一次判定を採用）"
+
+
+async def _check_image_invite_link(message: discord.Message) -> bool:
+    """
+    メッセージに添付された画像をOCR解析し、画像内に書かれた招待リンク文字列を検知した場合
+    メッセージを削除・通知します。True を返すと呼び出し元でメッセージ処理を中断します。
+    既存のテキスト本文向け招待リンク検知（automod_invite_enabled）とは独立した機能で、
+    OCR_SPACE_API_KEY が未設定の場合は何もせず False を返します。
+    """
+    if not OCR_SPACE_API_KEY or not message.attachments:
+        return False
+
+    _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+    image_url: Optional[str] = None
+    for attachment in message.attachments:
+        filename_lower = (attachment.filename or "").lower()
+        if filename_lower.endswith(_IMAGE_EXTENSIONS):
+            image_url = attachment.url
+            break
+
+    if image_url is None:
+        return False
+
+    ocr_text = await extract_text_from_image(image_url)
+    if not ocr_text:
+        return False
+
+    match = _OCR_INVITE_LINK_PATTERN.search(ocr_text)
+    if not match:
+        return False
+
+    # 一次判定に一致した箇所の前後を含めてAIに渡し、誤検知（例: 単なる「discord」という
+    # 単語や無関係な文脈での言及）を抑制する。
+    start = max(0, match.start() - 20)
+    end = min(len(ocr_text), match.end() + 20)
+    snippet = ocr_text[start:end]
+
+    flagged, reason = await _ai_judge_ocr_invite_link(snippet, guild_id=message.guild.id if message.guild else None)
+    if not flagged:
+        return False
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    warn_embed = discord.Embed(
+        title=" 画像内の招待リンクを検知・削除しました",
+        color=discord.Color.red()
+    )
+    warn_embed.add_field(name="送信者", value=message.author.mention, inline=True)
+    warn_embed.add_field(name="検知理由", value=reason, inline=False)
+    warn_embed.set_footer(text="画像OCR招待リンク検知（AI補助判定）による自動削除")
+
+    try:
+        await message.channel.send(
+            f"[!] {message.author.mention} 画像内に含まれる招待リンクを検知したため削除しました。",
+            delete_after=10
+        )
+    except Exception:
+        pass
+
+    await _send_mod_log(message.guild, warn_embed)
+    return True
+
+
 async def _run_automod_checks(message: discord.Message, guild_config: dict) -> bool:
     """
-    招待リンク削除・NGワード削除・IPロガー検知を実行します。
+    招待リンク削除・NGワード削除・IPロガー検知・画像OCR招待リンク検知を実行します。
     削除した場合は True を返します（呼び出し元でreturnするため）。
     スパム検知はメッセージ送信時のみ対象のため含めていません。
     """
@@ -4281,6 +4414,11 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict) -> b
     # IPロガー検知
     if guild_config.get("iplogger_check_enabled", False):
         if await _check_iplogger(message):
+            return True
+
+    # 画像OCR招待リンク検知（テキスト本文の招待リンク検知とは独立したスイッチ）
+    if guild_config.get("automod_image_ocr_invite_enabled", False):
+        if await _check_image_invite_link(message):
             return True
 
     return False
@@ -5374,12 +5512,63 @@ async def _firecrawl_web_search(query: str, max_results: int = 5) -> str:
     return "\n\n".join(lines)
 
 
+async def _newsdata_web_search(query: str, max_results: int = 5) -> str:
+    """
+    NewsData.io の latest エンドポイントを呼び出し、検索結果をテキスト形式に整形して返します。
+    失敗時はWebSearchErrorをraiseします。
+    他プロバイダと異なりニュース記事専門のAPIのため、直近48時間以内の報道記事のみが対象です
+    （一般的なWebページやドキュメント等はヒットしません）。
+    """
+    params = {
+        "apikey": NEWSDATA_API_KEY,
+        "q": query,
+        "language": "ja,en",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://newsdata.io/api/1/latest",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise WebSearchError(f"NewsData.io APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+    except WebSearchError:
+        raise
+    except Exception as e:
+        raise WebSearchError(f"NewsData.io 呼び出しエラー: {e}") from e
+
+    if data.get("status") != "success":
+        raise WebSearchError(f"NewsData.io APIエラー: {str(data.get('results', ''))[:300]}")
+
+    results = data.get("results") or []
+    if not results:
+        return "（検索結果が見つかりませんでした。）"
+
+    lines = []
+    for i, r in enumerate(results[:max_results], start=1):
+        title = (r.get("title") or "").strip()
+        # descriptionが空の場合はcontent（本文、APIにより200字程度に切り詰め）で代替
+        description = (r.get("description") or r.get("content") or "").strip()[:500]
+        url = r.get("link", "")
+        source = (r.get("source_name") or "").strip()
+        pub_date = (r.get("pubDate") or "").strip()
+        meta = " / ".join(x for x in [source, pub_date] if x)
+        header = f"[{i}] {title}" + (f"（{meta}）" if meta else "")
+        lines.append(f"{header}\n{description}\n出典URL: {url}")
+
+    return "\n\n".join(lines)
+
+
 # 優先順位付きのプロバイダ一覧: (内部ID, 表示名, APIキーが設定されているか判定する関数, 検索実行関数)
 # 内部IDはサーバーごとの優先順位設定（ai_chat_search_provider_order）で参照するために使用する。
 _WEB_SEARCH_PROVIDERS = [
     ("tavily", "Tavily", lambda: bool(TAVILY_API_KEY), _tavily_web_search),
     ("exa", "Exa", lambda: bool(EXA_API_KEY), _exa_web_search),
     ("firecrawl", "Firecrawl", lambda: bool(FIRECRAWL_API_KEY), _firecrawl_web_search),
+    ("newsdata", "NewsData.io", lambda: bool(NEWSDATA_API_KEY), _newsdata_web_search),
 ]
 _WEB_SEARCH_PROVIDER_IDS = [p[0] for p in _WEB_SEARCH_PROVIDERS]
 
@@ -5389,7 +5578,7 @@ def _resolve_search_provider_order(guild_config: Optional[dict] = None) -> list:
     実際に試す順番でプロバイダのタプル一覧を返します。
     guild_configに ai_chat_search_provider_order（["tavily","firecrawl","exa"]等）が
     設定されていればその順を使用し、未指定・不正な値が混ざっている場合はコード既定の順序
-    （Tavily→Exa→Firecrawl）にフォールバックします。
+    （Tavily→Exa→Firecrawl→NewsData.io）にフォールバックします。
     設定リストに含まれないプロバイダIDがあっても無視し、既定順の末尾に追加はしません
     （管理者が明示的に選んだプロバイダのみを、指定された順で試す）。
     """
@@ -5405,7 +5594,7 @@ def _resolve_search_provider_order(guild_config: Optional[dict] = None) -> list:
 
 async def _web_search_fallback(query: str, max_results: int = 5, guild_config: Optional[dict] = None) -> str:
     """
-    設定済みのWeb検索APIを優先順位（既定: Tavily→Exa→Firecrawl。サーバーごとにカスタム順設定可）
+    設定済みのWeb検索APIを優先順位（既定: Tavily→Exa→Firecrawl→NewsData.io。サーバーごとにカスタム順設定可）
     の順に試し、最初に成功したものの結果を返します。
     どのAPIキーも未設定の場合、または全プロバイダが失敗した場合のみ、
     その旨を示す短いテキストを返します（検索に失敗してもAIチャット自体は継続させたいため）。
@@ -5562,7 +5751,7 @@ async def _ai_chat_call_groq_with_search(
     guild_config: Optional[dict] = None
 ) -> str:
     """
-    Web検索（Tavily→Exa→Firecrawlの優先順位で自動フォールバック。サーバーごとに優先順位を
+    Web検索（Tavily→Exa→Firecrawl→NewsData.ioの優先順位で自動フォールバック。サーバーごとに優先順位を
     カスタム設定可能）を使えるGroq呼び出し。
     どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出し（_ai_chat_call_groq）に
     そのままフォールバックします。
@@ -5946,7 +6135,7 @@ async def _ai_call_llm_with_fallback(
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
     enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索
-    （既定: Tavily→Exa→Firecrawlの優先順位で自動フォールバック。guild_configで
+    （既定: Tavily→Exa→Firecrawl→NewsData.ioの優先順位で自動フォールバック。guild_configで
     サーバーごとにON/OFF・優先順位をカスタム設定可能）機能を持たせます
     （どのAPIキーも未設定の場合、またはそのサーバーで検索が無効化されている場合は
     自動的に検索なし呼び出しにフォールバックします）。
@@ -8662,7 +8851,7 @@ async def help_command(interaction: discord.Interaction):
             value=(
                 "`/server protect welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
                 "`/automod modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
-                "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
+                "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード・画像OCR招待リンク検知）を切り替えます\n"
                 "`/automod ngword_add` / `/automod ngword_remove` : NGワードの追加・削除を行います\n"
                 "`/server protect alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
                 "`/antinuke toggle` : 不審な連続操作の自動検出を有効・無効にします\n"
@@ -11865,6 +12054,7 @@ async def purge_external_apps(
     discord.app_commands.Choice(name="招待リンク削除", value="invite"),
     discord.app_commands.Choice(name="NGワード検知", value="ngword"),
     discord.app_commands.Choice(name="AI自動モデレーション（言い換え・遠回しな迷惑発言を検知）", value="ai"),
+    discord.app_commands.Choice(name="画像OCR招待リンク検知（AI補助判定）", value="image_ocr_invite"),
 ])
 async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_commands.Choice[str], 有効化: bool):
     if not await is_moderator(interaction): return
@@ -11881,12 +12071,21 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
         )
         return
 
+    if 機能.value == "image_ocr_invite" and 有効化 and not OCR_SPACE_API_KEY:
+        await interaction.response.send_message(
+            "OCR_SPACE_API_KEY が設定されていないため、画像OCR招待リンク検知を有効化できません。Botの環境変数を確認してください。",
+            ephemeral=True
+        )
+        return
+
     cfg[key] = 有効化
     save_data(all_data)
     status = "ON" if 有効化 else "OFF"
     extra_note = ""
     if 機能.value == "ai" and 有効化:
         extra_note = f"\n（判定は{AI_AUTOMOD_BATCH_INTERVAL_SECONDS}秒間隔でまとめて実行されるため、削除まで多少のタイムラグがあります）"
+    if 機能.value == "image_ocr_invite" and 有効化:
+        extra_note = "\n（テキスト本文の招待リンク削除とは独立した設定です。画像添付があるメッセージのみOCR解析を行います）"
     await interaction.response.send_message(
         f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。{extra_note}",
         ephemeral=True
@@ -18778,6 +18977,7 @@ DASHBOARD_TOGGLE_KEYS = {
     "automod_spam_enabled":     "AutoMod（スパム対策）",
     "automod_invite_enabled":   "AutoMod（招待リンクブロック）",
     "automod_ng_words_enabled": "AutoMod（NGワード）",
+    "automod_image_ocr_invite_enabled": "AutoMod（画像OCR招待リンク検知）",
     "server_blacklist_enabled": "サーバーブラックリスト自動BAN",
     "troll_autoban_enabled":    "荒らしリスト自動BAN",
     "economy_enabled":          "経済システム（コイン）",
@@ -18874,6 +19074,7 @@ class GuildDashboardView(discord.ui.View):
             ("automod_spam_enabled", " AutoModスパム", discord.ButtonStyle.secondary),
             ("automod_invite_enabled", " 招待リンク", discord.ButtonStyle.secondary),
             ("automod_ng_words_enabled", " NGワード", discord.ButtonStyle.secondary),
+            ("automod_image_ocr_invite_enabled", " 画像OCR招待リンク", discord.ButtonStyle.secondary),
             ("server_blacklist_enabled", " 鯖ブラックリスト", discord.ButtonStyle.secondary),
             ("troll_autoban_enabled", " 荒らし自動BAN", discord.ButtonStyle.secondary),
             ("economy_enabled", " 経済システム", discord.ButtonStyle.secondary),
