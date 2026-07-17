@@ -4823,6 +4823,13 @@ async def on_message(message: discord.Message):
         await _handle_dm_relay(message)
         return
 
+    # セットアップウィザード: 進行中のセッションスレッドでの発言は専用処理に回し、
+    # 他の自動応答・モデレーション処理とは干渉させない（他の処理より先に判定する）
+    if message.channel.id in _setup_wizard_sessions:
+        handled = await _handle_setup_wizard_message(message)
+        if handled:
+            return
+
     guild_id_str = str(message.guild.id)
     all_data = load_data()
 
@@ -21218,6 +21225,428 @@ async def _board_manage_save_handler(request):
     save_server_board_data(board_data)
 
     return _board_manage_redirect(resolved_access_query, "掲示板情報を保存しました。")
+
+
+# ====================================================================
+# セクション 17.5: AIサーバーセットアップウィザード
+# ・/setup コマンドで専用スレッドを開始し、AIとの自由テキスト対話で
+#   「どんな用途のサーバーか」「必要なチャンネル構成」「ロール構成」をヒアリング
+# ・AIがヒアリング十分と判断すると __PLAN_READY__ + JSON を出力 → プレビューEmbed表示
+# ・「作成」ボタン押下で一括構築（既存チャンネル/ロールは変更せず、追加のみ行う安全設計）
+# ====================================================================
+
+SETUP_WIZARD_MAX_TURNS = 12                 # ヒアリングの往復上限（無限ループ防止）
+SETUP_WIZARD_SESSION_TIMEOUT_SECONDS = 900  # 15分操作が無ければセッションを自動終了
+SETUP_WIZARD_COOLDOWN_SECONDS = 5           # 連続メッセージ送信の最低間隔
+SETUP_WIZARD_PLAN_MARKER = "__PLAN_READY__"
+
+SETUP_WIZARD_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバーの構築を手伝う設定アシスタントです。"
+    "ユーザーと日本語で自然に会話しながら、これから作るサーバー（または追加する構成）について "
+    "「サーバーの用途・目的」「欲しいテキストチャンネル／ボイスチャンネル」「欲しいロール」を "
+    "ヒアリングしてください。\n"
+    "ルール:\n"
+    "・一度に大量の質問をせず、1〜2個ずつ聞いてください。\n"
+    "・ユーザーの回答が曖昧な場合は、一般的なサーバー構成（雑談・お知らせ・自己紹介・ボイス通話等）を"
+    "提案しながら具体化してください。\n"
+    "・ユーザーが「お任せする」「それでいい」等、構成の決定をあなたに委ねた場合は、"
+    "それ以上質問を重ねず、妥当な構成案を自分で決めてすぐに次のルールに従ってプランを出力してください。\n"
+    "・ヒアリングが十分に済み、構成案を提示できる状態になったら、必ず出力の先頭に "
+    f"半角で「{SETUP_WIZARD_PLAN_MARKER}」という文字列だけを書き、続けて改行し、"
+    "以下のJSON形式のみを出力してください（それ以外の文章・Markdownのコードブロック記号は一切付けないこと）。\n"
+    "{\n"
+    '  "summary": "この構成案の一言説明",\n'
+    '  "categories": [\n'
+    '    {"name": "カテゴリ名", "channels": [{"type": "text または voice", "name": "チャンネル名"}]}\n'
+    "  ],\n"
+    '  "roles": [\n'
+    '    {"name": "ロール名", "color": "#RRGGBB(任意)", "hoist": true/false(任意), "mentionable": true/false(任意)}\n'
+    "  ]\n"
+    "}\n"
+    "・JSONを出力する時点では、それ以外の説明文は一切書かないでください（マーカーとJSONのみ）。\n"
+    "・まだヒアリング中の間は、通常の会話文だけを返し、絶対にマーカーやJSONを出力しないでください。"
+)
+
+# {thread_id: {"guild_id": int, "user_id": int, "messages": [...], "turns": int, "last_active": epoch}}
+_setup_wizard_sessions: dict = {}
+# {guild_id: thread_id} — サーバーごとに同時進行セッションを1つに制限するための逆引き
+_setup_wizard_guild_active: dict = {}
+
+
+def _setup_wizard_cleanup_stale_sessions():
+    """タイムアウトした古いセッションを掃除します。"""
+    now = time.time()
+    stale_thread_ids = [
+        tid for tid, s in _setup_wizard_sessions.items()
+        if now - s.get("last_active", now) > SETUP_WIZARD_SESSION_TIMEOUT_SECONDS
+    ]
+    for tid in stale_thread_ids:
+        session = _setup_wizard_sessions.pop(tid, None)
+        if session and _setup_wizard_guild_active.get(session["guild_id"]) == tid:
+            _setup_wizard_guild_active.pop(session["guild_id"], None)
+
+
+def _setup_wizard_end_session(thread_id: int):
+    """セッションを明示的に終了します（完了・キャンセル・エラー時に呼び出し）。"""
+    session = _setup_wizard_sessions.pop(thread_id, None)
+    if session and _setup_wizard_guild_active.get(session["guild_id"]) == thread_id:
+        _setup_wizard_guild_active.pop(session["guild_id"], None)
+
+
+def _setup_wizard_extract_plan(reply_text: str) -> Optional[dict]:
+    """AI応答から __PLAN_READY__ マーカー以降のJSON構成案を抽出します。失敗時はNoneを返します。"""
+    marker_idx = reply_text.find(SETUP_WIZARD_PLAN_MARKER)
+    if marker_idx == -1:
+        return None
+    json_part = reply_text[marker_idx + len(SETUP_WIZARD_PLAN_MARKER):].strip()
+    # AIがMarkdownのコードブロック記号を付けてしまった場合に備えて除去する
+    json_part = re.sub(r"^```(?:json)?\s*|\s*```$", "", json_part.strip())
+    try:
+        plan = json.loads(json_part)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(plan, dict):
+        return None
+    return plan
+
+
+def _setup_wizard_build_preview_embed(plan: dict, requester: discord.Member) -> discord.Embed:
+    """構成案プレビュー用のEmbedを作成します。"""
+    embed = discord.Embed(
+        title="サーバー構成案プレビュー",
+        description=str(plan.get("summary") or "AIが提案したサーバー構成案です。内容を確認してください。")[:400],
+        color=discord.Color.green()
+    )
+
+    categories = plan.get("categories") or []
+    if categories:
+        lines = []
+        for cat in categories[:25]:
+            cat_name = str(cat.get("name", "（無名カテゴリ）"))[:100]
+            channels = cat.get("channels") or []
+            ch_lines = []
+            for ch in channels[:25]:
+                ch_type = "🔊" if str(ch.get("type", "text")).lower() == "voice" else "#"
+                ch_lines.append(f"　{ch_type}{ch.get('name', '無名チャンネル')}")
+            block = f"**📁 {cat_name}**"
+            if ch_lines:
+                block += "\n" + "\n".join(ch_lines)
+            lines.append(block)
+        text = "\n".join(lines)
+        embed.add_field(name=f"チャンネル構成（カテゴリ数: {len(categories)}）", value=text[:1024] or "（なし）", inline=False)
+    else:
+        embed.add_field(name="チャンネル構成", value="（提案なし）", inline=False)
+
+    roles = plan.get("roles") or []
+    if roles:
+        role_lines = [f"・{r.get('name', '無名ロール')}" for r in roles[:25]]
+        embed.add_field(name=f"ロール構成（{len(roles)}個）", value="\n".join(role_lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="ロール構成", value="（提案なし）", inline=False)
+
+    embed.set_footer(text=f"依頼者: {requester.display_name} | 既存のチャンネル・ロールは変更せず、追加のみ行います")
+    return embed
+
+
+async def _setup_wizard_apply_plan(guild: discord.Guild, plan: dict) -> tuple[list[str], list[str]]:
+    """
+    構成案を実際のサーバーへ適用します（追加のみ・既存要素は一切変更しません）。
+    _safe_api_call を使ってレート制限に配慮しながら順番に作成します。
+    """
+    success_logs: list[str] = []
+    fail_logs: list[str] = []
+
+    # 1. ロールを先に作成（チャンネルの権限設定では使わない設計だが、将来の拡張に備えて先に処理）
+    allowed_color_re = re.compile(r"^#?[0-9a-fA-F]{6}$")
+    for r_data in (plan.get("roles") or [])[:25]:
+        if not isinstance(r_data, dict):
+            continue
+        name = str(r_data.get("name") or "").strip()[:100]
+        if not name:
+            continue
+        color = discord.Color.default()
+        color_raw = r_data.get("color")
+        if isinstance(color_raw, str) and allowed_color_re.match(color_raw.strip()):
+            try:
+                color = discord.Color(int(color_raw.strip().lstrip("#"), 16))
+            except ValueError:
+                pass
+        label = f"ロール「{name}」"
+        role = await _safe_api_call(
+            guild.create_role(
+                name=name,
+                color=color,
+                hoist=bool(r_data.get("hoist", False)),
+                mentionable=bool(r_data.get("mentionable", False)),
+                reason="AIセットアップウィザードによる自動作成",
+            ),
+            fail_logs, label
+        )
+        if role:
+            success_logs.append(f"{label} を作成しました")
+        await asyncio.sleep(0.5)
+
+    # 2. カテゴリ + 配下チャンネルを作成
+    for cat_data in (plan.get("categories") or [])[:25]:
+        if not isinstance(cat_data, dict):
+            continue
+        cat_name = str(cat_data.get("name") or "").strip()[:100]
+        if not cat_name:
+            continue
+        label = f"カテゴリ「{cat_name}」"
+        category = await _safe_api_call(
+            guild.create_category(name=cat_name, reason="AIセットアップウィザードによる自動作成"),
+            fail_logs, label
+        )
+        if not category:
+            continue
+        success_logs.append(f"{label} を作成しました")
+        await asyncio.sleep(0.5)
+
+        for ch_data in (cat_data.get("channels") or [])[:50]:
+            if not isinstance(ch_data, dict):
+                continue
+            ch_name = str(ch_data.get("name") or "").strip()[:100]
+            if not ch_name:
+                continue
+            ch_type = str(ch_data.get("type", "text")).lower()
+            if ch_type == "voice":
+                ch_label = f"ボイスch「{ch_name}」"
+                ch = await _safe_api_call(
+                    guild.create_voice_channel(
+                        name=ch_name, category=category, reason="AIセットアップウィザードによる自動作成"
+                    ),
+                    fail_logs, ch_label
+                )
+            else:
+                ch_label = f"テキストch「#{ch_name}」"
+                ch = await _safe_api_call(
+                    guild.create_text_channel(
+                        name=ch_name, category=category, reason="AIセットアップウィザードによる自動作成"
+                    ),
+                    fail_logs, ch_label
+                )
+            if ch:
+                success_logs.append(f"{ch_label} を作成しました")
+            await asyncio.sleep(0.5)
+
+    return success_logs, fail_logs
+
+
+class SetupWizardConfirmView(discord.ui.View):
+    """構成案プレビュー後の「作成」「キャンセル」ボタンです。"""
+
+    def __init__(self, plan: dict, thread_id: int, requester_id: int):
+        super().__init__(timeout=300)
+        self.plan = plan
+        self.thread_id = thread_id
+        self.requester_id = requester_id
+        self._running = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("このプレビューはセットアップを開始した本人のみ操作できます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="この内容で作成する", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        if self._running:
+            await interaction.response.send_message("すでに作成処理を実行中です。しばらくお待ちください。", ephemeral=True)
+            return
+        self._running = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        await interaction.followup.send(">> 構成の作成を開始します...", ephemeral=False)
+        success_logs, fail_logs = await _setup_wizard_apply_plan(interaction.guild, self.plan)
+
+        result_lines = (
+            [f"** サーバー構築完了 ** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
+            + [f"[OK] {s}" for s in success_logs]
+            + [f"[NG] {f}" for f in fail_logs]
+        )
+        chunk = ""
+        messages_out = []
+        for line in result_lines:
+            if len(chunk) + len(line) + 1 > 1900:
+                messages_out.append(chunk)
+                chunk = line + "\n"
+            else:
+                chunk += line + "\n"
+        if chunk:
+            messages_out.append(chunk)
+        for msg in messages_out:
+            await interaction.followup.send(msg, ephemeral=False)
+
+        _setup_wizard_end_session(self.thread_id)
+        self._running = False
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._running:
+            await interaction.response.send_message("作成処理はすでに実行中のためキャンセルできません。", ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="セットアップをキャンセルしました。構成の作成は行われていません。", embed=None, view=self)
+        _setup_wizard_end_session(self.thread_id)
+
+
+async def _setup_wizard_send_ai_turn(thread: discord.Thread, session: dict, requester: discord.Member):
+    """現在の会話履歴をもとにAIを呼び出し、質問の続行またはプラン提示を行います。"""
+    try:
+        reply_text, _provider = await _ai_call_llm_with_fallback(
+            session["messages"],
+            enable_search=False,
+        )
+    except Exception as e:
+        print(f"[セットアップウィザード] AI呼び出しに失敗しました: {e!r}")
+        await thread.send("[!] AIの呼び出し中にエラーが発生しました。しばらくしてから `/setup` をやり直してください。")
+        _setup_wizard_end_session(thread.id)
+        return
+
+    plan = _setup_wizard_extract_plan(reply_text)
+    if plan is not None:
+        embed = _setup_wizard_build_preview_embed(plan, requester)
+        view = SetupWizardConfirmView(plan, thread.id, requester.id)
+        await thread.send(
+            content="ヒアリングが完了しました。以下の内容でサーバーを構築します。よろしければ「作成」を押してください。",
+            embed=embed,
+            view=view,
+        )
+        # プレビュー表示中は追加のヒアリングメッセージを受け付けない（ボタン操作待ち）
+        session["awaiting_confirmation"] = True
+        session["last_active"] = time.time()
+        return
+
+    session["messages"].append({"role": "assistant", "content": reply_text})
+    session["last_active"] = time.time()
+    await thread.send(reply_text[:1900])
+
+
+async def _handle_setup_wizard_message(message: discord.Message) -> bool:
+    """
+    セットアップウィザード進行中のスレッドでのメッセージを処理します。
+    このスレッド宛のメッセージとして処理した場合は True を返します
+    （呼び出し側はTrueが返れば以降の通常メッセージ処理をスキップしてよい）。
+    """
+    _setup_wizard_cleanup_stale_sessions()
+    session = _setup_wizard_sessions.get(message.channel.id)
+    if session is None:
+        return False
+
+    if message.author.id != session["user_id"]:
+        # セットアップ担当者以外の発言は無視する（他の人が同じスレッドに書き込める場合がある）
+        return True
+
+    if session.get("awaiting_confirmation"):
+        # プレビューのボタン操作待ちの間はテキストでの追加ヒアリングを受け付けない
+        return True
+
+    remaining = SETUP_WIZARD_COOLDOWN_SECONDS - (time.time() - session.get("last_active", 0))
+    if remaining > 0:
+        return True
+
+    if session["turns"] >= SETUP_WIZARD_MAX_TURNS:
+        await message.channel.send(
+            "ヒアリングの往復上限に達しました。現時点の情報を元に構成案を作成します..."
+        )
+        session["messages"].append({
+            "role": "user",
+            "content": message.content[:1000] or "（内容なし）"
+        })
+        session["messages"].append({
+            "role": "system",
+            "content": (
+                "往復上限に達しました。追加の質問はせず、これまでの情報のみを使って"
+                f"必ず{SETUP_WIZARD_PLAN_MARKER}に続けてJSON構成案を出力してください。"
+            )
+        })
+        session["turns"] += 1
+        await _setup_wizard_send_ai_turn(message.channel, session, message.author)
+        return True
+
+    session["messages"].append({"role": "user", "content": message.content[:1000] or "（内容なし）"})
+    session["turns"] += 1
+    async with message.channel.typing():
+        await _setup_wizard_send_ai_turn(message.channel, session, message.author)
+    return True
+
+
+@bot.tree.command(name="setup", description="【管理者専用】AIとの対話でサーバーのチャンネル・ロール構成をヒアリングし、自動構築します")
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def setup_wizard_command(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction):
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message("現在この機能は利用できません（Botの設定が未完了です）。", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    _setup_wizard_cleanup_stale_sessions()
+    existing_thread_id = _setup_wizard_guild_active.get(guild.id)
+    if existing_thread_id:
+        await interaction.response.send_message(
+            f"このサーバーでは既にセットアップセッションが進行中です。<#{existing_thread_id}> で続きを行ってください。",
+            ephemeral=True
+        )
+        return
+
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "このコマンドは通常のテキストチャンネル内で実行してください。", ephemeral=True
+        )
+        return
+
+    if not guild.me.guild_permissions.create_public_threads or not guild.me.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "Botに「スレッドの作成」および「チャンネルの管理」権限がないため、この機能を利用できません。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        thread = await interaction.channel.create_thread(
+            name=f"サーバー設定ウィザード-{interaction.user.display_name}"[:100],
+            type=discord.ChannelType.public_thread,
+            reason="AIセットアップウィザード開始",
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"スレッドの作成に失敗しました: {e}", ephemeral=True)
+        return
+
+    session = {
+        "guild_id": guild.id,
+        "user_id": interaction.user.id,
+        "messages": [{
+            "role": "system",
+            "content": _ai_chat_finalize_system_prompt(SETUP_WIZARD_SYSTEM_PROMPT, include_search_guide=False),
+        }],
+        "turns": 0,
+        "last_active": time.time(),
+        "awaiting_confirmation": False,
+    }
+    _setup_wizard_sessions[thread.id] = session
+    _setup_wizard_guild_active[guild.id] = thread.id
+
+    await interaction.followup.send(f"セットアップウィザードを開始しました: {thread.mention}", ephemeral=True)
+    await thread.send(
+        f"{interaction.user.mention} こんにちは！このサーバーのチャンネル・ロール構成のセットアップをお手伝いします。\n"
+        "まず、このサーバーをどんな用途で使いたいか教えてください（例: ゲームコミュニティ、勉強会、会社の連絡用 など）。\n"
+        "-# このスレッド内で自由に返信してください。「お任せします」と伝えれば、AIがおすすめの構成を提案します。"
+    )
 
 
 # ====================================================================
