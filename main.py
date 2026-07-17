@@ -5809,99 +5809,197 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 
 
 # 一部のモデル（特に量子化・軽量モデル）はネイティブのtool_callsフィールドではなく、
-# 応答本文(content)の中に直接JSON形式でツール呼び出しを書いてしまうことがある。
-# パターンは主に2種類ある：
-#   (A) 本文全体がJSONのみ（例: {"tool": "web_search", "query": "..."}）
-#       → ツールがまだ実行されていないので、実際に検索してから応答を作り直す必要がある。
-#   (B) 本文の先頭にJSON（＋"[No output]"等のノイズ）が付着し、その後ろに
-#       モデル自身が生成した回答文が続く（例:
-#       {"tool":"web_search","query":"..."}[No output]現在の日本時間は...です）
-#       → モデルは既に回答を生成してしまっているので、先頭のJSON＋ノイズ部分だけを
-#         取り除き、後続の回答文をそのまま使う（無駄な再呼び出しを避ける）。
-_JSON_TOOL_CALL_LIKE_PATTERN = re.compile(
-    r'^\s*\{[^{}]*["\']tool["\']\s*:\s*["\']web_search["\'][^{}]*\}\s*$',
-    re.DOTALL
-)
+# 応答本文(content)の中に直接JSON形式でツール呼び出しや、さらには「ツールの実行結果」
+# らしきものまで幻覚(ハルシネーション)で書いてしまうことがある。
+# 当初は {"tool": "web_search", "query": "..."} という単一の決め打ちパターンだけを
+# 検知していたが、実際には次のように形がバラバラで、かつ複数個連続することがあると分かった:
+#   {"query": "...", "top_n": 5, "source": "news"}{"response": "search_results", "results": [...]}
+#   {"cursor": 0, "id": 0}{"response": "open", "content": "..."}
+# これらは "tool" というキーを持たないため、旧パターンでは一切検知できなかった。
+# そのため、特定のキー構成に依存せず「本文の先頭から連続するJSONオブジェクトを
+# 汎用的に貪欲パースし、ツール呼び出し/結果っぽい特徴を持つものはまとめて取り除く」
+# 方式に変更する。パターンは主に2種類ある：
+#   (A) 本文全体がJSON群のみ → ツールがまだ実行されていないので、実際に検索してから
+#       応答を作り直す必要がある。
+#   (B) 本文の先頭にJSON群（＋"[No output]"等のノイズ）が付着し、その後ろに
+#       モデル自身が生成した回答文が続く → 先頭のJSON群＋ノイズだけを取り除き、
+#       後続の回答文をそのまま使う（無駄な再呼び出しを避ける）。
 
-# (B) 用: 本文の先頭にある「JSONツール呼び出し＋任意のノイズ（[No output]等の短い定型文言）」
-# を検知して取り除くためのパターン。JSON本体をグループ1として、後ろの本文（実際の回答）を
-# 取り出せるようにする。ノイズ部分は「[ ] で囲まれた短い英字混じりの文言」に限定し、
-# 通常の回答文の一部（例: 文中の記号など）を誤って除去しないようにする。
-_LEADING_JSON_TOOL_CALL_PREFIX_PATTERN = re.compile(
-    r'^\s*(\{[^{}]*["\']tool["\']\s*:\s*["\']web_search["\'][^{}]*\})'
-    r'(?:\s*\[[A-Za-z0-9_\-\s]{0,30}\])?'
-    r'\s*',
-    re.DOTALL
-)
+# ツール呼び出し・ツール結果を装ったJSONオブジェクトによく現れるキー名。
+# これらのキーを1つでも含むJSONオブジェクトは「モデルが漏らしたツール関連JSON」と
+# みなして除去対象にする（キーの完全一致ではなく部分一致で緩く判定することで、
+# モデルが独自に付け足す top_n・source・id 等のフィールドにも対応する）。
+_LEAKED_TOOL_JSON_SIGNAL_KEYS = frozenset({
+    "tool", "query", "top_n", "source", "cursor", "response", "results",
+    "function", "arguments", "tool_call", "tool_calls", "name", "id",
+    "action", "parameters", "content", "snippet", "url", "title",
+})
+
+
+def _looks_like_leaked_tool_json(obj) -> bool:
+    """
+    切り出したJSONオブジェクトが「モデルが本文に漏らしたツール呼び出し／ツール結果らしきもの」
+    かどうかを緩く判定する。dict以外（文字列・数値・配列単体等）は対象外。
+    シグナルキーを1つも含まない素朴なdict（例: ユーザーが本来送りたかったデータ）を
+    誤って除去しないよう、シグナルキーとの一致を必須条件にする。
+    """
+    if not isinstance(obj, dict) or not obj:
+        return False
+    keys = {str(k).lower() for k in obj.keys()}
+    return bool(keys & _LEAKED_TOOL_JSON_SIGNAL_KEYS)
+
+
+def _extract_leading_json_blobs(text: str, max_blobs: int = 8):
+    """
+    文字列の先頭から、波括弧の対応（文字列リテラル内は無視）を数えながら、
+    連続するJSONオブジェクトを貪欲に切り出す。
+    各ブロブは実際に json.loads できたものだけを採用し、パースに失敗した・
+    閉じ括弧が見つからない時点で走査を打ち切る（壊れたJSONを誤って巻き込まないため）。
+    戻り値: (パース済みJSONオブジェクトのリスト, 走査を終えた位置以降の残り文字列)
+    """
+    blobs = []
+    i = 0
+    n = len(text)
+    while len(blobs) < max_blobs:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n or text[i] != '{':
+            break
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        end = None
+        while j < n:
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 1
+                        break
+            j += 1
+        if end is None:
+            break
+        candidate = text[i:end]
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            break
+        blobs.append(parsed)
+        i = end
+    return blobs, text[i:]
+
+
+# JSON群の直後に付着することがある短いノイズ（[No output] 等）を検知して読み飛ばすためのパターン。
+_LEAKED_JSON_TRAILING_NOISE_PATTERN = re.compile(r'^\s*\[[A-Za-z0-9_\-\s]{0,30}\]\s*')
+
+
+def _find_query_like_value(blobs: list) -> str:
+    """
+    切り出したJSONブロブ群の中から、検索クエリらしき文字列値を探して返す。
+    "query" キーを優先し、無ければ最初に見つかった文字列値をフォールバックとして使う。
+    見つからなければ空文字列を返す。
+    """
+    for blob in blobs:
+        if isinstance(blob, dict) and isinstance(blob.get("query"), str) and blob["query"].strip():
+            return blob["query"].strip()
+    for blob in blobs:
+        if isinstance(blob, dict):
+            for v in blob.values():
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
 
 
 def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     """
-    Groqモデルがtool_callsフィールドを使わず、本文に直接JSONでツール呼び出しを
-    書いてしまった場合（例: {"tool": "web_search", "query": "..."}）を検知し、
-    パースできればクエリ等を含む辞書を返す。該当しない・パース失敗時はNoneを返す。
+    本文が「ツール呼び出し／ツール結果らしきJSON群のみ」で構成されている場合
+    （後ろに回答文が続いていない場合）に、検索リトライに使えるクエリ等を含む
+    辞書（{"query": "..."} 形式）を返す。該当しない・パース失敗時はNoneを返す。
     コードブロック（```json ... ```）で囲まれているケースにも対応する。
 
-    本文全体がJSONのみの場合（後ろに回答文が続いていない場合）のみを対象とする。
-    JSONの後ろに回答文が続くケースは _strip_leaked_tool_call_prefix で別途処理する。
+    JSON群の後ろに回答文が続くケースは _strip_leaked_tool_call_prefix で別途処理する。
     """
     if not raw_content:
         return None
     candidate = raw_content.strip()
-    # ```json ... ``` や ``` ... ``` で囲まれている場合は中身だけ取り出す
     fence_match = re.match(r'^```(?:json)?\s*(.*?)\s*```$', candidate, re.DOTALL)
     if fence_match:
         candidate = fence_match.group(1).strip()
 
-    if not _JSON_TOOL_CALL_LIKE_PATTERN.match(candidate):
+    blobs, remainder = _extract_leading_json_blobs(candidate)
+    if not blobs or remainder.strip():
+        return None  # JSONが1つも無い、またはJSON群の後ろに何か残っている（=(B)側の処理対象）
+    if not any(_looks_like_leaked_tool_json(b) for b in blobs):
         return None
 
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-    if isinstance(parsed, dict) and parsed.get("tool") == "web_search":
-        return parsed
-    return None
+    query = _find_query_like_value(blobs)
+    return {"query": query}
 
 
 def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
     """
-    本文の先頭に「JSON形式のツール呼び出し（＋[No output]等のノイズ）」が付着し、
-    その後ろに実際の回答文が続いているケースを検知し、先頭のノイズ部分だけを
-    取り除いた本文を返す。該当しない場合は raw_content をそのまま返す。
+    本文の先頭に「JSON形式のツール呼び出し／ツール結果らしきものが1個以上連続し
+    （＋各JSONの直後に[No output]等のノイズが付くことがある）」、その後ろに実際の
+    回答文が続いているケースを検知し、先頭のJSON群＋ノイズ部分だけを取り除いた
+    本文を返す。該当しない場合は raw_content をそのまま返す。
 
-    例: '{"tool":"web_search","query":"現在 日本 時刻"}[No output]現在の日本時間は...'
-        → '現在の日本時間は...'
+    例: '{"query":"..."}{"response":"search_results","results":[...]}最近のニュースは...'
+        → '最近のニュースは...'
 
     このケースではモデルが既に回答文を生成し終えているため、再度APIを呼んで
-    検索させ直すのではなく、ノイズを除去してそのまま使うのが最も自然な対処になる
-    （画像で報告された「JSON＋[No output]＋回答文」がそのまま表示される不具合の修正）。
+    検索させ直すのではなく、ノイズを除去してそのまま使うのが最も自然な対処になる。
     """
     if not raw_content:
         return raw_content
 
-    match = _LEADING_JSON_TOOL_CALL_PREFIX_PATTERN.match(raw_content)
-    if not match:
+    i = 0
+    n = len(raw_content)
+    collected_blobs = []
+    consumed_any_signal = False
+    while True:
+        blobs, remainder_from_here = _extract_leading_json_blobs(raw_content[i:], max_blobs=1)
+        if not blobs:
+            break
+        blob = blobs[0]
+        if not _looks_like_leaked_tool_json(blob):
+            break
+        consumed_signal_this_round = True
+        collected_blobs.append(blob)
+        consumed_any_signal = consumed_any_signal or consumed_signal_this_round
+        i = n - len(remainder_from_here)
+        # JSONの直後に付着する短いノイズ（[No output] 等）を読み飛ばす
+        noise_match = _LEAKED_JSON_TRAILING_NOISE_PATTERN.match(raw_content[i:])
+        if noise_match:
+            i += noise_match.end()
+        else:
+            # ノイズが無ければ、次のJSONが直接連続している場合のみ続行するため
+            # 先頭の空白だけ読み飛ばして次周回のJSON判定に委ねる
+            while i < n and raw_content[i].isspace():
+                i += 1
+
+    if not consumed_any_signal:
         return raw_content
 
-    json_part = match.group(1)
-    try:
-        parsed = json.loads(json_part)
-    except json.JSONDecodeError:
-        return raw_content
-
-    if not (isinstance(parsed, dict) and parsed.get("tool") == "web_search"):
-        return raw_content
-
-    remainder = raw_content[match.end():].strip()
-    # 除去した結果、後ろに何も残らない（JSON単体だった）場合は呼び出し元の
-    # 「本文全体がJSON」処理に任せるため、そのまま元の文字列を返す
+    remainder = raw_content[i:].strip()
     if not remainder:
+        # 除去した結果、後ろに何も残らない（JSON群単体だった）場合は呼び出し元の
+        # 「本文全体がJSON」処理に任せるため、そのまま元の文字列を返す
         return raw_content
 
-    print(f"[AIチャット/Web検索] 応答本文からJSON漏れの先頭ノイズを除去しました: {json_part!r}")
+    print(f"[AIチャット/Web検索] 応答本文からJSON漏れの先頭ノイズを除去しました（{len(collected_blobs)}個のJSONブロブ）: {raw_content[:i][:200]!r}")
     return remainder
 
 
