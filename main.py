@@ -7968,10 +7968,12 @@ def _build_profile_card_image(
     draw.text((text_x, 55), display_name, font=name_font, fill=(255, 255, 255, 255))
     draw.text((text_x, 115), tagline, font=tagline_font, fill=(190, 190, 205, 255))
 
-    # 区切り線
-    draw.line((text_x, 160, W - 50, 160), fill=(255, 255, 255, 40), width=2)
-
-    # ステータスチップ（絵文字はフォントが対応していないため、簡易的なベクターアイコンを自前で描画する）
+    # 区切り線・ステータスチップ（絵文字はフォントが対応していないため、簡易的なベクターアイコンを自前で描画する）
+    # 注意: ImageDraw.line/rounded_rectangle等にRGBAの半透明色(alpha<255)を指定しても、
+    # Pillowは下地とのアルファ合成を行わずピクセル値をそのまま上書きしてしまう。
+    # そのため最終的に card.convert("RGB") する際、alpha情報が捨てられ「薄い白」のつもりが
+    # 「完全な白」の背景として保存され、白文字の値が完全に同化して見えなくなっていた。
+    # チップ部分は透明なレイヤーに描いてから alpha_composite で正しく合成する。
     chip_font_label = _profile_card_load_font(font_path, 20, "Medium")
     chip_font_value = _profile_card_load_font(font_path, 26, "Bold")
     chip_x = text_x
@@ -7979,9 +7981,18 @@ def _build_profile_card_image(
     chip_w = (W - 50 - text_x - 15 * (len(stats) - 1)) // len(stats)
     chip_h = 130
     icon_size = 26
+
+    chip_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    chip_layer_draw = ImageDraw.Draw(chip_layer)
+    chip_layer_draw.line((text_x, 160, W - 50, 160), fill=(255, 255, 255, 40), width=2)
     for i, (icon_type, label, value) in enumerate(stats):
         cx = chip_x + i * (chip_w + 15)
-        draw.rounded_rectangle((cx, chip_y, cx + chip_w, chip_y + chip_h), radius=18, fill=(255, 255, 255, 22))
+        chip_layer_draw.rounded_rectangle((cx, chip_y, cx + chip_w, chip_y + chip_h), radius=18, fill=(255, 255, 255, 22))
+    card = Image.alpha_composite(card, chip_layer)
+    draw = ImageDraw.Draw(card)
+
+    for i, (icon_type, label, value) in enumerate(stats):
+        cx = chip_x + i * (chip_w + 15)
         icon_x, icon_y = cx + 18, chip_y + 18
         _profile_card_draw_icon(draw, icon_type, icon_x, icon_y, icon_size, accent_color)
         label = _profile_card_sanitize_text(chip_font_label, label)
