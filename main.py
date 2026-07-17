@@ -7610,6 +7610,152 @@ async def image_command(
 
 
 # ====================================================================
+# /avatar コマンド（DiceBear の公開HTTP APIを使ったイラスト風ランダムアバター生成）
+# ・DiceBear（https://www.dicebear.com）はAPIキー不要・無料で使える公開HTTP APIを
+#   提供しており、スタイル名とシード文字列を指定するだけでイラスト風アバター画像が
+#   取得できる（同じスタイル+シードなら常に同じ絵が返るため再現性がある）。
+# ====================================================================
+
+_AVATAR_COMMAND_GUILD_KEY = -3  # /avatar 利用時のクールダウン管理用の疑似ギルドID（他機能のキーと衝突しないよう負の値にする）
+AVATAR_COMMAND_COOLDOWN_SECONDS = 5  # DiceBearの公開APIへの過度な連打を避けるための最小間隔
+DICEBEAR_API_VERSION = "10.x"
+
+# ユーザーに選ばせるスタイルの一覧（DiceBearが提供する30以上のスタイルのうち、
+# イラスト・キャラクター系で見た目の差がわかりやすいものを抜粋）。
+DICEBEAR_STYLE_CHOICES = [
+    app_commands.Choice(name="おまかせ（ランダム）", value="random"),
+    app_commands.Choice(name="アドベンチャラー（イラスト風の人物）", value="adventurer"),
+    app_commands.Choice(name="アバタース（丸顔の人物）", value="avataaars"),
+    app_commands.Choice(name="ロレレイ（線画イラスト風）", value="lorelei"),
+    app_commands.Choice(name="ノーショニスト（おしゃれイラスト風）", value="notionists"),
+    app_commands.Choice(name="ボッツ（ロボット）", value="bottts"),
+    app_commands.Choice(name="ドット絵", value="pixel-art"),
+    app_commands.Choice(name="サムズ（親指キャラ）", value="thumbs"),
+    app_commands.Choice(name="絵文字風", value="fun-emoji"),
+    app_commands.Choice(name="図形（シェイプ）", value="shapes"),
+]
+_DICEBEAR_RANDOM_STYLES = [c.value for c in DICEBEAR_STYLE_CHOICES if c.value != "random"]
+
+
+async def _dicebear_generate_avatar(style: str, seed: str) -> bytes:
+    """
+    DiceBearの公開HTTP APIを呼び出し、指定スタイル・シードのアバターPNG画像バイナリを返します。
+    認証不要・無料の公開エンドポイントのため、APIキーの設定は不要です。
+    失敗した場合は例外を送出します（呼び出し元でハンドリングする）。
+    """
+    url = f"https://api.dicebear.com/{DICEBEAR_API_VERSION}/{style}/png"
+    params = {"seed": seed, "size": 512}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                raise RuntimeError(f"DiceBear APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            return await resp.read()
+
+
+class _AvatarRegenerateView(discord.ui.View):
+    """
+    /avatar コマンドの結果に付けるビュー。
+    ボタンを押すと同じスタイル（おまかせの場合はスタイルも再抽選）で、
+    新しいシードのアバターをその場（同じメッセージ）で再生成する。
+    """
+    def __init__(self, style_choice: str, requester_id: int):
+        super().__init__(timeout=180)
+        self.style_choice = style_choice  # "random" または具体的なスタイル名
+        self.requester_id = requester_id
+
+    @discord.ui.button(label="別の一枚を生成", style=discord.ButtonStyle.primary, emoji="🔀")
+    async def regenerate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "このボタンはコマンドを実行した本人のみ使えます。", ephemeral=True
+            )
+            return
+
+        remaining = _ai_chat_check_cooldown(
+            _AVATAR_COMMAND_GUILD_KEY, interaction.user.id, AVATAR_COMMAND_COOLDOWN_SECONDS
+        )
+        if remaining is not None:
+            await interaction.response.send_message(
+                f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        _ai_chat_record_request(_AVATAR_COMMAND_GUILD_KEY, interaction.user.id)
+
+        actual_style = (
+            random.choice(_DICEBEAR_RANDOM_STYLES) if self.style_choice == "random" else self.style_choice
+        )
+        seed = secrets.token_hex(8)
+        try:
+            image_bytes = await _dicebear_generate_avatar(actual_style, seed)
+        except Exception as e:
+            print(f"[/avatar] 再生成エラー: {e}")
+            await interaction.followup.send(
+                "アバター生成に失敗しました。時間をおいて再度お試しください。", ephemeral=True
+            )
+            return
+
+        file_obj = discord.File(io.BytesIO(image_bytes), filename="avatar.png")
+        embed = discord.Embed(color=discord.Color.teal())
+        embed.set_image(url="attachment://avatar.png")
+        embed.set_footer(text=f"DiceBear ・ スタイル: {actual_style} ・ シード: {seed}")
+        await interaction.edit_original_response(embed=embed, attachments=[file_obj], view=self)
+
+
+@bot.tree.command(name="avatar", description="イラスト風のランダムアバター画像を生成します（無料・DiceBear提供）")
+@app_commands.describe(
+    スタイル="生成するアバターのスタイル（省略時はおまかせでランダム）",
+    シード="同じ文字列を指定すると毎回同じ絵になる合言葉（省略時はランダム）",
+)
+@app_commands.choices(スタイル=DICEBEAR_STYLE_CHOICES)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def avatar_command(
+    interaction: discord.Interaction,
+    スタイル: Optional[app_commands.Choice[str]] = None,
+    シード: Optional[str] = None,
+):
+    remaining = _ai_chat_check_cooldown(
+        _AVATAR_COMMAND_GUILD_KEY, interaction.user.id, AVATAR_COMMAND_COOLDOWN_SECONDS
+    )
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    style_choice = スタイル.value if スタイル else "random"
+    actual_style = random.choice(_DICEBEAR_RANDOM_STYLES) if style_choice == "random" else style_choice
+    seed = (シード or secrets.token_hex(8))[:100]
+
+    await interaction.response.defer(thinking=True)
+    _ai_chat_record_request(_AVATAR_COMMAND_GUILD_KEY, interaction.user.id)
+
+    try:
+        image_bytes = await _dicebear_generate_avatar(actual_style, seed)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("アバター生成がタイムアウトしました。時間をおいて再度お試しください。")
+        return
+    except Exception as e:
+        print(f"[/avatar] アバター生成エラー: {e}")
+        await interaction.followup.send("アバター生成に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    file_obj = discord.File(io.BytesIO(image_bytes), filename="avatar.png")
+    embed = discord.Embed(color=discord.Color.teal())
+    embed.set_image(url="attachment://avatar.png")
+    embed.set_footer(text=f"DiceBear ・ スタイル: {actual_style} ・ シード: {seed}")
+    view = _AvatarRegenerateView(style_choice, interaction.user.id)
+    await interaction.followup.send(embed=embed, file=file_obj, view=view)
+
+
+# ====================================================================
 # /reply_suggest コマンド（グループDMの会話をスキャンし、AIが返信候補を提案する）
 # ====================================================================
 # ・対象はグループDM（discord.GroupChannel）のみ。1対1DMやサーバー内チャンネルは対象外。
@@ -8951,6 +9097,7 @@ async def help_command(interaction: discord.Interaction):
             "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
             "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
+            "`/avatar` : イラスト風のランダムアバター画像を生成します（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
