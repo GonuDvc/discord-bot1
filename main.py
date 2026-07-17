@@ -6220,6 +6220,45 @@ def _try_extract_query_from_leaked_prefix(raw_content: str) -> Optional[dict]:
     return {"query": query}
 
 
+# tool_choice="auto" の場合、web_searchツールを呼ぶかどうかは完全にモデルの自己判断に委ねられる。
+# システムプロンプト（AI_CHAT_SEARCH_USAGE_GUIDE）で「時事・最新情報の質問では必ず検索しろ」と
+# 強く指示していても、モデルがそれに従わず、検索せずに「検索できません」という趣旨の断り文を
+# そのまま返してしまうことがある（tool_callsが無い＝検索不要と判断した通常応答として扱われてしまい、
+# JSON漏れ検知にも引っかからないため、これまでの不具合とは異なりコード側で検知できなかった）。
+# そのため、質問文に時事・最新情報を示すキーワードが含まれる場合は、モデルの判断に任せず
+# tool_choice="required" にして、1回目のラウンドで必ずweb_searchツールを呼ばせるようにする。
+_SEARCH_FORCE_KEYWORDS = (
+    "最新", "今日", "本日", "今週", "今年", "現在", "速報", "ニュース", "news",
+    "昨日", "先週", "先月", "今月", "直近", "アップデート", "リリース", "発表",
+    "何が起き", "何があった", "いま",
+)
+_SEARCH_FORCE_YEAR_PATTERN = re.compile(r"20[2-9]\d\s*年")
+
+
+def _extract_latest_user_text(messages: list) -> str:
+    """messages配列の中から、最後（最新）のuserロールの発言内容を取り出します。"""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+def _query_likely_needs_search(text: str) -> bool:
+    """
+    質問文が時事・最新情報を尋ねている可能性が高いかどうかを、キーワードで簡易判定します。
+    誤判定（過剰にTrueになる）はコストが多少増えるだけで実害が小さい一方、
+    見逃し（本来検索すべきなのにFalseにしてしまう）は今回のバグそのものになるため、
+    多少広めに拾うキーワード選定にしてあります。
+    """
+    if not text:
+        return False
+    if _SEARCH_FORCE_YEAR_PATTERN.search(text):
+        return True
+    return any(kw in text for kw in _SEARCH_FORCE_KEYWORDS)
+
+
 async def _ai_chat_call_groq_with_search(
     messages: list,
     model: Optional[str] = None,
@@ -6255,6 +6294,10 @@ async def _ai_chat_call_groq_with_search(
     working_messages = list(messages)  # 呼び出し元のリストは書き換えない
     max_search_rounds = 2
 
+    # 質問文が時事・最新情報系と判定された場合、1回目のラウンドはモデルの自己判断（auto）に
+    # 任せず、tool_choice="required" で必ずweb_searchツールを呼ばせる（詳細は関数上部のコメント参照）。
+    _force_search_first_round = _query_likely_needs_search(_extract_latest_user_text(working_messages))
+
     for round_idx in range(max_search_rounds + 1):
         payload = {
             "model": model or GROQ_MODEL,
@@ -6266,7 +6309,11 @@ async def _ai_chat_call_groq_with_search(
         # 最終ラウンド（検索回数を使い切った後）はツールを渡さず、必ずテキストで応答させる
         if round_idx < max_search_rounds:
             payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
-            payload["tool_choice"] = "auto"
+            if round_idx == 0 and _force_search_first_round:
+                payload["tool_choice"] = "required"
+                print(f"[Web検索] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
+            else:
+                payload["tool_choice"] = "auto"
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
