@@ -15,6 +15,7 @@ import urllib.parse
 import base64
 import html
 import secrets
+import unicodedata
 # import requests  # 削除: aiohttpで代替（同期ライブラリは非同期Botでブロッキングを起こすため）
 import io
 import datetime
@@ -7817,6 +7818,44 @@ def _profile_card_load_font(font_path: str, size: int, weight: str = "Bold"):
     return f
 
 
+_PROFILE_CARD_NOTDEF_CACHE = {}  # {id(font): (notdef_bytes, notdef_size)} フォントごとの「豆腐」グリフのキャッシュ
+
+
+def _profile_card_glyph_supported(font, ch: str) -> bool:
+    """
+    そのフォントが文字chの実際のグリフを持っているか（＝豆腐□にならないか）を判定します。
+    フォントにない文字を描画すると内部的に「.notdef」という共通の代替グリフ（豆腐）が
+    使われる性質を利用し、対象文字の描画結果が「未知の文字」の描画結果と一致するかで判定します。
+    """
+    if ch in (" ", "\u3000") or ch.isspace():
+        return True
+    key = id(font)
+    if key not in _PROFILE_CARD_NOTDEF_CACHE:
+        probe_mask = font.getmask("\uFFFE")  # 誰も割り当てていないコードポイント＝必ず豆腐になる
+        probe_img = Image.new("L", probe_mask.size)
+        probe_img.im.paste(probe_mask, (0, 0) + probe_mask.size)
+        _PROFILE_CARD_NOTDEF_CACHE[key] = (probe_img.tobytes(), probe_mask.size)
+    notdef_bytes, notdef_size = _PROFILE_CARD_NOTDEF_CACHE[key]
+    try:
+        mask = font.getmask(ch)
+        img = Image.new("L", mask.size)
+        img.im.paste(mask, (0, 0) + mask.size)
+        return not (img.tobytes() == notdef_bytes and mask.size == notdef_size)
+    except Exception:
+        return False
+
+
+def _profile_card_sanitize_text(font, text: str) -> str:
+    """
+    プロフィールカードに描画する文字列から「豆腐（□）」になる文字を取り除きます。
+    1) まずUnicode正規化（NFKC）で、装飾的な特殊文字（𝓜𝓚𝓜𝓚 等）をできる限り
+       普通の文字（MKMK 等）に変換する。
+    2) それでもフォントに存在しない文字（絵文字や特殊記号など）は読み飛ばす。
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in normalized if _profile_card_glyph_supported(font, ch))
+
+
 def _profile_card_make_circle_avatar(img: "Image.Image", size: int, border_color, border_width: int) -> "Image.Image":
     img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
     mask = Image.new("L", (size, size), 0)
@@ -7830,6 +7869,35 @@ def _profile_card_make_circle_avatar(img: "Image.Image", size: int, border_color
     d.ellipse((0, 0, total, total), fill=border_color)
     canvas.paste(out, (border_width, border_width), out)
     return canvas
+
+
+def _profile_card_draw_icon(draw, icon_type: str, x: int, y: int, size: int, color) -> None:
+    """
+    絵文字フォントに依存しない、シンプルなベクターアイコンを(x, y)を左上として描画します。
+    """
+    c = (*color, 255) if len(color) == 3 else color
+    white = (255, 255, 255, 255)
+    if icon_type == "coin":
+        draw.ellipse((x, y, x + size, y + size), outline=c, width=3)
+        draw.ellipse((x + size * 0.32, y + size * 0.22, x + size * 0.68, y + size * 0.78), outline=c, width=2)
+    elif icon_type == "invite":
+        draw.rounded_rectangle((x, y + size * 0.15, x + size, y + size * 0.85), radius=3, outline=c, width=3)
+        draw.line((x, y + size * 0.15, x + size / 2, y + size * 0.55), fill=c, width=3)
+        draw.line((x + size, y + size * 0.15, x + size / 2, y + size * 0.55), fill=c, width=3)
+    elif icon_type == "warning":
+        draw.polygon(
+            [(x + size / 2, y), (x + size, y + size * 0.9), (x, y + size * 0.9)],
+            outline=c, width=3
+        )
+        draw.line((x + size / 2, y + size * 0.38, x + size / 2, y + size * 0.62), fill=c, width=3)
+        draw.ellipse((x + size / 2 - 2, y + size * 0.72, x + size / 2 + 2, y + size * 0.76), fill=c)
+    elif icon_type == "calendar":
+        draw.rounded_rectangle((x, y + size * 0.15, x + size, y + size), radius=3, outline=c, width=3)
+        draw.line((x, y + size * 0.4, x + size, y + size * 0.4), fill=c, width=2)
+        draw.line((x + size * 0.28, y, x + size * 0.28, y + size * 0.28), fill=c, width=3)
+        draw.line((x + size * 0.72, y, x + size * 0.72, y + size * 0.28), fill=c, width=3)
+    else:
+        draw.ellipse((x, y, x + size, y + size), outline=c, width=3)
 
 
 def _build_profile_card_image(
@@ -7885,6 +7953,10 @@ def _build_profile_card_image(
     name_font = _profile_card_load_font(font_path, 46, "Bold")
     tagline_font = _profile_card_load_font(font_path, 24, "Medium")
 
+    # 豆腐（□）になる文字（絵文字・装飾的な特殊文字等）を除去してから描画する
+    username = _profile_card_sanitize_text(name_font, username) or "(表示できるユーザー名がありません)"
+    tagline = _profile_card_sanitize_text(tagline_font, tagline)
+
     # ユーザー名が長すぎるとチップ領域にはみ出すため、必要なら省略する
     max_name_width = W - 50 - text_x
     display_name = username
@@ -7899,18 +7971,23 @@ def _build_profile_card_image(
     # 区切り線
     draw.line((text_x, 160, W - 50, 160), fill=(255, 255, 255, 40), width=2)
 
-    # ステータスチップ
+    # ステータスチップ（絵文字はフォントが対応していないため、簡易的なベクターアイコンを自前で描画する）
     chip_font_label = _profile_card_load_font(font_path, 20, "Medium")
     chip_font_value = _profile_card_load_font(font_path, 26, "Bold")
     chip_x = text_x
     chip_y = 185
     chip_w = (W - 50 - text_x - 15 * (len(stats) - 1)) // len(stats)
     chip_h = 130
-    for i, (label, value) in enumerate(stats):
+    icon_size = 26
+    for i, (icon_type, label, value) in enumerate(stats):
         cx = chip_x + i * (chip_w + 15)
         draw.rounded_rectangle((cx, chip_y, cx + chip_w, chip_y + chip_h), radius=18, fill=(255, 255, 255, 22))
-        draw.text((cx + 18, chip_y + 18), label, font=chip_font_label, fill=(200, 200, 215, 255))
-        draw.text((cx + 18, chip_y + 55), str(value), font=chip_font_value, fill=(255, 255, 255, 255))
+        icon_x, icon_y = cx + 18, chip_y + 18
+        _profile_card_draw_icon(draw, icon_type, icon_x, icon_y, icon_size, accent_color)
+        label = _profile_card_sanitize_text(chip_font_label, label)
+        draw.text((icon_x + icon_size + 8, icon_y + 2), label, font=chip_font_label, fill=(200, 200, 215, 255))
+        value_text = _profile_card_sanitize_text(chip_font_value, str(value))
+        draw.text((cx + 18, chip_y + 55), value_text, font=chip_font_value, fill=(255, 255, 255, 255))
 
     buf = io.BytesIO()
     card.convert("RGB").save(buf, format="PNG")
@@ -7986,10 +8063,10 @@ async def profile_command(
         return
 
     stats = [
-        ("💰 Mコイン", f"{balance:,}"),
-        ("✉️ 招待人数", f"{net_invites}人"),
-        ("⚠️ 警告", f"{warning_count}件"),
-        ("📅 在籍日数", f"{days_in_server}日"),
+        ("coin", "Mコイン", f"{balance:,}"),
+        ("invite", "招待人数", f"{net_invites}人"),
+        ("warning", "警告", f"{warning_count}件"),
+        ("calendar", "在籍日数", f"{days_in_server}日"),
     ]
     tagline = f"@{target.name} ・ ID: {target.id}"
 
