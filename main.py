@@ -6713,6 +6713,14 @@ async def _ai_call_llm_with_fallback(
             is_last_candidate = (idx == len(candidate_models) - 1)
             if not is_daily_limit:
                 raise  # TPM等の短期レート制限はプロバイダを跨がず即座に通知する
+            if idx == 0 and effective_enable_search:
+                # 検索対応の主モデルが日次上限に達し、以降は検索非対応のフォールバック
+                # モデル（またはCerebras/Mistral）に切り替わる＝この応答では検索が使われない。
+                # 「検索が動かない」という不具合報告の原因になりやすいため、必ずログに残す。
+                print(
+                    f"[Web検索] 主モデル（{candidate}）が本日の利用上限（{e.limit_scope}）に達したため、"
+                    "検索非対応のフォールバックモデルに切り替えます。今回の応答では検索は実行されません。"
+                )
             if not is_last_candidate:
                 continue  # 次のGroqフォールバックモデルを試す
             # Groq側の候補をすべてTPD/RPDで使い切った → Cerebrasへ最終フォールバック
