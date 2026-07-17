@@ -5479,6 +5479,45 @@ def _parse_groq_retry_after(err_text: str) -> Optional[float]:
     return total if total > 0 else None
 
 
+def _inject_no_search_notice(messages: list) -> list:
+    """
+    Cerebras/Mistral等、Web検索（Tool Use）に対応させていない呼び出し経路向けに、
+    system メッセージへ「今回はweb_searchツールが実際には使えない」旨の注記を追記した
+    新しいメッセージ配列を返す（元のリスト・辞書は変更しない）。
+
+    背景: messages配列には、Groqでの検索対応を前提に組み立てられた
+    AI_CHAT_SEARCH_USAGE_GUIDE（「web_searchツールが利用可能」という案内）が
+    既に含まれていることがある。Cerebras/Mistral、またはGroqのフォールバックモデル
+    （検索機能なしで呼び出される）にフォールバックした場合、実際にはツール定義を
+    渡していないため、この案内を放置するとモデルが「ツールがあるはず」と誤認し、
+    本文中にツール呼び出しらしきJSONを自分で書いてしまう（結果、検索結果を捏造する／
+    JSON漏れとして弾かれ、ユーザーには意味不明な断り文言だけが返る）不具合の原因になっていた。
+    """
+    if not messages:
+        return messages
+
+    notice = (
+        "\n\n【重要・システムからの追加通知】"
+        "都合により、今回のこの応答ではWeb検索ツール（web_search）は実際には利用できません。"
+        "先の指示に「web_searchツールが利用可能」という記述が含まれていても、それは今回は無効です。"
+        "ツール呼び出しの真似としてJSON形式の文字列を本文に書くことは絶対にしないでください。"
+        "検索結果を自分で創作することも禁止です。"
+        "最新情報が必要な質問であっても、あなた自身が知っている範囲の一般的な知識のみで、"
+        "「これは学習データの時点の情報であり、最新の状況とは異なる可能性がある」と"
+        "一言添えた上で回答してください。"
+    )
+
+    new_messages = list(messages)
+    if new_messages and new_messages[0].get("role") == "system":
+        new_messages[0] = {
+            "role": "system",
+            "content": (new_messages[0].get("content") or "") + notice
+        }
+    else:
+        new_messages.insert(0, {"role": "system", "content": notice.strip()})
+    return new_messages
+
+
 async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str:
     """
     Groq Chat Completions APIを呼び出し、応答テキストを返します。
@@ -5504,7 +5543,7 @@ async def _ai_chat_call_groq(messages: list, model: Optional[str] = None) -> str
     }
     payload = {
         "model": model or GROQ_MODEL,
-        "messages": messages,
+        "messages": _inject_no_search_notice(messages),
         "temperature": 0.7,
         "max_tokens": GROQ_MAX_TOKENS,
         "reasoning_format": "hidden",  # 推論モデルの思考過程を応答本文に含めない（対応モデルのみ有効）
@@ -6420,7 +6459,7 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
     }
     payload = {
         "model": model or CEREBRAS_MODEL,
-        "messages": messages,
+        "messages": _inject_no_search_notice(messages),
         "temperature": 0.7,
         "max_tokens": CEREBRAS_MAX_TOKENS,
     }
@@ -6507,7 +6546,7 @@ async def _ai_chat_call_mistral(messages: list, model: Optional[str] = None) -> 
     }
     payload = {
         "model": model or MISTRAL_MODEL,
-        "messages": messages,
+        "messages": _inject_no_search_notice(messages),
         "temperature": 0.7,
         "max_tokens": MISTRAL_MAX_TOKENS,
     }
@@ -7494,12 +7533,15 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
         reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
 
     # フォールバックプロバイダ/モデルで応答した場合、一般ユーザーには実装詳細（プロバイダ名・モデル名）を
-    # 見せず「一時的に別方式で応答した」旨のみ簡潔に伝える（AI実装のプロバイダ/モデル名の外部露出防止）
+    # 見せず「一時的に別方式で応答した」旨のみ簡潔に伝える（AI実装のプロバイダ/モデル名の外部露出防止）。
+    # あわせて、Web検索が有効なサーバーであれば「今回は検索が使えていない」旨も伝える
+    # （検索できないまま学習データだけで回答している事実をユーザーが把握できるようにするため）。
     primary_model = model or GROQ_MODEL
+    search_note = "" if not WEB_SEARCH_AVAILABLE else "（今回はWeb検索は利用できていません）"
     if used_provider in ("cerebras", "mistral"):
-        reply_text += "\n\n*（本日の利用上限のため、一時的に別方式で応答しました）*"
+        reply_text += f"\n\n*（本日の利用上限のため、一時的に別方式で応答しました{search_note}）*"
     elif used_model and used_model != primary_model:
-        reply_text += "\n\n*（本日の利用上限のため、代替モデルで応答しました）*"
+        reply_text += f"\n\n*（本日の利用上限のため、代替モデルで応答しました{search_note}）*"
 
     # 履歴には画像URLそのものではなくテキストのみ保存する（画像のみ送信時はプレースホルダーを使用）。
     # 添付画像のURLは時間経過で失効するため、履歴として持ち回らせない設計。
