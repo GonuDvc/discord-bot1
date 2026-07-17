@@ -3837,6 +3837,30 @@ async def on_ready():
     except Exception as e:
         print(f"[警告] 起動中ステータスの表示に失敗しました: {e}")
 
+    # --- Web検索APIキーの設定状況を起動時に必ずログ出力する ---
+    # 「/aiで検索が発動しない」という不具合報告の大半は、コードの不具合ではなく
+    # Web検索APIキー（TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY / NEWSDATA_API_KEY）が
+    # 実行環境（Railway/Replit等）に1つも設定されていないことが原因（この場合、AIは
+    # web_searchツール自体を渡されないため、生成AIが「知識は〇〇年以前まで」という
+    # 自然な断り文で応答する＝一見正常な応答に見えてしまう）。
+    # 起動ログを見るだけで即座に切り分けできるよう、ここで明示的に出力する。
+    _search_key_status = {
+        "TAVILY_API_KEY": bool(TAVILY_API_KEY),
+        "EXA_API_KEY": bool(EXA_API_KEY),
+        "FIRECRAWL_API_KEY": bool(FIRECRAWL_API_KEY),
+        "NEWSDATA_API_KEY": bool(NEWSDATA_API_KEY),
+    }
+    if WEB_SEARCH_AVAILABLE:
+        _configured = [name for name, ok in _search_key_status.items() if ok]
+        print(f"[Web検索] 有効です。設定済みのAPIキー: {', '.join(_configured)}")
+    else:
+        print(
+            "[Web検索] 警告: TAVILY_API_KEY / EXA_API_KEY / FIRECRAWL_API_KEY / NEWSDATA_API_KEY "
+            "のいずれも設定されていません。/ai の検索機能は無効化され、AIは検索せずに"
+            "自身の知識のみで応答します（一見普通の回答に見えるため気付きにくい不具合の典型例です）。"
+            "実行環境（Railway/Replitの環境変数など）にキーを設定してください。"
+        )
+
     # Opusライブラリを自動検索してロードする（Nixpacks環境対応）
     if not discord.opus.is_loaded():
         import ctypes.util
