@@ -28,6 +28,13 @@ import aiohttp.web
 # import io  # 重複インポートを削除
 from discord import app_commands
 
+try:
+    # /profile のプロフィールカード画像生成にのみ使用。未インストールでもBot本体は起動できるようにガードする。
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 # role_channel_mute コマンド等で使う、発言/スレッド権限を持つチャンネル型のUnion
 MuteTargetChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel]
 
@@ -7756,6 +7763,250 @@ async def avatar_command(
 
 
 # ====================================================================
+# /profile コマンド（Mコイン残高・招待実績などをまとめた画像プロフィールカード）
+# ・Pillowで1枚のPNG画像として描画する（Discord Embedではなく実画像）。
+# ・日本語描画用フォント（Noto Sans JP・Google Fonts公式リポジトリ配布）は
+#   初回利用時にダウンロードしてローカルにキャッシュし、以降はキャッシュを再利用する
+#   （Railway等のホスティング環境ではデプロイに含めるのが難しいため、実行時取得にしている）。
+# ・アバターは「実際のDiscordアバター」または「DiceBearのイラスト風アバター」を選べる。
+# ====================================================================
+
+_PROFILE_COMMAND_GUILD_KEY = -4  # /profile 利用時のクールダウン管理用の疑似ギルドID（他機能のキーと衝突しないよう負の値にする）
+PROFILE_COMMAND_COOLDOWN_SECONDS = 8
+
+_PROFILE_CARD_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_PROFILE_CARD_FONT_PATH = os.path.join(_PROFILE_CARD_FONT_DIR, "NotoSansJP-variable.ttf")
+_PROFILE_CARD_FONT_URL = (
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"
+)
+_profile_card_font_lock = asyncio.Lock()
+
+
+async def _ensure_profile_card_font() -> str:
+    """
+    プロフィールカード描画用の日本語フォント（Noto Sans JP）をローカルにキャッシュして、
+    そのファイルパスを返します。2回目以降はダウンロードせずキャッシュ済みファイルを使います。
+    """
+    if os.path.exists(_PROFILE_CARD_FONT_PATH) and os.path.getsize(_PROFILE_CARD_FONT_PATH) > 1_000_000:
+        return _PROFILE_CARD_FONT_PATH
+    async with _profile_card_font_lock:
+        # ロック取得待ちの間に別タスクがダウンロードを終えている場合があるため再チェック
+        if os.path.exists(_PROFILE_CARD_FONT_PATH) and os.path.getsize(_PROFILE_CARD_FONT_PATH) > 1_000_000:
+            return _PROFILE_CARD_FONT_PATH
+        os.makedirs(_PROFILE_CARD_FONT_DIR, exist_ok=True)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                _PROFILE_CARD_FONT_URL, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"フォントのダウンロードに失敗しました（HTTP {resp.status}）")
+                data = await resp.read()
+        tmp_path = _PROFILE_CARD_FONT_PATH + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, _PROFILE_CARD_FONT_PATH)  # 書き込み途中のファイルが使われないよう原子的に置き換え
+    return _PROFILE_CARD_FONT_PATH
+
+
+def _profile_card_load_font(font_path: str, size: int, weight: str = "Bold"):
+    f = ImageFont.truetype(font_path, size)
+    try:
+        f.set_variation_by_name(weight)  # 可変フォントの太さ切り替え（非対応フォントなら黙って無視）
+    except Exception:
+        pass
+    return f
+
+
+def _profile_card_make_circle_avatar(img: "Image.Image", size: int, border_color, border_width: int) -> "Image.Image":
+    img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+
+    total = size + border_width * 2
+    canvas = Image.new("RGBA", (total, total), (0, 0, 0, 0))
+    d = ImageDraw.Draw(canvas)
+    d.ellipse((0, 0, total, total), fill=border_color)
+    canvas.paste(out, (border_width, border_width), out)
+    return canvas
+
+
+def _build_profile_card_image(
+    font_path: str,
+    avatar_bytes: bytes,
+    username: str,
+    tagline: str,
+    stats: list,  # [(ラベル, 値), ...]
+    accent_color=(88, 101, 242),
+) -> bytes:
+    """
+    プロフィールカードをPNG画像として描画し、そのバイナリを返します。
+    PIL処理はCPUバウンド（同期・ブロッキング）なので、呼び出し側は必ず
+    asyncio.to_thread 等でイベントループをブロックしないように呼び出してください。
+    """
+    W, H = 1000, 360
+    bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+
+    # 背景: 縦方向のグラデーション
+    top = (30, 22, 55)
+    bottom = (12, 10, 20)
+    bg_draw = ImageDraw.Draw(bg)
+    for y in range(H):
+        t = y / H
+        r = int(top[0] + (bottom[0] - top[0]) * t)
+        g = int(top[1] + (bottom[1] - top[1]) * t)
+        b = int(top[2] + (bottom[2] - top[2]) * t)
+        bg_draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+    # アクセントカラーの光彩
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((-150, -150, 350, 350), fill=(*accent_color, 90))
+    glow = glow.filter(ImageFilter.GaussianBlur(80))
+    bg = Image.alpha_composite(bg, glow)
+
+    # 角丸マスクで全体を切り抜き
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W, H), radius=28, fill=255)
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    card.paste(bg, (0, 0), mask)
+    draw = ImageDraw.Draw(card)
+
+    # アバター（円形・アクセントカラーの縁取り）
+    avatar_size = 190
+    avatar_img = Image.open(io.BytesIO(avatar_bytes))
+    avatar = _profile_card_make_circle_avatar(avatar_img, avatar_size, (*accent_color, 255), 6)
+    avatar_pos = (50, (H - avatar.height) // 2)
+    card.paste(avatar, avatar_pos, avatar)
+
+    text_x = avatar_pos[0] + avatar.width + 40
+
+    name_font = _profile_card_load_font(font_path, 46, "Bold")
+    tagline_font = _profile_card_load_font(font_path, 24, "Medium")
+
+    # ユーザー名が長すぎるとチップ領域にはみ出すため、必要なら省略する
+    max_name_width = W - 50 - text_x
+    display_name = username
+    while draw.textlength(display_name, font=name_font) > max_name_width and len(display_name) > 1:
+        display_name = display_name[:-1]
+    if display_name != username:
+        display_name = display_name[:-1] + "…"
+
+    draw.text((text_x, 55), display_name, font=name_font, fill=(255, 255, 255, 255))
+    draw.text((text_x, 115), tagline, font=tagline_font, fill=(190, 190, 205, 255))
+
+    # 区切り線
+    draw.line((text_x, 160, W - 50, 160), fill=(255, 255, 255, 40), width=2)
+
+    # ステータスチップ
+    chip_font_label = _profile_card_load_font(font_path, 20, "Medium")
+    chip_font_value = _profile_card_load_font(font_path, 26, "Bold")
+    chip_x = text_x
+    chip_y = 185
+    chip_w = (W - 50 - text_x - 15 * (len(stats) - 1)) // len(stats)
+    chip_h = 130
+    for i, (label, value) in enumerate(stats):
+        cx = chip_x + i * (chip_w + 15)
+        draw.rounded_rectangle((cx, chip_y, cx + chip_w, chip_y + chip_h), radius=18, fill=(255, 255, 255, 22))
+        draw.text((cx + 18, chip_y + 18), label, font=chip_font_label, fill=(200, 200, 215, 255))
+        draw.text((cx + 18, chip_y + 55), str(value), font=chip_font_value, fill=(255, 255, 255, 255))
+
+    buf = io.BytesIO()
+    card.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@bot.tree.command(name="profile", description="Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します")
+@app_commands.describe(
+    対象="プロフィールカードを見たいユーザー（省略時は自分）",
+    イラスト風アバター="オンにすると、実際のDiscordアバターの代わりにDiceBearのイラスト風アバターを使います",
+)
+async def profile_command(
+    interaction: discord.Interaction,
+    対象: Optional[discord.Member] = None,
+    イラスト風アバター: Optional[bool] = False,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if not _PIL_AVAILABLE:
+        await interaction.response.send_message(
+            "プロフィールカード機能に必要なライブラリ（Pillow）がインストールされていません。"
+            "`requirements.txt` に `Pillow` を追加してデプロイし直してください。",
+            ephemeral=True
+        )
+        return
+
+    remaining = _ai_chat_check_cooldown(
+        _PROFILE_COMMAND_GUILD_KEY, interaction.user.id, PROFILE_COMMAND_COOLDOWN_SECONDS
+    )
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    target = 対象 or interaction.user
+
+    await interaction.response.defer(thinking=True)
+    _ai_chat_record_request(_PROFILE_COMMAND_GUILD_KEY, interaction.user.id)
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    balance = get_balance(cfg, target.id)
+    invite_info = cfg.get("invite_stats", {}).get(str(target.id), {"joins": 0, "leaves": 0})
+    net_invites = max(invite_info.get("joins", 0) - invite_info.get("leaves", 0), 0)
+    warning_count = len(cfg.get("warnings", {}).get(str(target.id), []))
+    joined_at = target.joined_at
+    days_in_server = (discord.utils.utcnow() - joined_at).days if joined_at else 0
+
+    try:
+        font_path = await _ensure_profile_card_font()
+    except Exception as e:
+        print(f"[/profile] フォント取得エラー: {e}")
+        await interaction.followup.send("プロフィールカード用フォントの取得に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    try:
+        if イラスト風アバター:
+            avatar_bytes = await _dicebear_generate_avatar("notionists", str(target.id))
+        else:
+            avatar_url = target.display_avatar.replace(size=256).url
+            async with aiohttp.ClientSession() as session:
+                async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"アバター画像取得エラー（HTTP {resp.status}）")
+                    avatar_bytes = await resp.read()
+    except Exception as e:
+        print(f"[/profile] アバター取得エラー: {e}")
+        await interaction.followup.send("アバター画像の取得に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    stats = [
+        ("💰 Mコイン", f"{balance:,}"),
+        ("✉️ 招待人数", f"{net_invites}人"),
+        ("⚠️ 警告", f"{warning_count}件"),
+        ("📅 在籍日数", f"{days_in_server}日"),
+    ]
+    tagline = f"@{target.name} ・ ID: {target.id}"
+
+    try:
+        image_bytes = await asyncio.to_thread(
+            _build_profile_card_image, font_path, avatar_bytes, target.display_name, tagline, stats
+        )
+    except Exception as e:
+        print(f"[/profile] カード生成エラー: {e}")
+        await interaction.followup.send("プロフィールカードの生成に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    file_obj = discord.File(io.BytesIO(image_bytes), filename="profile.png")
+    await interaction.followup.send(file=file_obj)
+
+
+# ====================================================================
 # /reply_suggest コマンド（グループDMの会話をスキャンし、AIが返信候補を提案する）
 # ====================================================================
 # ・対象はグループDM（discord.GroupChannel）のみ。1対1DMやサーバー内チャンネルは対象外。
@@ -9098,6 +9349,7 @@ async def help_command(interaction: discord.Interaction):
             "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/avatar` : イラスト風のランダムアバター画像を生成します（DM・グループDM・サーバー内どこでも利用可能）\n"
+            "`/profile` : Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"

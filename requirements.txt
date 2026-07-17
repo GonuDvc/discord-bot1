@@ -4,3 +4,4 @@ python-dotenv
 aiohttp
 PyNaCl
 davey
+Pillow
