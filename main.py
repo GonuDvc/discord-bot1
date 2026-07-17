@@ -708,6 +708,8 @@ ai_chat_my_prompt_group = app_commands.Group(name="my_prompt", description="自�
 ai_chat_summary_group = app_commands.Group(name="weekly_summary", description="【オーナー限定】サーバー活動のAIサマリー機能の管理", parent=ai_chat_group)
 ai_debate_group = app_commands.Group(name="ai_debate", description="【オーナー限定】AI同士（2人格）の自動会話機能の管理")
 ai_debate_random_group = app_commands.Group(name="random", description="お題・人格をAIにランダム生成させて開始します", parent=ai_debate_group)
+profile_group = app_commands.Group(name="profile", description="Mコイン残高や招待実績などをまとめたプロフィールカード画像の表示・カスタマイズ")
+profile_background_group = app_commands.Group(name="background", description="プロフィールカードの背景画像を自分でアップロードして差し替えます", parent=profile_group)
 
 
 bot.tree.add_command(owner_trust_group)
@@ -736,6 +738,7 @@ bot.tree.add_command(embed_group)
 bot.tree.add_command(my_group)
 bot.tree.add_command(ai_chat_group)
 bot.tree.add_command(ai_debate_group)
+bot.tree.add_command(profile_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -816,6 +819,9 @@ def get_global_config(all_data: dict) -> dict:
         cfg["global_msg_cooldown_seconds"] = 60
     if "global_msg_last_earned" not in cfg:
         cfg["global_msg_last_earned"] = {}  # {user_id_str: unix_timestamp}
+    # プロフィールカードの背景画像（全サーバー共通。ユーザーが /profile background set でアップロード）
+    if "profile_backgrounds" not in cfg:
+        cfg["profile_backgrounds"] = {}  # {user_id_str: 画像URL}
     # サーバーブラックリスト（全サーバー共通）
     if "global_server_blacklist_ids" not in cfg:
         cfg["global_server_blacklist_ids"] = []  # [server_id_int, ...]
@@ -7712,11 +7718,11 @@ class _AvatarRegenerateView(discord.ui.View):
         file_obj = discord.File(io.BytesIO(image_bytes), filename="avatar.png")
         embed = discord.Embed(color=discord.Color.teal())
         embed.set_image(url="attachment://avatar.png")
-        embed.set_footer(text=f"DiceBear ・ スタイル: {actual_style} ・ シード: {seed}")
+        embed.set_footer(text=f"スタイル: {actual_style} ・ シード: {seed}")
         await interaction.edit_original_response(embed=embed, attachments=[file_obj], view=self)
 
 
-@bot.tree.command(name="avatar", description="イラスト風のランダムアバター画像を生成します（無料・DiceBear提供）")
+@bot.tree.command(name="avatar", description="イラスト風のランダムアバター画像を生成します（無料）")
 @app_commands.describe(
     スタイル="生成するアバターのスタイル（省略時はおまかせでランダム）",
     シード="同じ文字列を指定すると毎回同じ絵になる合言葉（省略時はランダム）",
@@ -7758,7 +7764,7 @@ async def avatar_command(
     file_obj = discord.File(io.BytesIO(image_bytes), filename="avatar.png")
     embed = discord.Embed(color=discord.Color.teal())
     embed.set_image(url="attachment://avatar.png")
-    embed.set_footer(text=f"DiceBear ・ スタイル: {actual_style} ・ シード: {seed}")
+    embed.set_footer(text=f"スタイル: {actual_style} ・ シード: {seed}")
     view = _AvatarRegenerateView(style_choice, interaction.user.id)
     await interaction.followup.send(embed=embed, file=file_obj, view=view)
 
@@ -7900,6 +7906,21 @@ def _profile_card_draw_icon(draw, icon_type: str, x: int, y: int, size: int, col
         draw.ellipse((x, y, x + size, y + size), outline=c, width=3)
 
 
+def _profile_card_cover_resize(img: "Image.Image", target_w: int, target_h: int) -> "Image.Image":
+    """
+    画像をアスペクト比を保ったまま target_w x target_h を「覆う(cover)」ようにリサイズし、
+    はみ出た部分を中央基準でクロップします（CSSのbackground-size: coverと同じ挙動）。
+    """
+    img = img.convert("RGB")
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
 def _build_profile_card_image(
     font_path: str,
     avatar_bytes: bytes,
@@ -7907,32 +7928,57 @@ def _build_profile_card_image(
     tagline: str,
     stats: list,  # [(ラベル, 値), ...]
     accent_color=(88, 101, 242),
+    background_bytes: Optional[bytes] = None,
 ) -> bytes:
     """
     プロフィールカードをPNG画像として描画し、そのバイナリを返します。
     PIL処理はCPUバウンド（同期・ブロッキング）なので、呼び出し側は必ず
     asyncio.to_thread 等でイベントループをブロックしないように呼び出してください。
+
+    background_bytes が指定された場合、ユーザーがアップロードした画像をカード全面の
+    背景として使用します（cover方式でリサイズ・中央クロップ）。その場合、文字やチップの
+    可読性を保つため暗いオーバーレイ（グラデーション）を重ねます。
     """
     W, H = 1000, 360
-    bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
 
-    # 背景: 縦方向のグラデーション
-    top = (30, 22, 55)
-    bottom = (12, 10, 20)
-    bg_draw = ImageDraw.Draw(bg)
-    for y in range(H):
-        t = y / H
-        r = int(top[0] + (bottom[0] - top[0]) * t)
-        g = int(top[1] + (bottom[1] - top[1]) * t)
-        b = int(top[2] + (bottom[2] - top[2]) * t)
-        bg_draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+    if background_bytes:
+        try:
+            custom_bg = Image.open(io.BytesIO(background_bytes))
+            bg = _profile_card_cover_resize(custom_bg, W, H).convert("RGBA")
+            # 可読性確保のため、全体に薄い暗幕＋左側（テキスト側）を特に暗くするグラデーションを重ねる
+            overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            overlay_draw = ImageDraw.Draw(overlay)
+            for x in range(W):
+                # 左端(アバター・文字側)ほど暗く、右端ほど薄く。最低でも110は確保して背景画像だけで文字が
+                # 読めなくなる（明るい画像・白背景の画像等）のを防ぐ。
+                t = x / W
+                alpha = int(190 - 90 * t)
+                overlay_draw.line([(x, 0), (x, H)], fill=(0, 0, 0, alpha))
+            bg = Image.alpha_composite(bg, overlay)
+        except Exception as e:
+            print(f"[プロフィールカード] 背景画像の読み込みに失敗（既定の背景を使用します）: {e}")
+            background_bytes = None
 
-    # アクセントカラーの光彩
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse((-150, -150, 350, 350), fill=(*accent_color, 90))
-    glow = glow.filter(ImageFilter.GaussianBlur(80))
-    bg = Image.alpha_composite(bg, glow)
+    if not background_bytes:
+        bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+
+        # 背景: 縦方向のグラデーション
+        top = (30, 22, 55)
+        bottom = (12, 10, 20)
+        bg_draw = ImageDraw.Draw(bg)
+        for y in range(H):
+            t = y / H
+            r = int(top[0] + (bottom[0] - top[0]) * t)
+            g = int(top[1] + (bottom[1] - top[1]) * t)
+            b = int(top[2] + (bottom[2] - top[2]) * t)
+            bg_draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+        # アクセントカラーの光彩
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.ellipse((-150, -150, 350, 350), fill=(*accent_color, 90))
+        glow = glow.filter(ImageFilter.GaussianBlur(80))
+        bg = Image.alpha_composite(bg, glow)
 
     # 角丸マスクで全体を切り抜き
     mask = Image.new("L", (W, H), 0)
@@ -8005,20 +8051,18 @@ def _build_profile_card_image(
     return buf.getvalue()
 
 
-@bot.tree.command(name="profile", description="Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します")
+@profile_group.command(name="view", description="Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します")
 @app_commands.describe(
     対象="プロフィールカードを見たいユーザー（省略時は自分）",
-    イラスト風アバター="オンにすると、実際のDiscordアバターの代わりにDiceBearのイラスト風アバターを使います",
+    イラスト風アバター="オンにすると、実際のDiscordアバターの代わりにイラスト風アバターを使います",
 )
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def profile_command(
     interaction: discord.Interaction,
-    対象: Optional[discord.Member] = None,
+    対象: Optional[discord.User] = None,
     イラスト風アバター: Optional[bool] = False,
 ):
-    if not interaction.guild:
-        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
-        return
-
     if not _PIL_AVAILABLE:
         await interaction.response.send_message(
             "プロフィールカード機能に必要なライブラリ（Pillow）がインストールされていません。"
@@ -8042,19 +8086,47 @@ async def profile_command(
     _ai_chat_record_request(_PROFILE_COMMAND_GUILD_KEY, interaction.user.id)
 
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    global_cfg = get_global_config(all_data)
 
-    balance = get_balance(cfg, target.id)
-    invite_info = cfg.get("invite_stats", {}).get(str(target.id), {"joins": 0, "leaves": 0})
-    net_invites = max(invite_info.get("joins", 0) - invite_info.get("leaves", 0), 0)
-    warning_count = len(cfg.get("warnings", {}).get(str(target.id), []))
-    joined_at = target.joined_at
-    days_in_server = (discord.utils.utcnow() - joined_at).days if joined_at else 0
+    # Mコインは /balance と同じ「全サーバー共通のグローバル残高」を表示する
+    # （サーバーローカルの economy_balances ではない。DM・グループDMにはサーバーという概念が
+    # 無いため、そもそもグローバル残高を使う必要がある）。
+    balance = get_global_balance(all_data, target.id)
+
+    if interaction.guild:
+        # サーバー内: 招待人数・警告・在籍日数はサーバー固有のデータのため、サーバー内実行時のみ表示する。
+        # 対象が discord.User の場合、そのサーバーのMemberとしての参加日等は member 情報からしか
+        # 取れないため、可能であれば Member に解決し直す（フェッチできなければ「-」表示にフォールバック）。
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        member = interaction.guild.get_member(target.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(target.id)
+            except Exception:
+                member = None
+
+        invite_info = cfg.get("invite_stats", {}).get(str(target.id), {"joins": 0, "leaves": 0})
+        net_invites = max(invite_info.get("joins", 0) - invite_info.get("leaves", 0), 0)
+        warning_count = len(cfg.get("warnings", {}).get(str(target.id), []))
+        joined_at = member.joined_at if member else None
+        days_in_server = (discord.utils.utcnow() - joined_at).days if joined_at else None
+
+        stats = [
+            ("coin", "Mコイン", f"{balance:,}"),
+            ("invite", "招待人数", f"{net_invites}人" if member else "-"),
+            ("warning", "警告", f"{warning_count}件" if member else "-"),
+            ("calendar", "在籍日数", f"{days_in_server}日" if days_in_server is not None else "-"),
+        ]
+    else:
+        # DM・グループDM: サーバー固有の情報が無いため、グローバル共通のMコインのみ表示する
+        stats = [
+            ("coin", "Mコイン", f"{balance:,}"),
+        ]
 
     try:
         font_path = await _ensure_profile_card_font()
     except Exception as e:
-        print(f"[/profile] フォント取得エラー: {e}")
+        print(f"[/profile view] フォント取得エラー: {e}")
         await interaction.followup.send("プロフィールカード用フォントの取得に失敗しました。時間をおいて再度お試しください。")
         return
 
@@ -8069,29 +8141,111 @@ async def profile_command(
                         raise RuntimeError(f"アバター画像取得エラー（HTTP {resp.status}）")
                     avatar_bytes = await resp.read()
     except Exception as e:
-        print(f"[/profile] アバター取得エラー: {e}")
+        print(f"[/profile view] アバター取得エラー: {e}")
         await interaction.followup.send("アバター画像の取得に失敗しました。時間をおいて再度お試しください。")
         return
 
-    stats = [
-        ("coin", "Mコイン", f"{balance:,}"),
-        ("invite", "招待人数", f"{net_invites}人"),
-        ("warning", "警告", f"{warning_count}件"),
-        ("calendar", "在籍日数", f"{days_in_server}日"),
-    ]
+    # ユーザーが /profile background set でアップロード済みの背景画像があれば取得する
+    # （全サーバー共通設定。取得に失敗した場合は既定のグラデーション背景にフォールバックする）
+    background_bytes = None
+    background_url = global_cfg.get("profile_backgrounds", {}).get(str(target.id))
+    if background_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(background_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        background_bytes = await resp.read()
+                    else:
+                        print(f"[/profile view] 背景画像取得エラー（HTTP {resp.status}）。既定の背景にフォールバックします。")
+        except Exception as e:
+            print(f"[/profile view] 背景画像取得エラー: {e}。既定の背景にフォールバックします。")
+
     tagline = f"@{target.name} ・ ID: {target.id}"
 
     try:
         image_bytes = await asyncio.to_thread(
-            _build_profile_card_image, font_path, avatar_bytes, target.display_name, tagline, stats
+            _build_profile_card_image, font_path, avatar_bytes, target.display_name, tagline, stats,
+            (88, 101, 242), background_bytes
         )
     except Exception as e:
-        print(f"[/profile] カード生成エラー: {e}")
+        print(f"[/profile view] カード生成エラー: {e}")
         await interaction.followup.send("プロフィールカードの生成に失敗しました。時間をおいて再度お試しください。")
         return
 
     file_obj = discord.File(io.BytesIO(image_bytes), filename="profile.png")
     await interaction.followup.send(file=file_obj)
+
+
+_PROFILE_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024  # 8MB
+_PROFILE_BACKGROUND_ALLOWED_CONTENT_TYPES = ("image/png", "image/jpeg", "image/webp")
+
+
+@profile_background_group.command(name="set", description="プロフィールカードの背景画像を自分でアップロードした画像に差し替えます")
+@app_commands.describe(画像="背景として使いたい画像（PNG/JPEG/WEBP、8MBまで。GIFはアニメーション非対応のため不可）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_background_set(interaction: discord.Interaction, 画像: discord.Attachment):
+    if not _PIL_AVAILABLE:
+        await interaction.response.send_message(
+            "プロフィールカード機能に必要なライブラリ（Pillow）がインストールされていません。",
+            ephemeral=True
+        )
+        return
+
+    content_type = (画像.content_type or "").split(";")[0].strip().lower()
+    if content_type not in _PROFILE_BACKGROUND_ALLOWED_CONTENT_TYPES:
+        await interaction.response.send_message(
+            "対応していない画像形式です。PNG・JPEG・WEBPのいずれかをアップロードしてください"
+            "（GIFはアニメーション表示に対応していないため使用できません）。",
+            ephemeral=True
+        )
+        return
+
+    if 画像.size > _PROFILE_BACKGROUND_MAX_BYTES:
+        await interaction.response.send_message(
+            f"画像サイズが大きすぎます（{画像.size / 1024 / 1024:.1f}MB）。"
+            f"{_PROFILE_BACKGROUND_MAX_BYTES // 1024 // 1024}MB以下の画像をアップロードしてください。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        image_bytes = await 画像.read()
+        # 実際に画像として開けるか検証しておく（拡張子・content_typeの詐称や破損ファイル対策）
+        Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:
+        print(f"[/profile background set] 画像検証エラー: {e}")
+        await interaction.followup.send("画像を読み込めませんでした。別の画像でお試しください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg.setdefault("profile_backgrounds", {})[str(interaction.user.id)] = 画像.url
+    save_data(all_data)
+
+    await interaction.followup.send(
+        "プロフィールカードの背景画像を設定しました。`/profile view` で確認できます。\n"
+        "-# 画像はDiscordのアップロード先CDN URLを保存しているため、"
+        "このメッセージや元の添付を削除するとURLが失効し、背景が既定のものに戻る場合があります。",
+        ephemeral=True
+    )
+
+
+@profile_background_group.command(name="reset", description="プロフィールカードの背景画像を既定のもの（グラデーション）に戻します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_background_reset(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    backgrounds = global_cfg.setdefault("profile_backgrounds", {})
+    if str(interaction.user.id) in backgrounds:
+        del backgrounds[str(interaction.user.id)]
+        save_data(all_data)
+        await interaction.response.send_message("プロフィールカードの背景画像を既定のものに戻しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("背景画像は設定されていません（既に既定のものです）。", ephemeral=True)
 
 
 # ====================================================================
@@ -9437,7 +9591,8 @@ async def help_command(interaction: discord.Interaction):
             "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
             "`/avatar` : イラスト風のランダムアバター画像を生成します（DM・グループDM・サーバー内どこでも利用可能）\n"
-            "`/profile` : Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します\n"
+            "`/profile view` : Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します\n"
+            "`/profile background set` : プロフィールカードの背景画像を自分でアップロードした画像に差し替えます\n"
             "`/giveaway` : プレゼント企画を作成・管理します\n"
             "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server stats` : サーバーの統計情報を表示します\n"
