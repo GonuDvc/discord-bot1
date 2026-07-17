@@ -5095,6 +5095,27 @@ AI_CHAT_MODEL_CONCEALMENT_GUARD = (
 
 AI_CHAT_GUILD_PROMPT_MAX_LENGTH = 1500  # サーバー既定人格として登録できる最大文字数（オーナー専用設定のため一般ユーザーより広め）
 
+
+def _ai_chat_current_date_notice() -> str:
+    """
+    現在の実際の日付をシステムプロンプトに埋め込むための一文を生成します。
+    AIモデルは学習データの時点（多くの場合2024年頃まで）で時間感覚が止まっているため、
+    「今日は何年か」を明示的に伝えないと、検索クエリや回答の中で誤った年（例: 2024年）を
+    使ってしまう・「自分の知識は最新だから検索は不要」と誤判断する、といった問題が起きる。
+    毎回の呼び出し時点の実時刻を埋め込むため、呼び出しのたびに動的に生成する（定数にしない）。
+    """
+    now = datetime.datetime.now()
+    return (
+        f"\n\n【現在日時】今日は{now.year}年{now.month}月{now.day}日です。"
+        f"あなた自身の学習データは、これより前のある時点までの情報しか含まれていません"
+        "（具体的な学習データの締め切り時期は自分では正確に分からないため、断定しないでください）。"
+        "そのため、現在の日付を基準に「最近」「最新」「今年」等の表現を解釈し、"
+        "学習データの内容が古くなっている可能性を常に疑ってください。"
+        "特にニュース・時事・現在の状況に関する質問では、自分の記憶だけで"
+        f"「{now.year}年」より前の年（例: 2024年）を勝手に前提としないでください。"
+    )
+
+
 # Web検索（Tool Use）で最新情報を取得した場合の振る舞いに関する指示。
 # Web検索APIキー（Tavily/Exa/Firecrawlのいずれも）未設定時はツール自体が渡らないため、
 # この指示があってもAIが検索を試みることはない。
@@ -5102,7 +5123,17 @@ AI_CHAT_SEARCH_USAGE_GUIDE = (
     "\n\nあなたには「web_search」というツールが利用可能な場合があります。"
     "自分の知識が古い可能性がある質問（最新ニュース、現在の状況、最近のリリース情報など）には"
     "積極的にこのツールを使って調べてから回答してください。"
-    "検索結果を使って回答する場合、情報源に触れるときは記事の出典サイト名"
+    "\n\n【絶対に守ること】"
+    "web_searchツールが利用可能な状況で、時事・最新情報・現在の状況に関する質問をされた場合、"
+    "あなた自身の学習データだけに基づいて回答することは禁止です。必ず実際にツールを呼び出し、"
+    "その結果が返ってくるのを待ってから回答してください。"
+    "検索結果を待たずに、あなた自身がそれらしい検索結果やニュース記事の内容を创作・想像して"
+    "回答文に含めることは絶対にしないでください（存在しないニュースの捏造は重大な問題です）。"
+    "ツールの実行結果は運営側のシステムから別途あなたに渡されます。"
+    "あなたが「検索した」という体裁のテキストや、検索結果らしきJSON・表を"
+    "自分で書き出す必要は一切ありません（それは嘘の情報になります）。"
+    "実際に検索が実行された場合のみ、その結果に基づいて回答してください。"
+    "\n\n検索結果を使って回答する場合、情報源に触れるときは記事の出典サイト名"
     "（例: 「〇〇新聞によると」「公式サイトの発表では」など、検索結果に含まれる記事自体の発信元）"
     "のみを使ってください。"
     "「Tavilyによると」「Exa.aiの検索結果では」のように、検索ツール自体の名称"
@@ -5138,7 +5169,7 @@ def _ai_chat_finalize_system_prompt(
     設定されていればWeb検索案内文を付与しない（実際にツールも渡されないため、
     案内文だけ残ると矛盾するのを防ぐ）。
     """
-    result = system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD
+    result = system_prompt + AI_CHAT_MODEL_CONCEALMENT_GUARD + _ai_chat_current_date_notice()
     search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
     if WEB_SEARCH_AVAILABLE and include_search_guide and search_enabled_for_guild:
         result += AI_CHAT_SEARCH_USAGE_GUIDE
@@ -5837,23 +5868,43 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 # みなして除去対象にする（キーの完全一致ではなく部分一致で緩く判定することで、
 # モデルが独自に付け足す top_n・source・id 等のフィールドにも対応する）。
 _LEAKED_TOOL_JSON_SIGNAL_KEYS = frozenset({
-    "tool", "query", "top_n", "source", "cursor", "response", "results",
+    "tool", "query", "top_n", "source", "cursor", "response", "results", "result",
     "function", "arguments", "tool_call", "tool_calls", "name", "id",
-    "action", "parameters", "content", "snippet", "url", "title",
+    "action", "parameters", "content", "snippet", "url", "title", "answer",
+})
+
+# 上記のうち、それ単体でJSONオブジェクトに含まれていれば「ツール呼び出し／結果らしい」と
+# 十分言い切れる強いシグナル。"name"・"id"・"title"・"content" 等は通常のユーザーデータ
+# （例: {"name": "田中太郎", ...}）にも頻出するため、これらのみを含むJSONは弱いシグナル
+# 扱いとし、単体では誤検知させない（複数の弱いシグナルが揃った場合、または強いシグナルが
+# 1つでもあれば「漏れ」と判定する）。
+_LEAKED_TOOL_JSON_STRONG_SIGNAL_KEYS = frozenset({
+    "tool", "query", "function", "arguments", "tool_call", "tool_calls",
+    "action", "parameters", "response",
 })
 
 
 def _looks_like_leaked_tool_json(obj) -> bool:
     """
     切り出したJSONオブジェクトが「モデルが本文に漏らしたツール呼び出し／ツール結果らしきもの」
-    かどうかを緩く判定する。dict以外（文字列・数値・配列単体等）は対象外。
-    シグナルキーを1つも含まない素朴なdict（例: ユーザーが本来送りたかったデータ）を
-    誤って除去しないよう、シグナルキーとの一致を必須条件にする。
+    かどうかを判定する。dict以外（文字列・数値・配列単体等）は対象外。
+
+    判定基準:
+      - 強いシグナルキー（tool, query, function, arguments, tool_call, tool_calls,
+        action, parameters, response）を1つでも含む → 漏れと判定
+      - 強いシグナルが無くても、弱いシグナルキー（results, result, source, url, title,
+        content, snippet, name, id, top_n, cursor, answer）を2つ以上含む → 漏れと判定
+        （検索結果オブジェクトはtitle/url/content等が複数同時に現れる典型パターンのため）
+      - 弱いシグナルが1つ以下しか無い素朴なdict（例: ユーザーが本来送りたかったデータ）は
+        誤って除去しないよう対象外とする
     """
     if not isinstance(obj, dict) or not obj:
         return False
     keys = {str(k).lower() for k in obj.keys()}
-    return bool(keys & _LEAKED_TOOL_JSON_SIGNAL_KEYS)
+    if keys & _LEAKED_TOOL_JSON_STRONG_SIGNAL_KEYS:
+        return True
+    weak_matches = keys & _LEAKED_TOOL_JSON_SIGNAL_KEYS
+    return len(weak_matches) >= 2
 
 
 def _extract_leading_json_blobs(text: str, max_blobs: int = 8):
@@ -5912,32 +5963,75 @@ def _extract_leading_json_blobs(text: str, max_blobs: int = 8):
 # JSON群の直後に付着することがある短いノイズ（[No output] 等）を検知して読み飛ばすためのパターン。
 _LEAKED_JSON_TRAILING_NOISE_PATTERN = re.compile(r'^\s*\[[A-Za-z0-9_\-\s]{0,30}\]\s*')
 
+# 一部モデルがJSON漏れの直前に書く短い独り言（例: "We need to call web_search again."）を
+# 許容する最大文字数。これを超える場合は通常の回答文の冒頭である可能性が高いため対象外とする。
+_LEAKED_JSON_PREFIX_TEXT_MAX_LEN = 80
+
 
 def _find_query_like_value(blobs: list) -> str:
     """
     切り出したJSONブロブ群の中から、検索クエリらしき文字列値を探して返す。
-    "query" キーを優先し、無ければ最初に見つかった文字列値をフォールバックとして使う。
+    "query" キーを優先し（ネストされたオブジェクト内も再帰的に探索する。例:
+    {"tool": "web_search", "parameters": {"query": "..."}} のようなケースに対応）、
+    見つからなければ再帰的に最初に見つかった文字列値をフォールバックとして使う。
+    ただしフォールバックでは "tool"・"name"・"function" 等のツール名らしきキーの値
+    （例: "web_search" 自体）を誤ってクエリとして採用しないよう除外する。
     見つからなければ空文字列を返す。
     """
-    for blob in blobs:
-        if isinstance(blob, dict) and isinstance(blob.get("query"), str) and blob["query"].strip():
-            return blob["query"].strip()
-    for blob in blobs:
-        if isinstance(blob, dict):
-            for v in blob.values():
+    _NON_QUERY_KEYS = {"tool", "name", "function", "action", "id", "tool_call", "tool_calls"}
+
+    def _search_query_key(obj) -> Optional[str]:
+        if isinstance(obj, dict):
+            if isinstance(obj.get("query"), str) and obj["query"].strip():
+                return obj["query"].strip()
+            for v in obj.values():
+                found = _search_query_key(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _search_query_key(item)
+                if found:
+                    return found
+        return None
+
+    def _search_any_string(obj, skip_key: Optional[str] = None) -> Optional[str]:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if str(k).lower() in _NON_QUERY_KEYS:
+                    continue
                 if isinstance(v, str) and v.strip():
                     return v.strip()
+                found = _search_any_string(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _search_any_string(item)
+                if found:
+                    return found
+        return None
+
+    for blob in blobs:
+        found = _search_query_key(blob)
+        if found:
+            return found
+    for blob in blobs:
+        found = _search_any_string(blob)
+        if found:
+            return found
     return ""
 
 
 def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     """
-    本文が「ツール呼び出し／ツール結果らしきJSON群のみ」で構成されている場合
-    （後ろに回答文が続いていない場合）に、検索リトライに使えるクエリ等を含む
-    辞書（{"query": "..."} 形式）を返す。該当しない・パース失敗時はNoneを返す。
+    本文が「（短い前置き文＋）ツール呼び出し／ツール結果らしきJSON群のみ」で
+    構成されている場合（JSON群の後ろに回答文が続いていない場合）に、
+    検索リトライに使えるクエリ等を含む辞書（{"query": "..."} 形式）を返す。
+    該当しない・パース失敗時はNoneを返す。
     コードブロック（```json ... ```）で囲まれているケースにも対応する。
 
-    JSON群の後ろに回答文が続くケースは _strip_leaked_tool_call_prefix で別途処理する。
+    JSON群の後ろに回答文が続くケースは _try_extract_query_from_leaked_prefix で別途処理する。
     """
     if not raw_content:
         return None
@@ -5946,9 +6040,15 @@ def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     if fence_match:
         candidate = fence_match.group(1).strip()
 
+    # 短い前置き文（例: "We need to call web_search again."）を許容してJSON開始位置を探す
+    brace_pos = candidate.find('{')
+    if brace_pos == -1 or brace_pos > _LEAKED_JSON_PREFIX_TEXT_MAX_LEN:
+        return None
+    candidate = candidate[brace_pos:]
+
     blobs, remainder = _extract_leading_json_blobs(candidate)
     if not blobs or remainder.strip():
-        return None  # JSONが1つも無い、またはJSON群の後ろに何か残っている（=(B)側の処理対象）
+        return None  # JSONが1つも無い、またはJSON群の後ろに何か残っている（=別経路の処理対象）
     if not any(_looks_like_leaked_tool_json(b) for b in blobs):
         return None
 
@@ -5956,26 +6056,37 @@ def _try_parse_leaked_tool_call_json(raw_content: str) -> Optional[dict]:
     return {"query": query}
 
 
-def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
+def _collect_leaked_tool_json_prefix(raw_content: str):
     """
-    本文の先頭に「JSON形式のツール呼び出し／ツール結果らしきものが1個以上連続し
-    （＋各JSONの直後に[No output]等のノイズが付くことがある）」、その後ろに実際の
-    回答文が続いているケースを検知し、先頭のJSON群＋ノイズ部分だけを取り除いた
-    本文を返す。該当しない場合は raw_content をそのまま返す。
+    本文の先頭（または先頭付近）に連続する「ツール呼び出し／ツール結果らしきJSON群
+    （＋各JSONの直後に[No output]等のノイズが付くことがある）」を検知し、
+    収集したJSONブロブのリストと、それらを取り除いた後の残り文字列を返す共通ロジック。
+    _strip_leaked_tool_call_prefix と _try_extract_query_from_leaked_prefix の両方から使う。
 
-    例: '{"query":"..."}{"response":"search_results","results":[...]}最近のニュースは...'
-        → '最近のニュースは...'
+    一部のモデルは、JSONの直前に "We need to call web_search again." のような
+    短い独り言・前置き文を挟んでからJSONを書き始めることがある。このような前置き文が
+    ある場合でもJSON漏れとして検知できるよう、最初の "{" が現れるまでの区間が
+    _LEAKED_JSON_PREFIX_TEXT_MAX_LEN 文字以内であれば、その前置き文ごとスキップして
+    JSON検知を試みる（長すぎる場合は通常の回答文の一部を誤検知するリスクがあるため対象外）。
 
-    このケースではモデルが既に回答文を生成し終えているため、再度APIを呼んで
-    検索させ直すのではなく、ノイズを除去してそのまま使うのが最も自然な対処になる。
+    戻り値: (collected_blobs: list, remainder: str)
+    JSON漏れが検知されなかった場合は (空リスト, raw_content) を返す。
     """
     if not raw_content:
-        return raw_content
+        return [], raw_content
 
-    i = 0
+    # 本文の先頭にプレーンテキストの前置きがあり得るため、最初の "{" の位置を探す。
+    # 前置きが無ければ brace_pos == 0 のまま（従来通りの挙動）。
+    brace_pos = raw_content.find('{')
+    if brace_pos == -1:
+        return [], raw_content  # JSONの開始位置が無ければ漏れなし
+    if brace_pos > _LEAKED_JSON_PREFIX_TEXT_MAX_LEN:
+        return [], raw_content  # 前置きが長すぎる = 通常の回答文の可能性が高いため対象外
+
+    prefix_text = raw_content[:brace_pos]
+    i = brace_pos
     n = len(raw_content)
     collected_blobs = []
-    consumed_any_signal = False
     while True:
         blobs, remainder_from_here = _extract_leading_json_blobs(raw_content[i:], max_blobs=1)
         if not blobs:
@@ -5983,9 +6094,7 @@ def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
         blob = blobs[0]
         if not _looks_like_leaked_tool_json(blob):
             break
-        consumed_signal_this_round = True
         collected_blobs.append(blob)
-        consumed_any_signal = consumed_any_signal or consumed_signal_this_round
         i = n - len(remainder_from_here)
         # JSONの直後に付着する短いノイズ（[No output] 等）を読み飛ばす
         noise_match = _LEAKED_JSON_TRAILING_NOISE_PATTERN.match(raw_content[i:])
@@ -5997,17 +6106,55 @@ def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
             while i < n and raw_content[i].isspace():
                 i += 1
 
-    if not consumed_any_signal:
+    if not collected_blobs:
+        return [], raw_content  # 前置きの後ろにJSONが続かなかった＝漏れなし（通常の回答文）
+
+    return collected_blobs, raw_content[i:]
+
+
+def _strip_leaked_tool_call_prefix(raw_content: str) -> str:
+    """
+    本文の先頭に「JSON形式のツール呼び出し／ツール結果らしきものが1個以上連続し
+    （＋各JSONの直後に[No output]等のノイズが付くことがある）」、その後ろに実際の
+    回答文が続いているケースを検知したかどうかを判定するために使う。
+
+    【重要】この関数は「JSON漏れが存在するかどうかの検知」専用であり、
+    戻り値の残り文字列（後半の回答文）をそのまま採用してはいけない。
+    後半の回答文はモデルが本物のツール結果を見ずに自分で内容を捏造している疑いがあるため、
+    呼び出し側では「raw_contentと異なる値が返ってきたら漏れありと判定し、再検索フローに回す」
+    という用途にのみ使うこと（実際の再検索・回答生成は _try_extract_query_from_leaked_prefix
+    経由で行う）。
+
+    例: '{"query":"..."}{"response":"search_results","results":[...]}最近のニュースは...'
+        → '最近のニュースは...' （この戻り値そのものは信頼して使わないこと）
+    """
+    collected_blobs, remainder = _collect_leaked_tool_json_prefix(raw_content)
+    if not collected_blobs:
         return raw_content
 
-    remainder = raw_content[i:].strip()
+    remainder = remainder.strip()
     if not remainder:
         # 除去した結果、後ろに何も残らない（JSON群単体だった）場合は呼び出し元の
         # 「本文全体がJSON」処理に任せるため、そのまま元の文字列を返す
         return raw_content
 
-    print(f"[AIチャット/Web検索] 応答本文からJSON漏れの先頭ノイズを除去しました（{len(collected_blobs)}個のJSONブロブ）: {raw_content[:i][:200]!r}")
     return remainder
+
+
+def _try_extract_query_from_leaked_prefix(raw_content: str) -> Optional[dict]:
+    """
+    本文の先頭にJSON漏れ（ツール呼び出し／ツール結果らしきもの）があり、
+    その後ろに（捏造の疑いがある）回答文が続いているケースから、
+    再検索に使うクエリを抽出する。JSON漏れが見つからない場合はNoneを返す。
+    """
+    collected_blobs, remainder = _collect_leaked_tool_json_prefix(raw_content)
+    if not collected_blobs:
+        return None
+    if not remainder.strip():
+        return None  # 後ろに何も残らない場合は「本文全体がJSON」側の処理に任せる
+    query = _find_query_like_value(collected_blobs)
+    print(f"[AIチャット/Web検索] 応答本文からJSON漏れ＋後続テキストを検知しました（{len(collected_blobs)}個のJSONブロブ）: {raw_content[:200]!r}")
+    return {"query": query}
 
 
 async def _ai_chat_call_groq_with_search(
@@ -6097,44 +6244,53 @@ async def _ai_chat_call_groq_with_search(
             raw_content = message_obj.get("content") or ""
 
             # ケース(B): 先頭にJSON形式のツール呼び出し（＋[No output]等のノイズ）が付着し、
-            # その後ろにモデル自身が生成した回答文が続いているケース。
-            # この場合モデルは既に回答を生成し終えているので、再度検索・再呼び出しはせず、
-            # 先頭のノイズだけを取り除いて残りの本文をそのまま使う。
-            stripped_content = _strip_leaked_tool_call_prefix(raw_content)
-            if stripped_content != raw_content:
-                reply_text = _strip_reasoning_tags(stripped_content).strip()
-                if choice.get("finish_reason") == "length":
-                    reply_text += "\n\n*（⚠️ 出力上限のため応答が途中で切れている可能性があります）*"
-                return reply_text
+            # その後ろに一見それらしい回答文が続いているケース。
+            # 【重要】この後半の回答文は、モデルが本物のツール実行結果を見ずに
+            # 自分で検索結果・ニュース記事の内容を捏造した上で書いている可能性が高いため、
+            # 内容を信頼して返してはいけない（実際にこの形で偽のニュースが返された事例がある）。
+            # そのため、後半の文章は破棄し、JSON部分から検索クエリを抽出できれば
+            # 本物の検索を実行してから改めて回答を生成させる（ケース(A)と同じ扱いに統一する）。
+            has_leaked_prefix = _strip_leaked_tool_call_prefix(raw_content) != raw_content
 
             # 一部モデルはtool_callsを使わず、本文に直接JSONでツール呼び出しを書いてしまう
             # ことがある（例: {"tool": "web_search", "query": "..."} がそのまま出力される）。
-            # これを検知した場合、生のJSONをユーザーに見せず、実際に検索を実行してから
-            # 会話履歴に「検索した体」で結果を積み、次のラウンドで最終応答を生成させる。
+            # これを検知した場合、生のJSON・それに続く捏造の疑いがある回答文をユーザーに見せず、
+            # 実際に検索を実行してから会話履歴に「検索した体」で結果を積み、
+            # 次のラウンドで最終応答を生成させる。
             leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is None and has_leaked_prefix:
+                # 後半に回答文が続いていて厳密な単体JSONとしてはパースできない場合でも、
+                # 先頭のJSON文字列自体からクエリらしき値を拾えれば同様に再検索対象とする
+                leaked_call = _try_extract_query_from_leaked_prefix(raw_content)
+
             if leaked_call is not None and round_idx < max_search_rounds:
                 query = str(leaked_call.get("query", "")).strip()
-                print(f"[AIチャット/Web検索] 本文へのJSON漏れを検知して修復しました。クエリ: {query!r}")
+                print(f"[AIチャット/Web検索] 本文へのJSON漏れ（捏造の疑いがある回答含む）を検知し、破棄して再検索します。クエリ: {query!r}")
                 if query:
                     search_result_text = await _web_search_fallback(query, guild_config=guild_config)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
                 # ネイティブのtool_calls経路と揃え、アシスタント発言＋検索結果を履歴に積んで
-                # 次のラウンドで通常のテキスト応答を生成させる（生JSONは履歴にも残さない）
+                # 次のラウンドで通常のテキスト応答を生成させる（生JSON・捏造回答は履歴にも残さない）
                 working_messages.append({
                     "role": "assistant",
                     "content": "（内部処理: Web検索を実行しました）"
                 })
                 working_messages.append({
                     "role": "user",
-                    "content": f"（システム）検索結果:\n{search_result_text}\n\n上記の検索結果を踏まえて、通常の文章で回答してください。JSON形式では出力しないでください。"
+                    "content": (
+                        f"（システム）先ほどの応答は無効になりました。改めて実際の検索結果を渡します:\n"
+                        f"{search_result_text}\n\n"
+                        "上記の実際の検索結果のみを根拠に、通常の文章で回答してください。"
+                        "JSON形式では出力せず、検索結果に無い情報を付け加えないでください。"
+                    )
                 })
                 continue
 
             # 通常の応答（検索不要と判断した、または検索ラウンドを使い切った）
-            if leaked_call is not None:
-                # 検索ラウンドを使い切った状態でJSON漏れが検知された場合は、
-                # これ以上検索を試みず、生JSONも見せずに簡潔な断り文言を返す
+            if leaked_call is not None or has_leaked_prefix:
+                # 検索ラウンドを使い切った状態でJSON漏れ・捏造の疑いが検知された場合は、
+                # これ以上検索を試みず、生JSON・捏造の疑いがある内容も見せずに簡潔な断り文言を返す
                 return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
             reply_text = _strip_reasoning_tags(raw_content).strip()
             if choice.get("finish_reason") == "length":
@@ -6199,19 +6355,22 @@ def _sanitize_ai_reply_content(raw_content: str) -> str:
 
     _ai_chat_call_groq_with_search と同様、一部のモデルがtool_callsフィールドを使わず
     本文に直接JSON形式のツール呼び出し（例: {"tool": "web_search", "query": "..."}）を
-    書いてしまうことがあります。これらの呼び出し経路では実際に検索して修復することは
-    できないため、代わりに次のように扱います:
-      (A) 先頭にJSON＋ノイズが付着し、後ろに回答文が続く場合 → 先頭部分だけ除去して返す
+    書いてしまうことがあります。この呼び出し経路では実際に検索して修復することができないため、
+    次のように扱います:
+      (A) 先頭にJSON＋ノイズが付着し、後ろに回答文が続く場合
+          → 【重要】後ろの回答文はモデルが検索結果を見ずに自分で内容を捏造している疑いが
+            高いため、信頼して返してはいけない。生JSON・捏造の疑いがある回答文の両方を
+            見せず、簡潔な断り文言を返す。
       (B) 本文全体がJSON形式のツール呼び出しのみの場合 → 生JSONを見せず、簡潔な断り文言を返す
       (C) いずれにも該当しない場合 → <think>タグ除去のみ行い、そのまま返す
     """
     if not raw_content:
         return raw_content
 
-    # (A) 先頭のJSON＋ノイズを除去し、後ろに回答文が続いていればそちらを使う
-    stripped_content = _strip_leaked_tool_call_prefix(raw_content)
-    if stripped_content != raw_content:
-        return _strip_reasoning_tags(stripped_content).strip()
+    # (A) 先頭にJSON漏れがあり、後ろに（捏造の疑いがある）回答文が続く場合
+    if _strip_leaked_tool_call_prefix(raw_content) != raw_content:
+        print(f"[AIチャット] 検索非対応の呼び出し経路でJSON漏れ＋後続テキストを検知しました（捏造の疑いがあるため非表示）: {raw_content[:200]!r}")
+        return "（検索が必要な質問でしたが、この応答方式では検索を実行できませんでした。質問を変えて再度お試しください。）"
 
     # (B) 本文全体がJSON形式のツール呼び出しのみの場合、生JSONは見せない
     leaked_call = _try_parse_leaked_tool_call_json(raw_content)
