@@ -90,6 +90,22 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_MAX_TOKENS = int(os.getenv("MISTRAL_MAX_TOKENS", "2048"))
 
+# --- OpenRouter API（Groq→Cerebras→Mistralの後のフォールバック先） ---
+# OpenRouterはOpenAI互換のchat completionsエンドポイントで、複数社のモデルを
+# 単一のAPIキーで呼び分けられる（無料モデルには ":free" サフィックス付きのものがある）。
+# 未設定（OPENROUTER_API_KEY未設定）の場合はOpenRouterへのフォールバックを行わない。
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "2048"))
+
+# --- Google Gemini API（最終フォールバック先） ---
+# GeminiはOpenAI互換ではなく専用のGenerative Language APIを使う（リクエスト/レスポンス形式が
+# 他プロバイダと異なるため、変換処理を挟んで扱う）。無料枠あり（Google AI Studio発行のAPIキー）。
+# 未設定（GEMINI_API_KEY未設定）の場合はGeminiへのフォールバックを行わない。
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "2048"))
+
 # --- Web検索API（AIチャットのWeb検索機能）---
 # AIモデル自体は学習データの時点までの知識しか持たないため、最新情報（ニュース・現在の状況等）
 # が必要な質問にはWeb検索を経由してAIに情報を渡す（Tool Use/Function Calling方式）。
@@ -523,7 +539,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_paused", False),      # True: このサーバーではAIチャットの自動応答を一時停止中
         ("ai_chat_user_settings", {}),  # {user_id_str: {"model": str|None, "system_prompt": str|None, "blocked": bool}}
         ("ai_chat_cooldown_seconds", 0),  # ユーザーごとの連投制限（秒）。0=無効。オーナーが /ai_chat set_cooldown で設定
-        ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）。オーナーが /ai_chat set_provider で設定
+        ("ai_provider", "auto"),  # "auto"（既定：Groq→Cerebras→Mistral→OpenRouter→Gemini自動フォールバック）/ "groq"（Groq固定）/ "cerebras"（Cerebras固定）/ "mistral"（Mistral固定）/ "openrouter"（OpenRouter固定）/ "gemini"（Gemini固定）。オーナーが /ai_chat set_provider で設定
         ("ai_chat_guild_system_prompt", None),  # サーバー全体の既定AI人格（システムプロンプト）。未設定ならコード内蔵の既定文を使用。オーナーが /ai_chat set_personality で設定
         # --- AIチャット：Web検索のON/OFF・使用プロバイダ切り替え（管理者専用） ---
         ("ai_chat_web_search_enabled", True),   # True: Web検索ツールをAIに提示する（APIキーが1つも無ければ実際は使われない）。管理者が /ai_chat set_search または埋め込みボタンで切り替え
@@ -3862,6 +3878,20 @@ async def on_ready():
             "実行環境（Railway/Replitの環境変数など）にキーを設定してください。"
         )
 
+    # --- AIプロバイダ（フォールバック先）の設定状況も併せてログ出力する ---
+    _provider_status = {
+        "Groq": bool(GROQ_API_KEY),
+        "Cerebras": bool(CEREBRAS_API_KEY),
+        "Mistral": bool(MISTRAL_API_KEY),
+        "OpenRouter": bool(OPENROUTER_API_KEY),
+        "Gemini": bool(GEMINI_API_KEY),
+    }
+    _configured_providers = [name for name, ok in _provider_status.items() if ok]
+    _unconfigured_providers = [name for name, ok in _provider_status.items() if not ok]
+    print(f"[AIプロバイダ] 設定済み: {', '.join(_configured_providers) if _configured_providers else 'なし'}")
+    if _unconfigured_providers:
+        print(f"[AIプロバイダ] 未設定（フォールバック対象外）: {', '.join(_unconfigured_providers)}")
+
     # Opusライブラリを自動検索してロードする（Nixpacks環境対応）
     if not discord.opus.is_loaded():
         import ctypes.util
@@ -6831,6 +6861,529 @@ async def _ai_chat_call_mistral(messages: list, model: Optional[str] = None) -> 
     return reply_text
 
 
+# ====================================================================
+# OpenRouter API（Mistralの後の追加フォールバック先）
+# ====================================================================
+# OpenRouterはOpenAI互換のchat completionsエンドポイントで、複数社のモデルを
+# 単一のAPIキーで呼び分けられる。無料モデル（モデル名末尾に:freeが付くもの）を使えば
+# 実質無料枠として利用できる（ただしOpenRouter全体で1日あたりのリクエスト数上限あり）。
+# ====================================================================
+
+class OpenRouterAPIError(RuntimeError):
+    """OpenRouter API呼び出しに関する汎用エラー。"""
+    pass
+
+
+class OpenRouterRateLimitError(OpenRouterAPIError):
+    """OpenRouter APIがレート制限（HTTP 429）を返した場合に送出される専用例外。"""
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+        self.retry_after = retry_after
+        self.raw_message = raw_message
+        suffix = f"（推定復帰まで約{_format_duration(retry_after)}）" if retry_after else ""
+        super().__init__(f"OpenRouter APIのレート制限に達しました{suffix}")
+
+
+def _openrouter_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # OpenRouterはこの2つのヘッダーを推奨している（無くても動作するが、
+        # 統計・ランキングへの計上やダッシュボード表示のために付与しておく）。
+        "HTTP-Referer": "https://github.com/",
+        "X-Title": "MakuMaku BOT",
+    }
+
+
+async def _ai_chat_call_openrouter(messages: list, model: Optional[str] = None) -> str:
+    """
+    OpenRouter Chat Completions APIを呼び出し、応答テキストを返します。
+    インターフェースは他プロバイダの呼び出し関数と揃えてあります。
+    """
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    payload = {
+        "model": model or OPENROUTER_MODEL,
+        "messages": _inject_no_search_notice(messages),
+        "temperature": 0.7,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=_openrouter_headers(),
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after: Optional[float] = None
+                header_val = resp.headers.get("Retry-After")
+                if header_val:
+                    try:
+                        retry_after = float(header_val)
+                    except ValueError:
+                        retry_after = None
+                if retry_after is None:
+                    retry_after = _parse_groq_retry_after(err_text)
+                raise OpenRouterRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+            if resp.status != 200:
+                err_text = await resp.text()
+                if resp.status in (400, 404) and "model" in err_text.lower():
+                    raise OpenRouterAPIError(
+                        f"OpenRouter APIエラー（HTTP {resp.status}）: 指定されたモデル「{model or OPENROUTER_MODEL}」が"
+                        f"見つからないか無効です。Botの環境変数 OPENROUTER_MODEL を、"
+                        f"OpenRouter公式サイト（openrouter.ai/models）で現在利用可能なモデル名に"
+                        f"更新してください。詳細: {err_text[:200]}"
+                    )
+                raise OpenRouterAPIError(f"OpenRouter APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        choice = data["choices"][0]
+        raw_content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise OpenRouterAPIError(f"OpenRouter APIの応答形式が想定と異なります: {data}")
+
+    reply_text = _sanitize_ai_reply_content(raw_content)
+    if choice.get("finish_reason") == "length":
+        reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+
+    return reply_text
+
+
+async def _ai_chat_call_openrouter_with_search(
+    messages: list,
+    model: Optional[str] = None,
+    guild_config: Optional[dict] = None
+) -> str:
+    """
+    Web検索（Tool Use）に対応したOpenRouter呼び出し。_ai_chat_call_groq_with_search /
+    _ai_chat_call_cerebras_with_search と同じロジックです
+    （OpenRouterもOpenAI互換のtools形式に対応しているため）。
+    どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出しにフォールバックします。
+    """
+    if not WEB_SEARCH_AVAILABLE:
+        return await _ai_chat_call_openrouter(messages, model=model)
+
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    working_messages = list(messages)  # 呼び出し元のリストは書き換えない
+    max_search_rounds = 2
+
+    _force_search_first_round = _query_likely_needs_search(_extract_latest_user_text(working_messages))
+
+    for round_idx in range(max_search_rounds + 1):
+        payload = {
+            "model": model or OPENROUTER_MODEL,
+            "messages": working_messages,
+            "temperature": 0.7,
+            "max_tokens": OPENROUTER_MAX_TOKENS,
+        }
+        if round_idx < max_search_rounds:
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            if round_idx == 0 and _force_search_first_round:
+                payload["tool_choice"] = "required"
+                print(f"[Web検索/OpenRouter] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
+            else:
+                payload["tool_choice"] = "auto"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=_openrouter_headers(),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    err_text = await resp.text()
+                    retry_after: Optional[float] = None
+                    header_val = resp.headers.get("Retry-After")
+                    if header_val:
+                        try:
+                            retry_after = float(header_val)
+                        except ValueError:
+                            retry_after = None
+                    if retry_after is None:
+                        retry_after = _parse_groq_retry_after(err_text)
+                    raise OpenRouterRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    if resp.status in (400, 404) and "model" in err_text.lower():
+                        raise OpenRouterAPIError(
+                            f"OpenRouter APIエラー（HTTP {resp.status}）: 指定されたモデル「{model or OPENROUTER_MODEL}」が"
+                            f"見つからないか無効です。詳細: {err_text[:200]}"
+                        )
+                    raise OpenRouterAPIError(f"OpenRouter APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+
+        try:
+            choice = data["choices"][0]
+            message_obj = choice["message"]
+        except (KeyError, IndexError, TypeError):
+            raise OpenRouterAPIError(f"OpenRouter APIの応答形式が想定と異なります: {data}")
+
+        tool_calls = message_obj.get("tool_calls")
+        if not tool_calls:
+            if round_idx == 0 and _force_search_first_round:
+                print("[Web検索/OpenRouter] tool_choice=requiredにも関わらず、モデルがweb_searchツールを呼び出しませんでした。")
+            raw_content = message_obj.get("content") or ""
+
+            has_leaked_prefix = _strip_leaked_tool_call_prefix(raw_content) != raw_content
+            leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is None and has_leaked_prefix:
+                leaked_call = _try_extract_query_from_leaked_prefix(raw_content)
+
+            if leaked_call is not None and round_idx < max_search_rounds:
+                query = str(leaked_call.get("query", "")).strip()
+                print(f"[AIチャット/Web検索/OpenRouter] 本文へのJSON漏れを検知し、破棄して再検索します。クエリ: {query!r}")
+                if query:
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+                working_messages.append({
+                    "role": "assistant",
+                    "content": "（内部処理: Web検索を実行しました）"
+                })
+                working_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"（システム）先ほどの応答は無効になりました。改めて実際の検索結果を渡します:\n"
+                        f"{search_result_text}\n\n"
+                        "上記の実際の検索結果のみを根拠に、通常の文章で回答してください。"
+                        "JSON形式では出力せず、検索結果に無い情報を付け加えないでください。"
+                    )
+                })
+                continue
+
+            if leaked_call is not None or has_leaked_prefix:
+                return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
+            reply_text = _sanitize_ai_reply_content(raw_content)
+            if choice.get("finish_reason") == "length":
+                reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+            return reply_text
+
+        working_messages.append(message_obj)
+        for tool_call in tool_calls:
+            func = tool_call.get("function", {})
+            func_name = func.get("name", "")
+            try:
+                func_args = json.loads(func.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                func_args = {}
+
+            if func_name == "web_search":
+                query = str(func_args.get("query", "")).strip()
+                if query:
+                    print(f"[AIチャット/Web検索/OpenRouter] クエリ: {query}")
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            else:
+                search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
+
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": search_result_text
+            })
+
+    return "（検索処理が複雑すぎたため、応答を生成できませんでした。質問を変えて再度お試しください。）"
+
+
+# ====================================================================
+# Google Gemini API（最終フォールバック先）
+# ====================================================================
+# GeminiはOpenAI互換ではなく専用のGenerative Language API（REST）を使うため、
+# リクエスト/レスポンスの形式が他プロバイダと異なる。
+# メッセージ形式の変換（system→systemInstruction、assistant→model等）と、
+# 関数呼び出し（functionCall/functionResponse）の扱いだけ専用に実装し、
+# 検索まわりのロジック（キーワード判定・JSON漏れ検知・_web_search_fallback呼び出し）は
+# 他プロバイダと共通の関数をそのまま再利用する。
+# ====================================================================
+
+class GeminiAPIError(RuntimeError):
+    """Gemini API呼び出しに関する汎用エラー。"""
+    pass
+
+
+class GeminiRateLimitError(GeminiAPIError):
+    """Gemini APIがレート制限（HTTP 429）を返した場合に送出される専用例外。"""
+    def __init__(self, retry_after: Optional[float] = None, raw_message: str = ""):
+        self.retry_after = retry_after
+        self.raw_message = raw_message
+        suffix = f"（推定復帰まで約{_format_duration(retry_after)}）" if retry_after else ""
+        super().__init__(f"Gemini APIのレート制限に達しました{suffix}")
+
+
+# Gemini独自のfunction calling形式で使う、web_search関数の宣言
+# （他プロバイダの _WEB_SEARCH_TOOL_DEFINITION と内容は同じだが、Geminiは
+#  "functionDeclarations" というOpenAIとは異なるラップ構造を要求するため専用に定義する）
+_GEMINI_WEB_SEARCH_FUNCTION_DECLARATION = {
+    "name": "web_search",
+    "description": "最新のニュース・出来事・情報など、学習データだけでは分からない時事的な内容を調べるためにWeb検索を実行します。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "検索したい内容を表す、具体的で簡潔な検索クエリ"
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+
+def _convert_openai_messages_to_gemini(messages: list) -> Tuple[str, list]:
+    """
+    このBOT内で共通利用しているOpenAI形式のmessages配列
+    （{"role": "system"|"user"|"assistant", "content": str} のリスト）を、
+    Geminiの (systemInstructionテキスト, contents配列) 形式に変換します。
+
+    - role "system" → systemInstruction用テキストとして連結
+    - role "user" → Geminiの "user" ロール
+    - role "assistant" → Geminiの "model" ロール
+    - role "tool" 等（OpenAI形式のツール実行結果）は変換対象外
+      （Gemini側のfunction calling往復は _ai_chat_call_gemini_with_search 内で
+      Gemini独自の形式で別途組み立てるため、ここでは無視してよい）
+    """
+    system_parts = []
+    contents = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        if role == "system":
+            if content:
+                system_parts.append(content)
+        elif role == "user":
+            if content:
+                contents.append({"role": "user", "parts": [{"text": content}]})
+        elif role == "assistant":
+            if content:
+                contents.append({"role": "model", "parts": [{"text": content}]})
+        # "tool" 等はここでは無視する
+    system_text = "\n\n".join(system_parts)
+    return system_text, contents
+
+
+def _extract_gemini_retry_after(err_text: str) -> Optional[float]:
+    """
+    Gemini APIのレート制限エラー応答（RetryInfo）から、再試行までの待機秒数を抽出します。
+    例: "retryDelay": "23s" のような文字列を含む場合がある。
+    """
+    match = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', err_text)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+async def _ai_chat_call_gemini(messages: list, model: Optional[str] = None) -> str:
+    """
+    Google Gemini（Generative Language API）を呼び出し、応答テキストを返します。
+    インターフェースは他プロバイダの呼び出し関数と揃えてあります。
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    notice_messages = _inject_no_search_notice(messages)
+    system_text, contents = _convert_openai_messages_to_gemini(notice_messages)
+    if not contents:
+        contents = [{"role": "user", "parts": [{"text": "（内容なし）"}]}]
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": GEMINI_MAX_TOKENS},
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    gemini_model = model or GEMINI_MODEL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after = _extract_gemini_retry_after(err_text)
+                raise GeminiRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+            if resp.status != 200:
+                err_text = await resp.text()
+                if resp.status == 404:
+                    raise GeminiAPIError(
+                        f"Gemini APIエラー（HTTP 404）: 指定されたモデル「{gemini_model}」が見つかりません。"
+                        f"Botの環境変数 GEMINI_MODEL を、Google AI Studio（aistudio.google.com）で"
+                        f"現在利用可能なモデル名（例: gemini-2.0-flash）に更新してください。詳細: {err_text[:200]}"
+                    )
+                raise GeminiAPIError(f"Gemini APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+        raw_content = "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError, TypeError):
+        raise GeminiAPIError(f"Gemini APIの応答形式が想定と異なります: {data}")
+
+    if not raw_content and candidate.get("finishReason") == "SAFETY":
+        raise GeminiAPIError("Gemini APIがセーフティフィルターにより応答をブロックしました。")
+
+    reply_text = _sanitize_ai_reply_content(raw_content)
+    if candidate.get("finishReason") == "MAX_TOKENS":
+        reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+
+    return reply_text
+
+
+async def _ai_chat_call_gemini_with_search(
+    messages: list,
+    model: Optional[str] = None,
+    guild_config: Optional[dict] = None
+) -> str:
+    """
+    Web検索（function calling）に対応したGemini呼び出し。
+    ロジックの流れ（時事キーワード検知→1回目は強制的にツールを呼ばせる／
+    tool_callsが無ければJSON漏れを疑う／検索結果を積んで再度応答生成させる）は
+    Groq/Cerebras/OpenRouter版と同じですが、リクエスト/レスポンスの形式が
+    Gemini独自のため専用に実装しています。
+    """
+    if not WEB_SEARCH_AVAILABLE:
+        return await _ai_chat_call_gemini(messages, model=model)
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    system_text, contents = _convert_openai_messages_to_gemini(messages)
+    if not contents:
+        contents = [{"role": "user", "parts": [{"text": "（内容なし）"}]}]
+
+    gemini_model = model or GEMINI_MODEL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={GEMINI_API_KEY}"
+
+    _force_search_first_round = _query_likely_needs_search(_extract_latest_user_text(messages))
+    max_search_rounds = 2
+
+    for round_idx in range(max_search_rounds + 1):
+        payload = {
+            "contents": contents,
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": GEMINI_MAX_TOKENS},
+        }
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+        if round_idx < max_search_rounds:
+            payload["tools"] = [{"functionDeclarations": [_GEMINI_WEB_SEARCH_FUNCTION_DECLARATION]}]
+            if round_idx == 0 and _force_search_first_round:
+                payload["toolConfig"] = {
+                    "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["web_search"]}
+                }
+                print(f"[Web検索/Gemini] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(messages)!r}")
+            else:
+                payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    err_text = await resp.text()
+                    retry_after = _extract_gemini_retry_after(err_text)
+                    raise GeminiRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    if resp.status == 404:
+                        raise GeminiAPIError(
+                            f"Gemini APIエラー（HTTP 404）: 指定されたモデル「{gemini_model}」が見つかりません。詳細: {err_text[:200]}"
+                        )
+                    raise GeminiAPIError(f"Gemini APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+
+        try:
+            candidate = data["candidates"][0]
+            parts = candidate.get("content", {}).get("parts", [])
+        except (KeyError, IndexError, TypeError):
+            raise GeminiAPIError(f"Gemini APIの応答形式が想定と異なります: {data}")
+
+        function_call_part = next((p for p in parts if isinstance(p, dict) and "functionCall" in p), None)
+
+        if function_call_part is None:
+            if round_idx == 0 and _force_search_first_round:
+                print("[Web検索/Gemini] toolConfig=ANYにも関わらず、Geminiモデルがweb_searchツールを呼び出しませんでした。")
+            raw_content = "".join(p.get("text", "") for p in parts)
+
+            has_leaked_prefix = _strip_leaked_tool_call_prefix(raw_content) != raw_content
+            leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is None and has_leaked_prefix:
+                leaked_call = _try_extract_query_from_leaked_prefix(raw_content)
+
+            if leaked_call is not None and round_idx < max_search_rounds:
+                query = str(leaked_call.get("query", "")).strip()
+                print(f"[AIチャット/Web検索/Gemini] 本文へのJSON漏れを検知し、破棄して再検索します。クエリ: {query!r}")
+                if query:
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+                contents.append({"role": "model", "parts": [{"text": "（内部処理: Web検索を実行しました）"}]})
+                contents.append({"role": "user", "parts": [{"text": (
+                    f"（システム）先ほどの応答は無効になりました。改めて実際の検索結果を渡します:\n"
+                    f"{search_result_text}\n\n"
+                    "上記の実際の検索結果のみを根拠に、通常の文章で回答してください。"
+                    "JSON形式では出力せず、検索結果に無い情報を付け加えないでください。"
+                )}]})
+                continue
+
+            if leaked_call is not None or has_leaked_prefix:
+                return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
+
+            if not raw_content and candidate.get("finishReason") == "SAFETY":
+                raise GeminiAPIError("Gemini APIがセーフティフィルターにより応答をブロックしました。")
+
+            reply_text = _sanitize_ai_reply_content(raw_content)
+            if candidate.get("finishReason") == "MAX_TOKENS":
+                reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+            return reply_text
+
+        func_call = function_call_part["functionCall"]
+        func_name = func_call.get("name", "")
+        func_args = func_call.get("args") or {}
+
+        contents.append({"role": "model", "parts": [{"functionCall": func_call}]})
+
+        if func_name == "web_search":
+            query = str(func_args.get("query", "")).strip()
+            if query:
+                print(f"[AIチャット/Web検索/Gemini] クエリ: {query}")
+                search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                _search_performed_var.set(True)
+            else:
+                search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+        else:
+            search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
+
+        contents.append({
+            "role": "function",
+            "parts": [{
+                "functionResponse": {
+                    "name": func_name,
+                    "response": {"content": search_result_text}
+                }
+            }]
+        })
+
+    return "（検索処理が複雑すぎたため、応答を生成できませんでした。質問を変えて再度お試しください。）"
+
+
 async def _ai_get_provider_override(guild_id: Optional[int]) -> Optional[str]:
     """
     guild_configに保存されたai_provider設定を読み込みます。
@@ -6843,7 +7396,7 @@ async def _ai_get_provider_override(guild_id: Optional[int]) -> Optional[str]:
         all_data = load_data()
         guild_config = get_guild_config(all_data, str(guild_id))
         provider = guild_config.get("ai_provider", "auto")
-        if provider in ("groq", "cerebras", "mistral"):
+        if provider in ("groq", "cerebras", "mistral", "openrouter", "gemini"):
             return provider
         return None
     except Exception as e:
@@ -6860,30 +7413,31 @@ async def _ai_call_llm_with_fallback(
 ) -> Tuple[str, str]:
     """
     Groq（メインモデル → GROQ_FALLBACK_MODELS）を順に試し、
-    すべて日次上限（TPD/RPD）で失敗した場合はCerebrasを、
-    Cerebrasも失敗した場合は最後にMistralを試す統一ラッパーです。
+    すべて日次上限（TPD/RPD）で失敗した場合はCerebrasを、Cerebrasも失敗した場合はMistralを、
+    Mistralも失敗した場合はOpenRouterを、それも失敗した場合は最後にGeminiを試す統一ラッパーです。
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
-    enable_search: True の場合、Groqのメインモデルでの呼び出しにWeb検索
-    （既定: Tavily→Exa→Firecrawl→NewsData.ioの優先順位で自動フォールバック。guild_configで
+    enable_search: True の場合、対応している全プロバイダ（Groq/Cerebras/Mistral/OpenRouter/Gemini）
+    でWeb検索（既定: Tavily→Exa→Firecrawl→NewsData.ioの優先順位で自動フォールバック。guild_configで
     サーバーごとにON/OFF・優先順位をカスタム設定可能）機能を持たせます
     （どのAPIキーも未設定の場合、またはそのサーバーで検索が無効化されている場合は
     自動的に検索なし呼び出しにフォールバックします）。
-    フォールバックモデル・Cerebras・Mistralへの切り替え時は検索機能を使いません
-    （実装をシンプルに保つため、検索は「メインの1回目の試行」でのみ有効）。
+    ※Mistralのみ検索対応版が未実装のため、Mistralへのフォールバック時は検索を使いません。
 
     guild_config: そのサーバーの設定辞書。ai_chat_web_search_enabled（bool）で
     Web検索の有効/無効を、ai_chat_search_provider_order（リスト）で検索プロバイダの
     優先順位をサーバーごとに上書きできる。Noneの場合はコード既定の動作（検索有効・既定順）。
 
     provider_override:
-      - "groq": Groqのみ使用（フォールバックモデルは試すが、Cerebras/Mistralへは切り替えない）
-      - "cerebras": Cerebrasのみ使用（Groq/Mistralは一切呼ばない）
-      - "mistral": Mistralのみ使用（Groq/Cerebrasは一切呼ばない）
-      - None（既定）: 従来通りの自動フォールバック（Groq→Cerebras→Mistral）
+      - "groq": Groqのみ使用（フォールバックモデルは試すが、他プロバイダへは切り替えない）
+      - "cerebras": Cerebrasのみ使用
+      - "mistral": Mistralのみ使用
+      - "openrouter": OpenRouterのみ使用
+      - "gemini": Geminiのみ使用
+      - None（既定）: 従来通りの自動フォールバック（Groq→Cerebras→Mistral→OpenRouter→Gemini）
 
-    戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras"|"mistral")
+    戻り値: (応答テキスト, 実際に使用したプロバイダ名"groq"|"cerebras"|"mistral"|"openrouter"|"gemini")
     """
     if provider_override == "cerebras":
         if not CEREBRAS_API_KEY:
@@ -6892,7 +7446,11 @@ async def _ai_call_llm_with_fallback(
                 "CEREBRAS_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
                 "Botの環境変数を確認してください。"
             )
-        reply_text = await _ai_chat_call_cerebras(messages, model=model)
+        search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+        if enable_search and search_enabled_for_guild:
+            reply_text = await _ai_chat_call_cerebras_with_search(messages, model=model, guild_config=guild_config)
+        else:
+            reply_text = await _ai_chat_call_cerebras(messages, model=model)
         return reply_text, "cerebras"
 
     if provider_override == "mistral":
@@ -6904,6 +7462,34 @@ async def _ai_call_llm_with_fallback(
             )
         reply_text = await _ai_chat_call_mistral(messages, model=model)
         return reply_text, "mistral"
+
+    if provider_override == "openrouter":
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError(
+                "このサーバーはAIプロバイダが「OpenRouter固定」に設定されていますが、"
+                "OPENROUTER_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
+                "Botの環境変数を確認してください。"
+            )
+        search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+        if enable_search and search_enabled_for_guild:
+            reply_text = await _ai_chat_call_openrouter_with_search(messages, model=model, guild_config=guild_config)
+        else:
+            reply_text = await _ai_chat_call_openrouter(messages, model=model)
+        return reply_text, "openrouter"
+
+    if provider_override == "gemini":
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "このサーバーはAIプロバイダが「Gemini固定」に設定されていますが、"
+                "GEMINI_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
+                "Botの環境変数を確認してください。"
+            )
+        search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+        if enable_search and search_enabled_for_guild:
+            reply_text = await _ai_chat_call_gemini_with_search(messages, model=model, guild_config=guild_config)
+        else:
+            reply_text = await _ai_chat_call_gemini(messages, model=model)
+        return reply_text, "gemini"
 
     candidate_models = [model] + GROQ_FALLBACK_MODELS
 
@@ -6953,14 +7539,39 @@ async def _ai_call_llm_with_fallback(
             last_error = e
 
     if not MISTRAL_API_KEY:
-        # Mistral未設定なら、ここまでの最後のエラーをそのまま送出する
+        # Mistral未設定なら、そのままOpenRouterを試す（最終的にlast_errorは下のOpenRouter/Gemini節で処理）
+        pass
+    else:
+        try:
+            reply_text = await _ai_chat_call_mistral(messages)
+            return reply_text, "mistral"
+        except Exception as e:
+            print(f"[AIフォールバック] Mistralへの切り替えにも失敗しました: {e}")
+            last_error = e
+
+    if OPENROUTER_API_KEY:
+        try:
+            if effective_enable_search:
+                reply_text = await _ai_chat_call_openrouter_with_search(messages, guild_config=guild_config)
+            else:
+                reply_text = await _ai_chat_call_openrouter(messages)
+            return reply_text, "openrouter"
+        except Exception as e:
+            print(f"[AIフォールバック] OpenRouterへの切り替えにも失敗しました: {e}")
+            last_error = e
+
+    if not GEMINI_API_KEY:
+        # Gemini未設定なら、ここまでの最後のエラーをそのまま送出する
         raise last_error
 
     try:
-        reply_text = await _ai_chat_call_mistral(messages)
-        return reply_text, "mistral"
+        if effective_enable_search:
+            reply_text = await _ai_chat_call_gemini_with_search(messages, guild_config=guild_config)
+        else:
+            reply_text = await _ai_chat_call_gemini(messages)
+        return reply_text, "gemini"
     except Exception as e:
-        print(f"[AIフォールバック] Mistralへの切り替えにも失敗しました: {e}")
+        print(f"[AIフォールバック] Geminiへの切り替えにも失敗しました: {e}")
         raise last_error from e
 
 
@@ -7735,7 +8346,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                 used_provider = "groq"
             else:
                 provider_override = guild_config.get("ai_provider", "auto")
-                if provider_override not in ("groq", "cerebras", "mistral"):
+                if provider_override not in ("groq", "cerebras", "mistral", "openrouter", "gemini"):
                     provider_override = None
                 reply_text, used_provider = await _ai_call_llm_with_fallback(
                     messages, model=model, provider_override=provider_override, enable_search=True,
@@ -7745,9 +8356,13 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
                     used_model = model or GROQ_MODEL
                 elif used_provider == "cerebras":
                     used_model = CEREBRAS_MODEL
-                else:
+                elif used_provider == "mistral":
                     used_model = MISTRAL_MODEL
-    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
+                elif used_provider == "openrouter":
+                    used_model = OPENROUTER_MODEL
+                else:
+                    used_model = GEMINI_MODEL
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError) as e:
         try:
             wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
 
@@ -7785,7 +8400,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     # （検索できないまま学習データだけで回答している事実をユーザーが把握できるようにするため）。
     primary_model = model or GROQ_MODEL
     search_note = "" if (not WEB_SEARCH_AVAILABLE or _search_performed_var.get()) else "（今回はWeb検索は利用できていません）"
-    if used_provider in ("cerebras", "mistral"):
+    if used_provider in ("cerebras", "mistral", "openrouter", "gemini"):
         reply_text += f"\n\n*（本日の利用上限のため、一時的に別方式で応答しました{search_note}）*"
     elif used_model and used_model != primary_model:
         reply_text += f"\n\n*（本日の利用上限のため、代替モデルで応答しました{search_note}）*"
@@ -7867,7 +8482,7 @@ async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict
     ]
 
     provider_override = guild_config.get("ai_provider", "auto")
-    if provider_override not in ("groq", "cerebras", "mistral"):
+    if provider_override not in ("groq", "cerebras", "mistral", "openrouter", "gemini"):
         provider_override = None
 
     try:
@@ -7875,7 +8490,7 @@ async def _handle_ai_chat_bot_reply(message: discord.Message, guild_config: dict
             reply_text, _used_provider = await _ai_call_llm_with_fallback(
                 messages, provider_override=provider_override
             )
-    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError):
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError):
         # レート制限時は他Botに向けてエラーメッセージを送らず、静かに諦める
         print(f"[AIチャット/bot_reply] レート制限のため応答を見送りました（channel_id={channel_id}）")
         return
@@ -7966,7 +8581,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
         system_prompt = user_setting["system_prompt"] or _ai_chat_resolve_default_system_prompt(guild_config)
         model = user_setting["model"] or None
         provider_override = guild_config.get("ai_provider", "auto")
-        if provider_override not in ("groq", "cerebras", "mistral"):
+        if provider_override not in ("groq", "cerebras", "mistral", "openrouter", "gemini"):
             provider_override = None
 
     # 履歴キー: DM/グループDM/サーバーいずれもチャンネルID単位（既存の自動応答と同じ仕組みを再利用）
@@ -7983,7 +8598,7 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
             messages, model=model, provider_override=provider_override, enable_search=True,
             guild_config=guild_config
         )
-    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError) as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
         limit_scope = getattr(e, "limit_scope", None)
         if limit_scope in ("TPD", "RPD"):
@@ -8930,7 +9545,7 @@ async def reply_suggest_command(interaction: discord.Interaction, 件数: app_co
 
     try:
         raw, _used_provider = await _ai_call_llm_with_fallback(messages)
-    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError) as e:
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError) as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
         limit_scope = getattr(e, "limit_scope", None)
         if limit_scope in ("TPD", "RPD"):
@@ -11492,6 +12107,8 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
     app_commands.Choice(name="プロバイダ1固定", value="groq"),
     app_commands.Choice(name="プロバイダ2固定", value="cerebras"),
     app_commands.Choice(name="プロバイダ3固定", value="mistral"),
+    app_commands.Choice(name="プロバイダ4固定", value="openrouter"),
+    app_commands.Choice(name="プロバイダ5固定", value="gemini"),
 ])
 async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_commands.Choice[str]):
     if not await is_owner_check(interaction): return
@@ -11513,6 +12130,22 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
         )
         return
 
+    if provider.value == "openrouter" and not OPENROUTER_API_KEY:
+        await interaction.response.send_message(
+            "[設定不可] このプロバイダはBotに設定されていないため選択できません。\n"
+            "Botの環境変数を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    if provider.value == "gemini" and not GEMINI_API_KEY:
+        await interaction.response.send_message(
+            "[設定不可] このプロバイダはBotに設定されていないため選択できません。\n"
+            "Botの環境変数を確認してください。",
+            ephemeral=True
+        )
+        return
+
     all_data = load_data()
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
     guild_config["ai_provider"] = provider.value
@@ -11523,6 +12156,8 @@ async def ai_chat_set_provider(interaction: discord.Interaction, provider: app_c
         "groq": "プロバイダ1固定に設定しました。上限に達しても他のプロバイダへは切り替わらず、エラーがそのまま通知されます。",
         "cerebras": "プロバイダ2固定に設定しました。常にこのプロバイダが使用されます。",
         "mistral": "プロバイダ3固定に設定しました。常にこのプロバイダが使用されます（無料枠のレート制限が厳しいためご注意ください）。",
+        "openrouter": "プロバイダ4固定に設定しました。常にこのプロバイダが使用されます。",
+        "gemini": "プロバイダ5固定に設定しました。常にこのプロバイダが使用されます。",
     }
     await interaction.response.send_message(
         f"[設定完了] このサーバーのAIプロバイダを「{provider.name}」に設定しました。\n{descriptions[provider.value]}\n"
