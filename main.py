@@ -13455,6 +13455,9 @@ async def gacha_info(interaction: discord.Interaction, id: str):
     embed.set_footer(text=f"ID: {persona['id']}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+AI_CHAT_USER_PROMPT_MAX_LENGTH = 500  # 一般メンバーが自分で設定できるシステムプロンプトの最大文字数
+
+
 
 
 
