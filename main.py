@@ -11301,7 +11301,7 @@ async def help_command(interaction: discord.Interaction):
             "`/server protect ip_ban_check` : ウェブ認証を利用したBAN逃れ（同一IP）対策を設定します\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
             "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
-            "`/gacha draw` : Mコインを消費してAI生成のオリジナル人格を引きます（`/gacha list`で確認、`/gacha use`で/aiに適用）\n"
+            "`/gacha draw` : Mコインを消費してAI生成のオリジナル人格を引きます（`/gacha list`で確認、`/gacha use`で/aiに適用、`/gacha rates`で排出率確認）\n"
             "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
         ),
         inline=False
@@ -13456,7 +13456,7 @@ async def gacha_draw(interaction: discord.Interaction):
     embed.add_field(name="話し方", value=persona.get("speech_style") or "（未設定）", inline=False)
     if persona.get("catchphrase"):
         embed.add_field(name="口癖", value=f"「{persona['catchphrase']}」", inline=False)
-    embed.set_footer(text=f"ID: {persona['id']} ／ `/gacha use` でこの人格を /ai に適用できます（消費: {GACHA_COST:,} {coin_name}）")
+    embed.set_footer(text=f"ID: {persona['id']} ／ `/gacha use` でこの人格を /ai に適用できます／`/gacha rates` で排出率を確認できます")
     await interaction.followup.send(embed=embed)
 
 
@@ -13551,6 +13551,37 @@ async def gacha_info(interaction: discord.Interaction, id: str):
         embed.add_field(name="口癖", value=f"「{persona['catchphrase']}」", inline=False)
     embed.set_footer(text=f"ID: {persona['id']}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@gacha_group.command(name="rates", description="AI人格ガチャのレアリティ排出率一覧を確認します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_rates(interaction: discord.Interaction):
+    all_data = load_data()
+    coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+
+    rarity_desc = {
+        "N": "ごく普通で親しみやすい、ありふれた個性",
+        "R": "少し個性的で分かりやすい特徴を1つ持つ",
+        "SR": "かなり尖った個性・強い口調や独特な世界観",
+        "SSR": "非常に独特で強烈な、一度見たら忘れられない個性",
+    }
+
+    lines = []
+    for name, rate, _flavor in GACHA_RARITIES:
+        desc = rarity_desc.get(name, "")
+        lines.append(f"**[{name}]** {rate}% — {desc}")
+
+    embed = discord.Embed(
+        title="[AI人格ガチャ] レアリティ排出率",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="1回あたりの消費", value=f"{GACHA_COST:,} {coin_name}", inline=True)
+    embed.add_field(name="所持上限", value=f"{GACHA_MAX_PERSONAS_PER_USER}体（超えると古いものから破棄）", inline=True)
+    embed.set_footer(text="レアリティが高いほど、AIが生成する個性がより強く・独特になります")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 AI_CHAT_USER_PROMPT_MAX_LENGTH = 500  # 一般メンバーが自分で設定できるシステムプロンプトの最大文字数
 
