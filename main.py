@@ -640,12 +640,22 @@ def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
             "gacha_personas": [],       # AI人格ガチャで排出したペルソナのリスト
             "gacha_active_persona_id": None,  # /ai で現在適用中のガチャペルソナID（Noneなら無効）
             "gacha_last_draw_at": None,  # 最後にガチャを引いたUNIXタイムスタンプ（週1回制限用）
+            "gacha_total_draws": 0,      # 累計ガチャ抽選回数（売却・交換で減っても消えない、称号判定用）
+            "gacha_active_title": None,  # プロフィール等に表示する選択中の称号ID（Noneなら未設定）
+            "gacha_earned_titles": [],   # 達成が確定した称号IDのリスト（達成後に対象ペルソナを手放しても保持され続ける）
+            "gacha_rarity_history": [],  # 今まで一度でも引いたレアリティの履歴（売却・交換しても消えない、称号判定用）
+            "gacha_max_held": 0,         # 同時所持数の歴代最大値（称号判定用）
         }
     else:
         # 既存データへの互換性のためキーが無ければ追加
         all_data["user_apps"][user_id_str].setdefault("gacha_personas", [])
         all_data["user_apps"][user_id_str].setdefault("gacha_active_persona_id", None)
         all_data["user_apps"][user_id_str].setdefault("gacha_last_draw_at", None)
+        all_data["user_apps"][user_id_str].setdefault("gacha_total_draws", 0)
+        all_data["user_apps"][user_id_str].setdefault("gacha_active_title", None)
+        all_data["user_apps"][user_id_str].setdefault("gacha_earned_titles", [])
+        all_data["user_apps"][user_id_str].setdefault("gacha_rarity_history", [])
+        all_data["user_apps"][user_id_str].setdefault("gacha_max_held", len(all_data["user_apps"][user_id_str].get("gacha_personas", [])))
     return all_data["user_apps"][user_id_str]
 
 
@@ -687,6 +697,51 @@ GACHA_RARITY_COLORS = {
     "SR": discord.Color.purple(),
     "SSR": discord.Color.gold(),
 }
+
+# レアリティ別の売却額（Mコイン）。GACHA_COST(100)より安く設定し、
+# 「引く方が得」なバランスを保ちつつ、被り・不要ペルソナの整理手段として機能させる。
+GACHA_SELL_PRICES = {
+    "N": 10,
+    "R": 30,
+    "SR": 150,
+    "SSR": 800,
+}
+
+# 称号: (称号ID, 表示名, 説明, 判定関数名)
+# 判定関数は (persona_history: list[dict], draws: int, max_held: int) を引数に bool を返す。
+# persona_history は「今まで一度でも獲得した全ペルソナのレアリティ履歴」（売却・交換しても消えない）。
+# max_held は「同時所持数の歴代最大値」（コンプ系称号用）。
+GACHA_TITLE_DEFS = [
+    ("first_gacha", "はじめの一歩", "ガチャを1回引いた", lambda hist, draws, max_held: draws >= 1),
+    ("ssr_hunter", "SSRハンター", "SSRを1体以上獲得した", lambda hist, draws, max_held: hist.count("SSR") >= 1),
+    ("ssr_double", "強運の持ち主", "SSRを2体以上獲得した", lambda hist, draws, max_held: hist.count("SSR") >= 2),
+    ("sr_collector", "SRコレクター", "SRを5体以上獲得した", lambda hist, draws, max_held: hist.count("SR") >= 5),
+    ("veteran_10", "常連さん", "累計10回ガチャを引いた", lambda hist, draws, max_held: draws >= 10),
+    ("veteran_50", "廃課金者予備軍", "累計50回ガチャを引いた", lambda hist, draws, max_held: draws >= 50),
+    ("collector_full", "コンプリートを目指す者", "ペルソナを同時に30体所持した", lambda hist, draws, max_held: max_held >= GACHA_MAX_PERSONAS_PER_USER),
+]
+
+
+def _gacha_compute_titles(user_app_data: dict) -> list:
+    """ユーザーの累計獲得履歴・累計抽選回数・歴代最大所持数から、達成済みの称号IDリストを計算します。"""
+    hist = user_app_data.get("gacha_rarity_history", [])
+    draws = user_app_data.get("gacha_total_draws", 0)
+    max_held = user_app_data.get("gacha_max_held", len(user_app_data.get("gacha_personas", [])))
+    earned = []
+    for title_id, _name, _desc, check_fn in GACHA_TITLE_DEFS:
+        try:
+            if check_fn(hist, draws, max_held):
+                earned.append(title_id)
+        except Exception:
+            pass
+    return earned
+
+
+def _gacha_title_display_name(title_id: str) -> Optional[str]:
+    for tid, name, _desc, _fn in GACHA_TITLE_DEFS:
+        if tid == title_id:
+            return name
+    return None
 
 
 def _gacha_roll_rarity() -> tuple:
@@ -9708,6 +9763,12 @@ async def profile_command(
             print(f"[/profile view] 背景画像取得エラー: {e}。既定の背景にフォールバックします。")
 
     tagline = f"@{target.name} ・ ID: {target.id}"
+    target_app_data = get_user_app_data(all_data, str(target.id))
+    active_title_id = target_app_data.get("gacha_active_title")
+    if active_title_id:
+        title_name = _gacha_title_display_name(active_title_id)
+        if title_name:
+            tagline = f"「{title_name}」 {tagline}"
 
     try:
         image_bytes = await asyncio.to_thread(
@@ -13477,6 +13538,20 @@ async def gacha_draw(interaction: discord.Interaction):
         del persona_list[: len(persona_list) - GACHA_MAX_PERSONAS_PER_USER]
     user_app_data["gacha_last_draw_at"] = time.time()  # 週1回制限用に最終抽選日時を記録
 
+    # 称号判定用の累計記録を更新（売却・交換で手放しても消えない実績として扱う）
+    titles_before = set(user_app_data.get("gacha_earned_titles", []))
+    user_app_data["gacha_total_draws"] = user_app_data.get("gacha_total_draws", 0) + 1
+    history = user_app_data.setdefault("gacha_rarity_history", [])
+    history.append(persona["rarity"])
+    user_app_data["gacha_max_held"] = max(user_app_data.get("gacha_max_held", 0), len(persona_list))
+    titles_after = set(_gacha_compute_titles(user_app_data))
+    newly_earned = titles_after - titles_before
+    if newly_earned:
+        earned_list = user_app_data.setdefault("gacha_earned_titles", [])
+        for tid in newly_earned:
+            if tid not in earned_list:
+                earned_list.append(tid)
+
     save_data(all_data)
 
     coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
@@ -13492,6 +13567,9 @@ async def gacha_draw(interaction: discord.Interaction):
     embed.add_field(name="話し方", value=persona.get("speech_style") or "（未設定）", inline=False)
     if persona.get("catchphrase"):
         embed.add_field(name="口癖", value=f"「{persona['catchphrase']}」", inline=False)
+    if newly_earned:
+        title_names = [_gacha_title_display_name(tid) or tid for tid in newly_earned]
+        embed.add_field(name="[称号] 新しい称号を獲得！", value="\n".join(f"「{n}」" for n in title_names), inline=False)
     embed.set_footer(text=f"ID: {persona['id']} ／ `/gacha use` でこの人格を /ai に適用できます／`/gacha rates` で排出率を確認できます")
     await interaction.followup.send(embed=embed)
 
@@ -13521,7 +13599,7 @@ async def gacha_list(interaction: discord.Interaction):
         description="\n".join(lines),
         color=discord.Color.blue()
     )
-    embed.set_footer(text=f"所持数: {len(personas)}体 ／ `/gacha use <ID>` で /ai に適用できます")
+    embed.set_footer(text=f"所持数: {len(personas)}体 ／ `/gacha use <ID>` で /ai に適用 ／ `/gacha sell` で売却 ／ `/gacha trade` で交換できます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -13606,7 +13684,8 @@ async def gacha_rates(interaction: discord.Interaction):
     lines = []
     for name, rate, _flavor in GACHA_RARITIES:
         desc = rarity_desc.get(name, "")
-        lines.append(f"**[{name}]** {rate}% — {desc}")
+        sell_price = GACHA_SELL_PRICES.get(name, 0)
+        lines.append(f"**[{name}]** {rate}% — {desc}（売却額: {sell_price:,} {coin_name}）")
 
     embed = discord.Embed(
         title="[AI人格ガチャ] レアリティ排出率",
@@ -13618,6 +13697,319 @@ async def gacha_rates(interaction: discord.Interaction):
     embed.add_field(name="抽選間隔", value="1週間に1回まで", inline=True)
     embed.set_footer(text="レアリティが高いほど、AIが生成する個性がより強く・独特になります")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /gacha sell — 所持ペルソナをMコインに換金
+# --------------------------------------------------------------------
+
+class GachaSellConfirmView(discord.ui.View):
+    """ペルソナ売却の最終確認ボタンです。誤操作防止のため一段階挟みます。"""
+
+    def __init__(self, user_id: int, persona_id: str, persona_name: str, rarity: str, price: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.persona_id = persona_id
+        self.persona_name = persona_name
+        self.rarity = rarity
+        self.price = price
+        self._done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("これはあなたの売却確認ではありません。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="売却する", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            await interaction.response.send_message("この売却は既に処理済みです。", ephemeral=True)
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+
+        all_data = load_data()
+        user_app_data = get_user_app_data(all_data, str(self.user_id))
+        persona_list = user_app_data.get("gacha_personas", [])
+        target = next((p for p in persona_list if p.get("id") == self.persona_id), None)
+        if target is None:
+            await interaction.response.edit_message(
+                content="このペルソナは既に手放されているか、見つかりませんでした。", embed=None, view=self
+            )
+            return
+
+        persona_list.remove(target)
+        add_global_balance(all_data, self.user_id, self.price)
+        save_data(all_data)
+
+        coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+        await interaction.response.edit_message(
+            content=f"[{self.rarity}] **{self.persona_name}** を売却し、{self.price:,} {coin_name} を獲得しました。",
+            embed=None, view=self
+        )
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="売却をキャンセルしました。", embed=None, view=self)
+
+
+@gacha_group.command(name="sell", description="所持しているガチャペルソナを売却してMコインに換金します")
+@app_commands.describe(id="売却するペルソナのID（`/gacha list`で確認できます）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_sell(interaction: discord.Interaction, id: str):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    persona = next((p for p in user_app_data.get("gacha_personas", []) if p.get("id") == id), None)
+
+    if persona is None:
+        await interaction.response.send_message(
+            "指定されたIDのペルソナが見つかりません。`/gacha list` でIDを確認してください。", ephemeral=True
+        )
+        return
+
+    # 現在 /ai に適用中のペルソナはうっかり売却を防ぐため、事前に解除を求める
+    if user_app_data.get("gacha_active_persona_id") == id:
+        await interaction.response.send_message(
+            "このペルソナは現在 `/ai` に適用中です。売却する前に `/gacha use` （ID無し）で解除してください。",
+            ephemeral=True
+        )
+        return
+
+    rarity = persona["rarity"]
+    price = GACHA_SELL_PRICES.get(rarity, 0)
+    coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+
+    view = GachaSellConfirmView(interaction.user.id, id, persona["name"], rarity, price)
+    await interaction.response.send_message(
+        f"[{rarity}] **{persona['name']}** を売却すると **{price:,} {coin_name}** を獲得します。\n"
+        "この操作は取り消せません。よろしいですか？",
+        view=view,
+        ephemeral=True
+    )
+
+
+# --------------------------------------------------------------------
+# /gacha trade — 他ユーザーとペルソナを1体ずつ交換
+# --------------------------------------------------------------------
+
+class GachaTradeConfirmView(discord.ui.View):
+    """交換提案を受けた側が承認・拒否するためのボタンです。"""
+
+    def __init__(self, proposer_id: int, proposer_persona_id: str, target_id: int, target_persona_id: str):
+        super().__init__(timeout=300)  # 相手がすぐ気づかない場合を考慮して長めに
+        self.proposer_id = proposer_id
+        self.proposer_persona_id = proposer_persona_id
+        self.target_id = target_id
+        self.target_persona_id = target_persona_id
+        self._done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("この交換提案の対象者ではありません。", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="交換を承認する", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            await interaction.response.send_message("この交換提案は既に処理済みです。", ephemeral=True)
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+
+        all_data = load_data()
+        proposer_data = get_user_app_data(all_data, str(self.proposer_id))
+        target_data = get_user_app_data(all_data, str(self.target_id))
+
+        proposer_personas = proposer_data.get("gacha_personas", [])
+        target_personas = target_data.get("gacha_personas", [])
+
+        proposer_persona = next((p for p in proposer_personas if p.get("id") == self.proposer_persona_id), None)
+        target_persona = next((p for p in target_personas if p.get("id") == self.target_persona_id), None)
+
+        # どちらかが既に手放している・IDを変更しているケースを想定
+        if proposer_persona is None or target_persona is None:
+            await interaction.response.edit_message(
+                content="交換対象のペルソナが片方またはどちらも見つからないため、交換を中止しました"
+                "（既に売却・別の交換で手放された可能性があります）。",
+                embed=None, view=self
+            )
+            return
+
+        # 提案者側が現在 /ai に適用中のペルソナだった場合は自動的に適用解除する
+        if proposer_data.get("gacha_active_persona_id") == self.proposer_persona_id:
+            proposer_data["gacha_active_persona_id"] = None
+        if target_data.get("gacha_active_persona_id") == self.target_persona_id:
+            target_data["gacha_active_persona_id"] = None
+
+        proposer_personas.remove(proposer_persona)
+        target_personas.remove(target_persona)
+        proposer_personas.append(target_persona)
+        target_personas.append(proposer_persona)
+
+        save_data(all_data)
+
+        embed = discord.Embed(
+            title="[gacha] 交換が成立しました",
+            description=(
+                f"<@{self.proposer_id}> の [{proposer_persona['rarity']}] **{proposer_persona['name']}**\n"
+                "⇄\n"
+                f"<@{self.target_id}> の [{target_persona['rarity']}] **{target_persona['name']}**"
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(content=None, embed=embed, view=self)
+
+    @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="交換提案を拒否しました。", embed=None, view=self)
+
+
+@gacha_group.command(name="trade", description="他ユーザーと所持ペルソナを1体ずつ交換します（相手の承認が必要です）")
+@app_commands.describe(
+    相手="交換相手のユーザー",
+    自分のペルソナid="渡す自分のペルソナのID（`/gacha list`で確認できます）",
+    相手のペルソナid="欲しい相手のペルソナのID（相手の`/gacha list`結果が必要です）"
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_trade(
+    interaction: discord.Interaction,
+    相手: discord.User,
+    自分のペルソナid: str,
+    相手のペルソナid: str,
+):
+    if 相手.id == interaction.user.id:
+        await interaction.response.send_message("自分自身とは交換できません。", ephemeral=True)
+        return
+    if 相手.bot:
+        await interaction.response.send_message("Botとは交換できません。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    proposer_data = get_user_app_data(all_data, str(interaction.user.id))
+    target_data = get_user_app_data(all_data, str(相手.id))
+
+    proposer_persona = next((p for p in proposer_data.get("gacha_personas", []) if p.get("id") == 自分のペルソナid), None)
+    if proposer_persona is None:
+        await interaction.response.send_message(
+            "指定した自分のペルソナIDが見つかりません。`/gacha list` でIDを確認してください。", ephemeral=True
+        )
+        return
+
+    target_persona = next((p for p in target_data.get("gacha_personas", []) if p.get("id") == 相手のペルソナid), None)
+    if target_persona is None:
+        await interaction.response.send_message(
+            f"{相手.mention} はそのIDのペルソナを所持していません。相手に `/gacha list` で確認してもらってください。",
+            ephemeral=True
+        )
+        return
+
+    view = GachaTradeConfirmView(interaction.user.id, 自分のペルソナid, 相手.id, 相手のペルソナid)
+    embed = discord.Embed(
+        title="[gacha] 交換提案",
+        description=(
+            f"{interaction.user.mention} → {相手.mention} への交換提案です。\n\n"
+            f"**渡すペルソナ**: [{proposer_persona['rarity']}] {proposer_persona['name']}\n"
+            f"**欲しいペルソナ**: [{target_persona['rarity']}] {target_persona['name']}"
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"{相手.display_name} さんの承認待ちです（5分以内に反応がないと自動的に無効になります）")
+    await interaction.response.send_message(content=相手.mention, embed=embed, view=view)
+
+
+# --------------------------------------------------------------------
+# /gacha titles, /gacha set_title — 称号システム
+# --------------------------------------------------------------------
+
+@gacha_group.command(name="titles", description="ガチャの実績で獲得した称号の一覧を確認します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_titles(interaction: discord.Interaction):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+
+    earned_ids = set(user_app_data.get("gacha_earned_titles", []))
+    active_title = user_app_data.get("gacha_active_title")
+
+    lines = []
+    for title_id, name, desc, _fn in GACHA_TITLE_DEFS:
+        got = title_id in earned_ids
+        mark = "[済]" if got else "[未]"
+        active_mark = " ← 現在表示中" if (got and title_id == active_title) else ""
+        lines.append(f"{mark} **{name}** — {desc}{active_mark}")
+
+    embed = discord.Embed(
+        title="[AI人格ガチャ] 称号一覧",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text=f"獲得済み: {len(earned_ids)}/{len(GACHA_TITLE_DEFS)} ／ `/gacha set_title` で表示する称号を選べます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@gacha_group.command(name="set_title", description="プロフィール等に表示する称号を選びます（未指定で解除）")
+@app_commands.describe(称号名="表示する称号の名前（`/gacha titles`で確認できます）。省略すると表示を解除します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_set_title(interaction: discord.Interaction, 称号名: Optional[str] = None):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+
+    if 称号名 is None:
+        user_app_data["gacha_active_title"] = None
+        save_data(all_data)
+        await interaction.response.send_message("表示称号を解除しました。", ephemeral=True)
+        return
+
+    earned_ids = set(user_app_data.get("gacha_earned_titles", []))
+    match = next((tid for tid, name, _d, _f in GACHA_TITLE_DEFS if name == 称号名), None)
+
+    if match is None:
+        await interaction.response.send_message(
+            "その名前の称号が見つかりません。`/gacha titles` で正確な名称を確認してください。", ephemeral=True
+        )
+        return
+    if match not in earned_ids:
+        await interaction.response.send_message(
+            "その称号はまだ獲得していません。`/gacha titles` で達成条件を確認してください。", ephemeral=True
+        )
+        return
+
+    user_app_data["gacha_active_title"] = match
+    save_data(all_data)
+    await interaction.response.send_message(f"表示称号を「{称号名}」に設定しました。", ephemeral=True)
+
+
+@gacha_set_title.autocomplete("称号名")
+async def gacha_set_title_autocomplete(interaction: discord.Interaction, current: str):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    earned_ids = set(user_app_data.get("gacha_earned_titles", []))
+    choices = []
+    for title_id, name, _desc, _fn in GACHA_TITLE_DEFS:
+        if title_id in earned_ids and current.lower() in name.lower():
+            choices.append(app_commands.Choice(name=name, value=name))
+    return choices[:25]
 
 
 AI_CHAT_USER_PROMPT_MAX_LENGTH = 500  # 一般メンバーが自分で設定できるシステムプロンプトの最大文字数
