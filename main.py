@@ -154,8 +154,11 @@ IMAGE_GEN_PRIMARY_AVAILABLE = bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_I
 # ボイスチャンネル再生（/voice play 等）用の FFmpeg オプション
 # --------------------------------------------------------------------
 # before_options: 入力側（デコード前）に渡すオプション。
-#   -reconnect 系: ネットワーク経由の音源で接続が瞬断した際に自動再接続し、
-#                  途切れ・ノイズの原因を減らす（ローカルファイルでは実質無害）。
+#   -reconnect 系オプションは http/https 等のネットワーク入力プロトコル専用。
+#   ローカルファイルパスを直接 FFmpegPCMAudio に渡す場合にこれを付けると、
+#   ffmpegが「Option reconnect not found.」で入力オープンに失敗し、
+#   結果として無音（曲が流れない）になる。そのため before_options は
+#   音源がURL（http://, https://）の場合のみ付与し、ローカルファイルには付けない。
 # options: 出力側（Discordへ渡すPCM生成時）に渡すオプション。
 #   -vn        : 映像トラックを無視（誤って動画ファイルを渡した場合の解析ノイズ防止）。
 #   -ar 48000  : Discordが要求する48kHzに明示的にリサンプリング（不一致によるプチ
@@ -163,11 +166,10 @@ IMAGE_GEN_PRIMARY_AVAILABLE = bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_I
 #   -ac 2      : ステレオ2chに固定。
 #   -af aresample=48000:resampler=soxr : 高品質リサンプラ(soxr)を使用し、
 #                デフォルトの簡易リサンプラで生じがちなジリジリしたノイズを軽減。
-_FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+_FFMPEG_RECONNECT_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn -ar 48000 -ac 2 -af aresample=48000:resampler=soxr"
 # soxrリサンプラが使えないffmpegビルド向けのフォールバック（高品質リサンプラなし）
 FFMPEG_OPTIONS_FALLBACK = "-vn -ar 48000 -ac 2"
-FFMPEG_BEFORE_OPTIONS = _FFMPEG_BEFORE_OPTIONS
 
 # 音量調整の上限（PCMVolumeTransformer.volume に渡す倍率の上限）。
 # 2.0(200%)まで許容すると音声波形が大きくクリップして激しいノイズ・音割れの
@@ -177,13 +179,18 @@ VOICE_VOLUME_MAX = 1.5
 
 def make_ffmpeg_audio_source(audio_path: str, executable: str) -> "discord.FFmpegPCMAudio":
     """ノイズ対策オプション付きでFFmpegPCMAudioを生成する。
-    soxrリサンプラが利用できない環境（一部の軽量ffmpegビルド）では例外を投げるffmpegも
-    あるため、まず高品質オプションで試し、失敗したらフォールバックオプションで再試行する。"""
+    - 音源がURL（http://, https://）の場合のみ -reconnect 系オプションを付与する
+      （ローカルファイルに付けると「Option reconnect not found.」で再生失敗するため）。
+    - soxrリサンプラが利用できない環境（一部の軽量ffmpegビルド）では例外を投げる
+      ffmpegもあるため、まず高品質オプションで試し、失敗したらフォールバックする。
+    """
+    is_url = isinstance(audio_path, str) and audio_path.startswith(("http://", "https://"))
+    before_options = _FFMPEG_RECONNECT_OPTIONS if is_url else None
     try:
         return discord.FFmpegPCMAudio(
             audio_path,
             executable=executable,
-            before_options=FFMPEG_BEFORE_OPTIONS,
+            before_options=before_options,
             options=FFMPEG_OPTIONS,
         )
     except Exception as e:
@@ -191,7 +198,7 @@ def make_ffmpeg_audio_source(audio_path: str, executable: str) -> "discord.FFmpe
         return discord.FFmpegPCMAudio(
             audio_path,
             executable=executable,
-            before_options=FFMPEG_BEFORE_OPTIONS,
+            before_options=before_options,
             options=FFMPEG_OPTIONS_FALLBACK,
         )
 
