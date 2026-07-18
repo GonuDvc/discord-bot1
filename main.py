@@ -10,6 +10,7 @@ import json
 import math
 import random
 import asyncio
+import contextvars
 import urllib.request
 import urllib.parse
 import base64
@@ -6227,6 +6228,14 @@ def _try_extract_query_from_leaked_prefix(raw_content: str) -> Optional[dict]:
 # JSON漏れ検知にも引っかからないため、これまでの不具合とは異なりコード側で検知できなかった）。
 # そのため、質問文に時事・最新情報を示すキーワードが含まれる場合は、モデルの判断に任せず
 # tool_choice="required" にして、1回目のラウンドで必ずweb_searchツールを呼ばせるようにする。
+# 今回の /ai 応答生成の中で、実際にWeb検索（_web_search_fallback）が実行されたかどうかを
+# 追跡するためのContextVar。asyncioのタスクごとに独立した値を持てるため、複数サーバーで
+# 同時に /ai が実行されてもお互いに干渉しない。
+# 「Groq/Cerebrasどちらの経路でも検索した場合はTrueにする」ことで、応答末尾に付ける
+# 「今回は検索できていません」という注記が、実際の挙動と食い違わないようにする。
+_search_performed_var: contextvars.ContextVar = contextvars.ContextVar("_search_performed_var", default=False)
+
+
 _SEARCH_FORCE_KEYWORDS = (
     "最新", "今日", "本日", "今週", "今年", "現在", "速報", "ニュース", "news",
     "昨日", "先週", "先月", "今月", "直近", "アップデート", "リリース", "発表",
@@ -6351,6 +6360,8 @@ async def _ai_chat_call_groq_with_search(
 
         tool_calls = message_obj.get("tool_calls")
         if not tool_calls:
+            if round_idx == 0 and _force_search_first_round:
+                print("[Web検索] tool_choice=requiredにも関わらず、Groqモデルがweb_searchツールを呼び出しませんでした。")
             raw_content = message_obj.get("content") or ""
 
             # ケース(B): 先頭にJSON形式のツール呼び出し（＋[No output]等のノイズ）が付着し、
@@ -6378,6 +6389,7 @@ async def _ai_chat_call_groq_with_search(
                 print(f"[AIチャット/Web検索] 本文へのJSON漏れ（捏造の疑いがある回答含む）を検知し、破棄して再検索します。クエリ: {query!r}")
                 if query:
                     search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
                 # ネイティブのtool_calls経路と揃え、アシスタント発言＋検索結果を履歴に積んで
@@ -6423,6 +6435,7 @@ async def _ai_chat_call_groq_with_search(
                 if query:
                     print(f"[AIチャット/Web検索] クエリ: {query}")
                     search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
             else:
@@ -6577,6 +6590,158 @@ async def _ai_chat_call_cerebras(messages: list, model: Optional[str] = None) ->
         reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
 
     return reply_text
+
+
+async def _ai_chat_call_cerebras_with_search(
+    messages: list,
+    model: Optional[str] = None,
+    guild_config: Optional[dict] = None
+) -> str:
+    """
+    Web検索（Tool Use）に対応したCerebras呼び出し。_ai_chat_call_groq_with_search と
+    ほぼ同じロジックです（CerebrasのChat Completions APIもOpenAI互換のtools形式に対応しているため）。
+
+    Groqの主モデルが本日の利用上限（TPD/RPD）に達し、Cerebrasへフォールバックした場合でも
+    検索機能そのものは引き続き使えるようにするために追加した（従来はCerebrasへの切り替え時点で
+    検索非対応になり、「検索できません」という断り文だけが返っていた）。
+
+    どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出し（_ai_chat_call_cerebras）に
+    そのままフォールバックします。
+    """
+    if not WEB_SEARCH_AVAILABLE:
+        return await _ai_chat_call_cerebras(messages, model=model)
+
+    if not CEREBRAS_API_KEY:
+        raise RuntimeError("CEREBRAS_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    working_messages = list(messages)  # 呼び出し元のリストは書き換えない
+    max_search_rounds = 2
+
+    _force_search_first_round = _query_likely_needs_search(_extract_latest_user_text(working_messages))
+
+    for round_idx in range(max_search_rounds + 1):
+        payload = {
+            "model": model or CEREBRAS_MODEL,
+            "messages": working_messages,
+            "temperature": 0.7,
+            "max_tokens": CEREBRAS_MAX_TOKENS,
+        }
+        if round_idx < max_search_rounds:
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            if round_idx == 0 and _force_search_first_round:
+                payload["tool_choice"] = "required"
+                print(f"[Web検索/Cerebras] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
+            else:
+                payload["tool_choice"] = "auto"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    err_text = await resp.text()
+                    retry_after: Optional[float] = None
+                    header_val = resp.headers.get("Retry-After")
+                    if header_val:
+                        try:
+                            retry_after = float(header_val)
+                        except ValueError:
+                            retry_after = None
+                    if retry_after is None:
+                        retry_after = _parse_groq_retry_after(err_text)
+                    raise CerebrasRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    if resp.status == 404 and "model" in err_text.lower():
+                        raise CerebrasAPIError(
+                            f"Cerebras APIエラー（HTTP 404）: 指定されたモデル「{model or CEREBRAS_MODEL}」が見つかりません。"
+                            f"詳細: {err_text[:200]}"
+                        )
+                    raise CerebrasAPIError(f"Cerebras APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+
+        try:
+            choice = data["choices"][0]
+            message_obj = choice["message"]
+        except (KeyError, IndexError, TypeError):
+            raise CerebrasAPIError(f"Cerebras APIの応答形式が想定と異なります: {data}")
+
+        tool_calls = message_obj.get("tool_calls")
+        if not tool_calls:
+            if round_idx == 0 and _force_search_first_round:
+                print("[Web検索/Cerebras] tool_choice=requiredにも関わらず、Cerebrasモデルがweb_searchツールを呼び出しませんでした（Cerebras側がrequired未対応の可能性があります）。")
+            raw_content = message_obj.get("content") or ""
+
+            has_leaked_prefix = _strip_leaked_tool_call_prefix(raw_content) != raw_content
+            leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is None and has_leaked_prefix:
+                leaked_call = _try_extract_query_from_leaked_prefix(raw_content)
+
+            if leaked_call is not None and round_idx < max_search_rounds:
+                query = str(leaked_call.get("query", "")).strip()
+                print(f"[AIチャット/Web検索/Cerebras] 本文へのJSON漏れを検知し、破棄して再検索します。クエリ: {query!r}")
+                if query:
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+                working_messages.append({
+                    "role": "assistant",
+                    "content": "（内部処理: Web検索を実行しました）"
+                })
+                working_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"（システム）先ほどの応答は無効になりました。改めて実際の検索結果を渡します:\n"
+                        f"{search_result_text}\n\n"
+                        "上記の実際の検索結果のみを根拠に、通常の文章で回答してください。"
+                        "JSON形式では出力せず、検索結果に無い情報を付け加えないでください。"
+                    )
+                })
+                continue
+
+            if leaked_call is not None or has_leaked_prefix:
+                return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
+            reply_text = _sanitize_ai_reply_content(raw_content)
+            if choice.get("finish_reason") == "length":
+                reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+            return reply_text
+
+        working_messages.append(message_obj)
+        for tool_call in tool_calls:
+            func = tool_call.get("function", {})
+            func_name = func.get("name", "")
+            try:
+                func_args = json.loads(func.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                func_args = {}
+
+            if func_name == "web_search":
+                query = str(func_args.get("query", "")).strip()
+                if query:
+                    print(f"[AIチャット/Web検索/Cerebras] クエリ: {query}")
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            else:
+                search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
+
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": search_result_text
+            })
+
+    return "（検索処理が複雑すぎたため、応答を生成できませんでした。質問を変えて再度お試しください。）"
 
 
 # ====================================================================
@@ -6761,12 +6926,11 @@ async def _ai_call_llm_with_fallback(
             if not is_daily_limit:
                 raise  # TPM等の短期レート制限はプロバイダを跨がず即座に通知する
             if idx == 0 and effective_enable_search:
-                # 検索対応の主モデルが日次上限に達し、以降は検索非対応のフォールバック
-                # モデル（またはCerebras/Mistral）に切り替わる＝この応答では検索が使われない。
-                # 「検索が動かない」という不具合報告の原因になりやすいため、必ずログに残す。
+                # 検索対応の主モデルが日次上限に達し、以降はGroqの検索非対応フォールバックモデル
+                # （設定されていれば）、それも尽きればCerebras（検索対応版）に切り替わる。
                 print(
                     f"[Web検索] 主モデル（{candidate}）が本日の利用上限（{e.limit_scope}）に達したため、"
-                    "検索非対応のフォールバックモデルに切り替えます。今回の応答では検索は実行されません。"
+                    "別プロバイダにフォールバックします（Cerebrasが設定済みなら検索は引き続き利用可能です）。"
                 )
             if not is_last_candidate:
                 continue  # 次のGroqフォールバックモデルを試す
@@ -6779,7 +6943,10 @@ async def _ai_call_llm_with_fallback(
 
     if CEREBRAS_API_KEY:
         try:
-            reply_text = await _ai_chat_call_cerebras(messages)
+            if effective_enable_search:
+                reply_text = await _ai_chat_call_cerebras_with_search(messages, guild_config=guild_config)
+            else:
+                reply_text = await _ai_chat_call_cerebras(messages)
             return reply_text, "cerebras"
         except Exception as e:
             print(f"[AIフォールバック] Cerebrasへの切り替えにも失敗しました: {e}")
@@ -7560,6 +7727,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
 
     try:
         async with message.channel.typing():
+            _search_performed_var.set(False)  # 今回の応答生成における検索実行有無を再集計する
             if image_url is not None:
                 # 画像添付時はVision対応モデル固定（Cerebrasへのフォールバックは行わない）
                 reply_text = await _ai_chat_call_groq(messages, model=GROQ_VISION_MODEL)
@@ -7616,7 +7784,7 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     # あわせて、Web検索が有効なサーバーであれば「今回は検索が使えていない」旨も伝える
     # （検索できないまま学習データだけで回答している事実をユーザーが把握できるようにするため）。
     primary_model = model or GROQ_MODEL
-    search_note = "" if not WEB_SEARCH_AVAILABLE else "（今回はWeb検索は利用できていません）"
+    search_note = "" if (not WEB_SEARCH_AVAILABLE or _search_performed_var.get()) else "（今回はWeb検索は利用できていません）"
     if used_provider in ("cerebras", "mistral"):
         reply_text += f"\n\n*（本日の利用上限のため、一時的に別方式で応答しました{search_note}）*"
     elif used_model and used_model != primary_model:
