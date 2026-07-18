@@ -5647,8 +5647,10 @@ _GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE = (
     "あなたはDiscord Bot向けのオリジナルキャラクター設定を考案するクリエイターです。"
     "以下の条件を満たす、既存の作品・実在の人物・著作物に依拠しない完全オリジナルの"
     "キャラクター設定を1つ考案してください。\n"
-    "{flavor_instruction}\n\n"
-    "必ず次のJSON形式のみで出力してください。説明文やコードブロックは不要です。\n"
+    "{flavor_instruction}\n"
+    "{theme_instruction}\n"
+    "{avoid_instruction}"
+    "\n必ず次のJSON形式のみで出力してください。説明文やコードブロックは不要です。\n"
     '{{"name": "キャラクター名(日本語、10文字以内)", '
     '"first_person": "一人称(例: 私、僕、俺、わし 等、5文字以内)", '
     '"personality": "性格の説明(日本語、40文字以内)", '
@@ -5657,12 +5659,62 @@ _GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE = (
     '"flavor_text": "このキャラクターの一言紹介文(日本語、50文字以内)"}}'
 )
 
+# 生成のたびにランダムで1つ選び、プロンプトに埋め込む「題材ヒント」。
+# 同じ入力プロンプトだと似た/同じキャラが繰り返し出やすいLLMの性質への対策として、
+# 呼び出しごとに異なる方向性を明示的に与え、生成結果にばらつきを持たせる。
+GACHA_THEME_HINTS = [
+    "動物や生き物をモチーフにしたキャラクター",
+    "職業（仕事）をモチーフにしたキャラクター",
+    "季節や天候をモチーフにしたキャラクター",
+    "食べ物や飲み物をモチーフにしたキャラクター",
+    "宇宙・星・天体をモチーフにしたキャラクター",
+    "神話・伝説の生き物をモチーフにしたキャラクター（実在の特定の神格名は避け、雰囲気のみ借用）",
+    "機械・ロボット・AIをモチーフにしたキャラクター",
+    "植物・花をモチーフにしたキャラクター",
+    "楽器や音楽をモチーフにしたキャラクター",
+    "スポーツをモチーフにしたキャラクター",
+    "古風で和風な雰囲気のキャラクター",
+    "近未来的でサイバーな雰囲気のキャラクター",
+    "ゆるくてマイペースな日常系キャラクター",
+    "無口だが芯の強いキャラクター",
+    "やたら大げさでドラマチックな話し方をするキャラクター",
+    "妙に博識で講釈好きなキャラクター",
+    "何をするにも全力すぎるキャラクター",
+    "面倒くさがりだが実は優しいキャラクター",
+    "小動物系で人懐っこいキャラクター",
+    "クールで無感情に見えて実は情熱的なキャラクター",
+]
 
-async def _gacha_generate_persona(guild_id: Optional[int] = None) -> Optional[dict]:
-    """レアリティを抽選し、AIにキャラクター設定を生成させます。失敗時はNoneを返します。"""
+
+async def _gacha_generate_persona(
+    guild_id: Optional[int] = None,
+    avoid_names: Optional[list] = None,
+) -> Optional[dict]:
+    """
+    レアリティを抽選し、AIにキャラクター設定を生成させます。失敗時はNoneを返します。
+    avoid_names: そのユーザーが既に持っている名前のリスト。指定すると、これらと
+    被らない名前にするようAIへ明示的に指示し、生成結果の重複を防ぎます。
+    """
+    import random
+
     rarity_name, flavor_instruction = _gacha_roll_rarity()
+    theme = random.choice(GACHA_THEME_HINTS)
+    theme_instruction = f"今回の題材の方向性: {theme}。この方向性を踏まえて考案してください。"
 
-    prompt = _GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE.format(flavor_instruction=flavor_instruction)
+    avoid_instruction = ""
+    if avoid_names:
+        # プロンプト肥大化を避けるため直近分のみに絞る
+        sample = avoid_names[-15:]
+        avoid_instruction = (
+            "すでに存在する次の名前とは異なる、新しい名前を考えてください: "
+            + "、".join(sample) + "\n"
+        )
+
+    prompt = _GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE.format(
+        flavor_instruction=flavor_instruction,
+        theme_instruction=theme_instruction,
+        avoid_instruction=avoid_instruction,
+    )
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": "オリジナルキャラクターを1体生成してください。"},
@@ -13348,9 +13400,24 @@ async def gacha_draw(interaction: discord.Interaction):
 
     await interaction.response.defer(thinking=True)
 
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    existing_names = [p.get("name", "") for p in user_app_data.get("gacha_personas", []) if p.get("name")]
+
     persona = await _gacha_generate_persona(
-        guild_id=interaction.guild.id if interaction.guild is not None else None
+        guild_id=interaction.guild.id if interaction.guild is not None else None,
+        avoid_names=existing_names,
     )
+    # 既存の所持ペルソナと名前が完全一致した場合、1回だけ再生成を試みる
+    # （プロンプトに avoid_names を渡してもLLMが無視することがあるための保険）
+    if persona is not None and persona["name"] in existing_names:
+        retry_persona = await _gacha_generate_persona(
+            guild_id=interaction.guild.id if interaction.guild is not None else None,
+            avoid_names=existing_names,
+        )
+        if retry_persona is not None:
+            persona = retry_persona
+
     if persona is None:
         await interaction.followup.send(
             "ガチャの生成に失敗しました（AIの応答取得に失敗）。コインは消費されていません。もう一度お試しください。"
