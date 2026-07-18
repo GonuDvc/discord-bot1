@@ -639,11 +639,13 @@ def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
             "bookmarks": [],
             "gacha_personas": [],       # AI人格ガチャで排出したペルソナのリスト
             "gacha_active_persona_id": None,  # /ai で現在適用中のガチャペルソナID（Noneなら無効）
+            "gacha_last_draw_at": None,  # 最後にガチャを引いたUNIXタイムスタンプ（週1回制限用）
         }
     else:
         # 既存データへの互換性のためキーが無ければ追加
         all_data["user_apps"][user_id_str].setdefault("gacha_personas", [])
         all_data["user_apps"][user_id_str].setdefault("gacha_active_persona_id", None)
+        all_data["user_apps"][user_id_str].setdefault("gacha_last_draw_at", None)
     return all_data["user_apps"][user_id_str]
 
 
@@ -653,13 +655,30 @@ def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
 
 GACHA_COST = 100  # 1回あたりの消費Mコイン
 GACHA_MAX_PERSONAS_PER_USER = 30  # 1ユーザーが保持できるペルソナの上限（超えたら最古のものを破棄）
+GACHA_COOLDOWN_SECONDS = 7 * 24 * 60 * 60  # ガチャは1週間に1回まで
+
+
+def _gacha_format_remaining(seconds: float) -> str:
+    """クールダウン残り秒数を「〇日〇時間〇分」形式の文字列に整形します。"""
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}日")
+    if hours:
+        parts.append(f"{hours}時間")
+    if minutes or not parts:
+        parts.append(f"{minutes}分")
+    return "".join(parts)
 
 # レアリティ: (表示名, 排出率%, 個性の強さの指示文)
 GACHA_RARITIES = [
-    ("N", 60, "ごく普通で親しみやすい、ありふれた個性にしてください。"),
-    ("R", 27, "少し個性的で分かりやすい特徴を1つ持たせてください。"),
-    ("SR", 10, "かなり尖った個性・強い口調や独特な世界観を持たせてください。"),
-    ("SSR", 3, "非常に独特で強烈な、一度見たら忘れられないレベルの個性にしてください。"),
+    ("N", 80, "ごく普通で親しみやすい、ありふれた個性にしてください。"),
+    ("R", 17, "少し個性的で分かりやすい特徴を1つ持たせてください。"),
+    ("SR", 2.5, "かなり尖った個性・強い口調や独特な世界観を持たせてください。"),
+    ("SSR", 0.5, "非常に独特で強烈な、一度見たら忘れられないレベルの個性にしてください。"),
 ]
 
 GACHA_RARITY_COLORS = {
@@ -13388,6 +13407,22 @@ async def gacha_draw(interaction: discord.Interaction):
         return
 
     all_data = load_data()
+
+    # --- 週1回制限のチェック ---
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    last_draw_at = user_app_data.get("gacha_last_draw_at")
+    now_ts = time.time()
+    if last_draw_at is not None:
+        elapsed = now_ts - last_draw_at
+        if elapsed < GACHA_COOLDOWN_SECONDS:
+            remaining = GACHA_COOLDOWN_SECONDS - elapsed
+            next_available = int(last_draw_at + GACHA_COOLDOWN_SECONDS)
+            await interaction.response.send_message(
+                f"ガチャは1週間に1回までです。次に引けるのは <t:{next_available}:F>（あと約{_gacha_format_remaining(remaining)}）です。",
+                ephemeral=True
+            )
+            return
+
     wallet = get_global_balance(all_data, interaction.user.id)
     if wallet < GACHA_COST:
         coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
@@ -13440,6 +13475,7 @@ async def gacha_draw(interaction: discord.Interaction):
     persona_list.append(persona)
     if len(persona_list) > GACHA_MAX_PERSONAS_PER_USER:
         del persona_list[: len(persona_list) - GACHA_MAX_PERSONAS_PER_USER]
+    user_app_data["gacha_last_draw_at"] = time.time()  # 週1回制限用に最終抽選日時を記録
 
     save_data(all_data)
 
@@ -13579,6 +13615,7 @@ async def gacha_rates(interaction: discord.Interaction):
     )
     embed.add_field(name="1回あたりの消費", value=f"{GACHA_COST:,} {coin_name}", inline=True)
     embed.add_field(name="所持上限", value=f"{GACHA_MAX_PERSONAS_PER_USER}体（超えると古いものから破棄）", inline=True)
+    embed.add_field(name="抽選間隔", value="1週間に1回まで", inline=True)
     embed.set_footer(text="レアリティが高いほど、AIが生成する個性がより強く・独特になります")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
