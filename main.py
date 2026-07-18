@@ -924,6 +924,8 @@ ai_debate_group = app_commands.Group(name="ai_debate", description="【オーナ
 ai_debate_random_group = app_commands.Group(name="random", description="お題・人格をAIにランダム生成させて開始します", parent=ai_debate_group)
 profile_group = app_commands.Group(name="profile", description="Mコイン残高や招待実績などをまとめたプロフィールカード画像の表示・カスタマイズ")
 profile_background_group = app_commands.Group(name="background", description="プロフィールカードの背景画像を自分でアップロードして差し替えます", parent=profile_group)
+profile_card_color_group = app_commands.Group(name="card_color", description="プロフィールカードのアクセントカラー（枠・アイコン色）を変更します", parent=profile_group)
+profile_badge_group = app_commands.Group(name="badge", description="プロフィールカードに表示するバッジの管理", parent=profile_group)
 
 
 bot.tree.add_command(owner_trust_group)
@@ -1038,6 +1040,14 @@ def get_global_config(all_data: dict) -> dict:
     # プロフィールカードの背景画像（全サーバー共通。ユーザーが /profile background set でアップロード）
     if "profile_backgrounds" not in cfg:
         cfg["profile_backgrounds"] = {}  # {user_id_str: 画像URL}
+    # プロフィールカードのアクセントカラー（全サーバー共通。ユーザーが /profile card_color set で設定）
+    if "profile_card_colors" not in cfg:
+        cfg["profile_card_colors"] = {}  # {user_id_str: [r, g, b]}
+    # バッジ定義（オーナーが /profile badge create で作成）とユーザーへの付与記録
+    if "badge_defs" not in cfg:
+        cfg["badge_defs"] = {}  # {badge_id_str: {"name": str, "color": [r,g,b], "symbol": str, "created_at": iso_str}}
+    if "user_badges" not in cfg:
+        cfg["user_badges"] = {}  # {user_id_str: [badge_id_str, ...]}
     # サーバーブラックリスト（全サーバー共通）
     if "global_server_blacklist_ids" not in cfg:
         cfg["global_server_blacklist_ids"] = []  # [server_id_int, ...]
@@ -9464,6 +9474,58 @@ def _profile_card_sanitize_text(font, text: str) -> str:
     return "".join(ch for ch in normalized if _profile_card_glyph_supported(font, ch))
 
 
+def _badge_generate_image(font_path: str, name: str, symbol: str, color: tuple, size: int = 96) -> "Image.Image":
+    """
+    バッジのデザインをその場で自動生成します（PIL製、外部素材不要）。
+    円形グラデーション＋縁取り＋中央に記号（絵文字1文字 or バッジ名の頭文字）を描画したRGBA画像を返します。
+    プロフィールカード合成用に呼び出し側でリサイズして使うことを想定し、少し大きめ(96px)で生成します。
+    """
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    r, g, b = color
+    # 中心を明るく、外周を暗くした放射状グラデーションで立体感を出す
+    light = (min(255, r + 60), min(255, g + 60), min(255, b + 60))
+    dark = (max(0, r - 40), max(0, g - 40), max(0, b - 40))
+    cx, cy = size / 2, size / 2
+    max_r = size / 2
+    for radius in range(int(max_r), 0, -1):
+        t = radius / max_r
+        rr = int(dark[0] + (light[0] - dark[0]) * (1 - t))
+        gg = int(dark[1] + (light[1] - dark[1]) * (1 - t))
+        bb = int(dark[2] + (light[2] - dark[2]) * (1 - t))
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(rr, gg, bb, 255))
+
+    # 光沢のハイライト（左上に薄い白丸）
+    highlight = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(highlight)
+    hd.ellipse((size * 0.18, size * 0.12, size * 0.55, size * 0.42), fill=(255, 255, 255, 70))
+    highlight = highlight.filter(ImageFilter.GaussianBlur(6))
+    img = Image.alpha_composite(img, highlight)
+    draw = ImageDraw.Draw(img)
+
+    # 外周の縁取り
+    draw.ellipse((2, 2, size - 2, size - 2), outline=(255, 255, 255, 200), width=3)
+
+    # 中央のシンボル文字（絵文字等でフォント未対応なら、バッジ名の先頭1文字にフォールバック）
+    symbol_font = _profile_card_load_font(font_path, int(size * 0.46), "Bold")
+    display_symbol = symbol.strip() if symbol else ""
+    if not display_symbol or not _profile_card_glyph_supported(symbol_font, display_symbol[0]):
+        fallback = _profile_card_sanitize_text(symbol_font, name.strip()) if name else ""
+        display_symbol = fallback[0] if fallback else "★"
+    else:
+        display_symbol = display_symbol[0]
+
+    bbox = draw.textbbox((0, 0), display_symbol, font=symbol_font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(
+        (cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]),
+        display_symbol, font=symbol_font, fill=(255, 255, 255, 255)
+    )
+
+    return img
+
+
 def _profile_card_make_circle_avatar(img: "Image.Image", size: int, border_color, border_width: int) -> "Image.Image":
     img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
     mask = Image.new("L", (size, size), 0)
@@ -9531,6 +9593,7 @@ def _build_profile_card_image(
     stats: list,  # [(ラベル, 値), ...]
     accent_color=(88, 101, 242),
     background_bytes: Optional[bytes] = None,
+    badges: Optional[list] = None,  # [{"name": str, "symbol": str, "color": (r,g,b)}, ...] 表示順
 ) -> bytes:
     """
     プロフィールカードをPNG画像として描画し、そのバイナリを返します。
@@ -9616,6 +9679,26 @@ def _build_profile_card_image(
     draw.text((text_x, 55), display_name, font=name_font, fill=(255, 255, 255, 255))
     draw.text((text_x, 115), tagline, font=tagline_font, fill=(190, 190, 205, 255))
 
+    # バッジ（名前の右側に小さく並べる。最大5個まで、はみ出す場合は省略）
+    if badges:
+        badge_render_size = 36
+        badge_gap = 8
+        name_width = draw.textlength(display_name, font=name_font)
+        badge_x = text_x + name_width + 16
+        badge_y = 55 + (name_font.size - badge_render_size) // 2 + 4
+        max_badge_right = W - 50
+        for b in badges[:5]:
+            if badge_x + badge_render_size > max_badge_right:
+                break
+            try:
+                badge_img = _badge_generate_image(font_path, b.get("name", ""), b.get("symbol", ""), tuple(b.get("color", (200, 170, 60))), size=96)
+                badge_img = badge_img.resize((badge_render_size, badge_render_size), Image.LANCZOS)
+                card.paste(badge_img, (int(badge_x), int(badge_y)), badge_img)
+            except Exception as e:
+                print(f"[プロフィールカード] バッジ描画に失敗: {e}")
+            badge_x += badge_render_size + badge_gap
+        draw = ImageDraw.Draw(card)
+
     # 区切り線・ステータスチップ（絵文字はフォントが対応していないため、簡易的なベクターアイコンを自前で描画する）
     # 注意: ImageDraw.line/rounded_rectangle等にRGBAの半透明色(alpha<255)を指定しても、
     # Pillowは下地とのアルファ合成を行わずピクセル値をそのまま上書きしてしまう。
@@ -9647,6 +9730,99 @@ def _build_profile_card_image(
         draw.text((icon_x + icon_size + 8, icon_y + 2), label, font=chip_font_label, fill=(200, 200, 215, 255))
         value_text = _profile_card_sanitize_text(chip_font_value, str(value))
         draw.text((cx + 18, chip_y + 55), value_text, font=chip_font_value, fill=(255, 255, 255, 255))
+
+    buf = io.BytesIO()
+    card.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _build_profile_compare_image(
+    font_path: str,
+    left_avatar_bytes: bytes,
+    right_avatar_bytes: bytes,
+    left_name: str,
+    right_name: str,
+    left_accent: tuple,
+    right_accent: tuple,
+    rows: list,  # [(icon_type, label, left_value_str, right_value_str, left_wins: Optional[bool]), ...]
+) -> bytes:
+    """
+    2人分のステータスを左右に並べた比較カードをPNG画像として描画します。
+    left_wins: True=左が優位（左を強調）/ False=右が優位（右を強調）/ None=比較不能・引き分け（強調なし）。
+    CPUバウンドな同期処理のため、呼び出し側は asyncio.to_thread で呼び出してください。
+    """
+    W = 1000
+    row_h = 64
+    header_h = 150
+    H = header_h + row_h * len(rows) + 40
+
+    bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    bg_draw = ImageDraw.Draw(bg)
+    top, bottom = (26, 20, 46), (12, 10, 20)
+    for y in range(H):
+        t = y / H
+        r = int(top[0] + (bottom[0] - top[0]) * t)
+        g = int(top[1] + (bottom[1] - top[1]) * t)
+        b = int(top[2] + (bottom[2] - top[2]) * t)
+        bg_draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W, H), radius=28, fill=255)
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    card.paste(bg, (0, 0), mask)
+    draw = ImageDraw.Draw(card)
+
+    # 左右のアバター（見出し部分）
+    avatar_size = 96
+    left_avatar = _profile_card_make_circle_avatar(Image.open(io.BytesIO(left_avatar_bytes)), avatar_size, (*left_accent, 255), 4)
+    right_avatar = _profile_card_make_circle_avatar(Image.open(io.BytesIO(right_avatar_bytes)), avatar_size, (*right_accent, 255), 4)
+    card.paste(left_avatar, (50, 30), left_avatar)
+    card.paste(right_avatar, (W - 50 - avatar_size, 30), right_avatar)
+
+    name_font = _profile_card_load_font(font_path, 30, "Bold")
+    vs_font = _profile_card_load_font(font_path, 34, "Bold")
+
+    left_name_disp = _profile_card_sanitize_text(name_font, left_name) or "?"
+    right_name_disp = _profile_card_sanitize_text(name_font, right_name) or "?"
+    draw.text((50 + avatar_size + 15, 60), left_name_disp, font=name_font, fill=(255, 255, 255, 255))
+    right_name_w = draw.textlength(right_name_disp, font=name_font)
+    draw.text((W - 50 - avatar_size - 15 - right_name_w, 60), right_name_disp, font=name_font, fill=(255, 255, 255, 255))
+
+    vs_w = draw.textlength("VS", font=vs_font)
+    draw.text(((W - vs_w) / 2, 45), "VS", font=vs_font, fill=(255, 210, 80, 255))
+
+    draw.line((50, header_h - 10, W - 50, header_h - 10), fill=(255, 255, 255, 40), width=2)
+
+    label_font = _profile_card_load_font(font_path, 22, "Medium")
+    value_font = _profile_card_load_font(font_path, 26, "Bold")
+    icon_size = 24
+
+    y = header_h + 10
+    for icon_type, label, left_val, right_val, left_wins in rows:
+        row_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        rd = ImageDraw.Draw(row_layer)
+        if left_wins is True:
+            rd.rounded_rectangle((50, y, W / 2 - 10, y + row_h - 10), radius=14, fill=(*left_accent, 40))
+        elif left_wins is False:
+            rd.rounded_rectangle((W / 2 + 10, y, W - 50, y + row_h - 10), radius=14, fill=(*right_accent, 40))
+        card = Image.alpha_composite(card, row_layer)
+        draw = ImageDraw.Draw(card)
+
+        label_disp = _profile_card_sanitize_text(label_font, label)
+        label_w = draw.textlength(label_disp, font=label_font)
+        _profile_card_draw_icon(draw, icon_type, int(W / 2 - label_w / 2 - icon_size - 8), int(y + (row_h - 10) / 2 - icon_size / 2), icon_size, (200, 200, 215))
+        draw.text((W / 2 - label_w / 2, y + (row_h - 10) / 2 - 12), label_disp, font=label_font, fill=(190, 190, 205, 255))
+
+        left_val_disp = _profile_card_sanitize_text(value_font, str(left_val))
+        left_color = (*left_accent, 255) if left_wins is True else (220, 220, 230, 255)
+        draw.text((70, y + (row_h - 10) / 2 - 15), left_val_disp, font=value_font, fill=left_color)
+
+        right_val_disp = _profile_card_sanitize_text(value_font, str(right_val))
+        right_val_w = draw.textlength(right_val_disp, font=value_font)
+        right_color = (*right_accent, 255) if left_wins is False else (220, 220, 230, 255)
+        draw.text((W - 70 - right_val_w, y + (row_h - 10) / 2 - 15), right_val_disp, font=value_font, fill=right_color)
+
+        y += row_h
 
     buf = io.BytesIO()
     card.convert("RGB").save(buf, format="PNG")
@@ -9770,10 +9946,23 @@ async def profile_command(
         if title_name:
             tagline = f"「{title_name}」 {tagline}"
 
+    # ユーザーが /profile card_color set で設定したアクセントカラーがあれば使用（未設定なら既定色）
+    saved_color = global_cfg.get("profile_card_colors", {}).get(str(target.id))
+    accent_color = tuple(saved_color) if saved_color else (88, 101, 242)
+
+    # 付与済みバッジ（オーナーが /profile badge give で付与したもの）を新しい順で並べる
+    badge_defs = global_cfg.get("badge_defs", {})
+    user_badge_ids = global_cfg.get("user_badges", {}).get(str(target.id), [])
+    badges = []
+    for bid in reversed(user_badge_ids):
+        b = badge_defs.get(bid)
+        if b:
+            badges.append({"name": b.get("name", ""), "symbol": b.get("symbol", ""), "color": tuple(b.get("color", (200, 170, 60)))})
+
     try:
         image_bytes = await asyncio.to_thread(
             _build_profile_card_image, font_path, avatar_bytes, target.display_name, tagline, stats,
-            (88, 101, 242), background_bytes
+            accent_color, background_bytes, badges
         )
     except Exception as e:
         print(f"[/profile view] カード生成エラー: {e}")
@@ -9786,6 +9975,142 @@ async def profile_command(
 
 _PROFILE_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024  # 8MB
 _PROFILE_BACKGROUND_ALLOWED_CONTENT_TYPES = ("image/png", "image/jpeg", "image/webp")
+
+
+async def _profile_get_compare_stats(all_data: dict, interaction: discord.Interaction, user: discord.abc.User) -> dict:
+    """
+    /profile compare 用に、比較可能な生の数値ステータスを辞書で返します。
+    サーバー内実行時のみ招待人数・警告件数・在籍日数を含め、DM実行時はMコイン等のグローバル値のみ返します。
+    """
+    balance = get_global_balance(all_data, user.id)
+    bank = get_global_bank(all_data, user.id)
+    user_app_data = get_user_app_data(all_data, str(user.id))
+    gacha_count = len(user_app_data.get("gacha_personas", []))
+    ssr_count = user_app_data.get("gacha_rarity_history", []).count("SSR")
+
+    result = {
+        "balance": balance,
+        "bank": bank,
+        "gacha_count": gacha_count,
+        "ssr_count": ssr_count,
+        "net_invites": None,
+        "warning_count": None,
+        "days_in_server": None,
+    }
+
+    if interaction.guild:
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        member = interaction.guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user.id)
+            except Exception:
+                member = None
+        if member is not None:
+            invite_info = cfg.get("invite_stats", {}).get(str(user.id), {"joins": 0, "leaves": 0})
+            result["net_invites"] = max(invite_info.get("joins", 0) - invite_info.get("leaves", 0), 0)
+            result["warning_count"] = len(cfg.get("warnings", {}).get(str(user.id), []))
+            if member.joined_at:
+                result["days_in_server"] = (discord.utils.utcnow() - member.joined_at).days
+
+    return result
+
+
+@profile_group.command(name="compare", description="自分と指定したユーザーのステータスを比較するカードを生成します")
+@app_commands.describe(相手="比較したいユーザー")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_compare(interaction: discord.Interaction, 相手: discord.User):
+    if not _PIL_AVAILABLE:
+        await interaction.response.send_message(
+            "プロフィールカード機能に必要なライブラリ（Pillow）がインストールされていません。", ephemeral=True
+        )
+        return
+
+    if 相手.id == interaction.user.id:
+        await interaction.response.send_message("自分自身とは比較できません。", ephemeral=True)
+        return
+    if 相手.bot:
+        await interaction.response.send_message("Botとは比較できません。", ephemeral=True)
+        return
+
+    remaining = _ai_chat_check_cooldown(
+        _PROFILE_COMMAND_GUILD_KEY, interaction.user.id, PROFILE_COMMAND_COOLDOWN_SECONDS
+    )
+    if remaining is not None:
+        await interaction.response.send_message(
+            f"連続利用の間隔が短すぎます。あと{_format_duration(remaining)}待ってください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    _ai_chat_record_request(_PROFILE_COMMAND_GUILD_KEY, interaction.user.id)
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+
+    left_stats = await _profile_get_compare_stats(all_data, interaction, interaction.user)
+    right_stats = await _profile_get_compare_stats(all_data, interaction, 相手)
+
+    def _cmp_row(icon, label, key, suffix=""):
+        lv, rv = left_stats.get(key), right_stats.get(key)
+        if lv is None or rv is None:
+            return (icon, label, "-" if lv is None else f"{lv:,}{suffix}", "-" if rv is None else f"{rv:,}{suffix}", None)
+        wins = True if lv > rv else (False if rv > lv else None)
+        return (icon, label, f"{lv:,}{suffix}", f"{rv:,}{suffix}", wins)
+
+    rows = [
+        _cmp_row("coin", "Mコイン", "balance"),
+        _cmp_row("coin", "銀行残高", "bank"),
+        _cmp_row("invite", "招待人数", "net_invites", "人"),
+        _cmp_row("warning", "警告", "warning_count", "件"),
+        _cmp_row("calendar", "在籍日数", "days_in_server", "日"),
+    ]
+    # ガチャ実績は常にグローバル値なので別立てで追加
+    gacha_lv, gacha_rv = left_stats["gacha_count"], right_stats["gacha_count"]
+    rows.append(("coin", "所持ペルソナ", f"{gacha_lv}体", f"{gacha_rv}体", True if gacha_lv > gacha_rv else (False if gacha_rv > gacha_lv else None)))
+    ssr_lv, ssr_rv = left_stats["ssr_count"], right_stats["ssr_count"]
+    rows.append(("coin", "SSR獲得数", f"{ssr_lv}体", f"{ssr_rv}体", True if ssr_lv > ssr_rv else (False if ssr_rv > ssr_lv else None)))
+
+    try:
+        font_path = await _ensure_profile_card_font()
+    except Exception as e:
+        print(f"[/profile compare] フォント取得エラー: {e}")
+        await interaction.followup.send("プロフィールカード用フォントの取得に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async def _fetch_avatar(u):
+                url = u.display_avatar.replace(size=256).url
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"アバター画像取得エラー（HTTP {resp.status}）")
+                    return await resp.read()
+            left_avatar_bytes = await _fetch_avatar(interaction.user)
+            right_avatar_bytes = await _fetch_avatar(相手)
+    except Exception as e:
+        print(f"[/profile compare] アバター取得エラー: {e}")
+        await interaction.followup.send("アバター画像の取得に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    left_color_saved = global_cfg.get("profile_card_colors", {}).get(str(interaction.user.id))
+    right_color_saved = global_cfg.get("profile_card_colors", {}).get(str(相手.id))
+    left_accent = tuple(left_color_saved) if left_color_saved else (88, 101, 242)
+    right_accent = tuple(right_color_saved) if right_color_saved else (240, 120, 80)
+
+    try:
+        image_bytes = await asyncio.to_thread(
+            _build_profile_compare_image, font_path, left_avatar_bytes, right_avatar_bytes,
+            interaction.user.display_name, 相手.display_name, left_accent, right_accent, rows
+        )
+    except Exception as e:
+        print(f"[/profile compare] カード生成エラー: {e}")
+        await interaction.followup.send("比較カードの生成に失敗しました。時間をおいて再度お試しください。")
+        return
+
+    file_obj = discord.File(io.BytesIO(image_bytes), filename="compare.png")
+    await interaction.followup.send(file=file_obj)
 
 
 @profile_background_group.command(name="set", description="プロフィールカードの背景画像を自分でアップロードした画像に差し替えます")
@@ -9854,6 +10179,281 @@ async def profile_background_reset(interaction: discord.Interaction):
         await interaction.response.send_message("プロフィールカードの背景画像を既定のものに戻しました。", ephemeral=True)
     else:
         await interaction.response.send_message("背景画像は設定されていません（既に既定のものです）。", ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /profile card_color — プロフィールカードのアクセントカラー変更
+# --------------------------------------------------------------------
+
+_HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def _parse_hex_color(value: str) -> Optional[tuple]:
+    """#RRGGBB または RRGGBB 形式の文字列を (r, g, b) タプルに変換します。不正な形式ならNone。"""
+    m = _HEX_COLOR_RE.match(value.strip())
+    if not m:
+        return None
+    hex_str = m.group(1)
+    return tuple(int(hex_str[i:i + 2], 16) for i in (0, 2, 4))
+
+
+@profile_card_color_group.command(name="set", description="プロフィールカードのアクセントカラー（枠・アイコン色）をカラーコードで指定します")
+@app_commands.describe(カラーコード="16進カラーコード（例: #5865F2 や FF6B6B）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_card_color_set(interaction: discord.Interaction, カラーコード: str):
+    color = _parse_hex_color(カラーコード)
+    if color is None:
+        await interaction.response.send_message(
+            "カラーコードの形式が正しくありません。`#5865F2` のような16進形式で指定してください。", ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg.setdefault("profile_card_colors", {})[str(interaction.user.id)] = list(color)
+    save_data(all_data)
+
+    r, g, b = color
+    embed = discord.Embed(
+        title="アクセントカラーを変更しました",
+        description=f"`#{r:02X}{g:02X}{b:02X}` に設定しました。`/profile view` で確認できます。",
+        color=discord.Color.from_rgb(r, g, b)
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@profile_card_color_group.command(name="reset", description="プロフィールカードのアクセントカラーを既定色に戻します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_card_color_reset(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    colors = global_cfg.setdefault("profile_card_colors", {})
+    if str(interaction.user.id) in colors:
+        del colors[str(interaction.user.id)]
+        save_data(all_data)
+        await interaction.response.send_message("アクセントカラーを既定色に戻しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("アクセントカラーは設定されていません（既に既定色です）。", ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /profile badge — バッジ管理（デザインは自動生成、作成・付与はオーナー限定）
+# --------------------------------------------------------------------
+
+@profile_badge_group.command(name="create", description="【オーナー限定】新しいバッジを作成します（デザインは自動生成されます）")
+@app_commands.describe(
+    バッジ名="バッジの名前（例: 初期メンバー）",
+    カラーコード="バッジの色を16進カラーコードで指定（例: #FFD700）",
+    シンボル="バッジ中央に表示する文字（絵文字1文字推奨。省略するとバッジ名の頭文字を使用）"
+)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_badge_create(
+    interaction: discord.Interaction,
+    バッジ名: str,
+    カラーコード: str,
+    シンボル: Optional[str] = None,
+):
+    if not await is_owner_check(interaction):
+        return
+
+    if not _PIL_AVAILABLE:
+        await interaction.response.send_message(
+            "バッジ生成に必要なライブラリ（Pillow）がインストールされていません。", ephemeral=True
+        )
+        return
+
+    バッジ名 = バッジ名.strip()[:20]
+    if not バッジ名:
+        await interaction.response.send_message("バッジ名を入力してください。", ephemeral=True)
+        return
+
+    color = _parse_hex_color(カラーコード)
+    if color is None:
+        await interaction.response.send_message(
+            "カラーコードの形式が正しくありません。`#FFD700` のような16進形式で指定してください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.setdefault("badge_defs", {})
+
+    badge_id = uuid.uuid4().hex[:10]
+    badge_defs[badge_id] = {
+        "name": バッジ名,
+        "color": list(color),
+        "symbol": (シンボル or "").strip()[:4],
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    save_data(all_data)
+
+    # プレビュー画像を即座に生成して見せる
+    try:
+        font_path = await _ensure_profile_card_font()
+        badge_img = await asyncio.to_thread(
+            _badge_generate_image, font_path, バッジ名, シンボル or "", color, 128
+        )
+        buf = io.BytesIO()
+        badge_img.save(buf, format="PNG")
+        buf.seek(0)
+        file_obj = discord.File(buf, filename="badge_preview.png")
+        await interaction.followup.send(
+            f"バッジ「{バッジ名}」を作成しました（ID: `{badge_id}`）。\n"
+            f"`/profile badge give` でユーザーに付与できます。",
+            file=file_obj,
+            ephemeral=True
+        )
+    except Exception as e:
+        print(f"[/profile badge create] プレビュー生成エラー: {e}")
+        await interaction.followup.send(
+            f"バッジ「{バッジ名}」を作成しました（ID: `{badge_id}`）。\n"
+            f"（プレビュー画像の生成には失敗しましたが、バッジ自体は正常に登録されています）",
+            ephemeral=True
+        )
+
+
+@profile_badge_group.command(name="give", description="【オーナー限定】作成済みのバッジをユーザーに付与します")
+@app_commands.describe(ユーザー="バッジを付与するユーザー", バッジ名="付与するバッジの名前（`/profile badge list`で確認できます）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_badge_give(interaction: discord.Interaction, ユーザー: discord.User, バッジ名: str):
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.get("badge_defs", {})
+
+    badge_id = next((bid for bid, b in badge_defs.items() if b.get("name") == バッジ名), None)
+    if badge_id is None:
+        await interaction.response.send_message(
+            "その名前のバッジが見つかりません。`/profile badge list` で確認してください。", ephemeral=True
+        )
+        return
+
+    user_badges = global_cfg.setdefault("user_badges", {})
+    owned = user_badges.setdefault(str(ユーザー.id), [])
+    if badge_id in owned:
+        await interaction.response.send_message(
+            f"{ユーザー.mention} は既にバッジ「{バッジ名}」を所持しています。", ephemeral=True
+        )
+        return
+
+    owned.append(badge_id)
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"{ユーザー.mention} にバッジ「{バッジ名}」を付与しました。`/profile view` で確認できます。", ephemeral=True
+    )
+
+
+@profile_badge_group.command(name="revoke", description="【オーナー限定】ユーザーからバッジを剥奪します")
+@app_commands.describe(ユーザー="バッジを剥奪するユーザー", バッジ名="剥奪するバッジの名前")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_badge_revoke(interaction: discord.Interaction, ユーザー: discord.User, バッジ名: str):
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.get("badge_defs", {})
+
+    badge_id = next((bid for bid, b in badge_defs.items() if b.get("name") == バッジ名), None)
+    if badge_id is None:
+        await interaction.response.send_message(
+            "その名前のバッジが見つかりません。`/profile badge list` で確認してください。", ephemeral=True
+        )
+        return
+
+    user_badges = global_cfg.setdefault("user_badges", {})
+    owned = user_badges.setdefault(str(ユーザー.id), [])
+    if badge_id not in owned:
+        await interaction.response.send_message(
+            f"{ユーザー.mention} はバッジ「{バッジ名}」を所持していません。", ephemeral=True
+        )
+        return
+
+    owned.remove(badge_id)
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"{ユーザー.mention} からバッジ「{バッジ名}」を剥奪しました。", ephemeral=True
+    )
+
+
+@profile_badge_group.command(name="delete", description="【オーナー限定】バッジ自体を削除します（全ユーザーから剥奪されます）")
+@app_commands.describe(バッジ名="削除するバッジの名前")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_badge_delete(interaction: discord.Interaction, バッジ名: str):
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.get("badge_defs", {})
+
+    badge_id = next((bid for bid, b in badge_defs.items() if b.get("name") == バッジ名), None)
+    if badge_id is None:
+        await interaction.response.send_message(
+            "その名前のバッジが見つかりません。`/profile badge list` で確認してください。", ephemeral=True
+        )
+        return
+
+    del badge_defs[badge_id]
+    user_badges = global_cfg.setdefault("user_badges", {})
+    for owned in user_badges.values():
+        if badge_id in owned:
+            owned.remove(badge_id)
+    save_data(all_data)
+    await interaction.response.send_message(f"バッジ「{バッジ名}」を削除しました（全ユーザーから剥奪されました）。", ephemeral=True)
+
+
+@profile_badge_group.command(name="list", description="作成済みのバッジ一覧を確認します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def profile_badge_list(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.get("badge_defs", {})
+
+    if not badge_defs:
+        await interaction.response.send_message("まだバッジが作成されていません。", ephemeral=True)
+        return
+
+    lines = []
+    for b in badge_defs.values():
+        r, g, b_, bl = b.get("color", [200, 170, 60])[0], b.get("color", [200, 170, 60])[1], b.get("color", [200, 170, 60])[2], b
+        symbol = b.get("symbol") or "(頭文字を使用)"
+        lines.append(f"**{b.get('name', '不明')}** — シンボル: {symbol} / カラー: `#{r:02X}{g:02X}{b_:02X}`")
+
+    embed = discord.Embed(
+        title="[profile] 作成済みバッジ一覧",
+        description="\n".join(lines[:25]),
+        color=discord.Color.gold()
+    )
+    if len(badge_defs) > 25:
+        embed.set_footer(text=f"他 {len(badge_defs) - 25} 件（表示は先頭25件まで）")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@profile_badge_give.autocomplete("バッジ名")
+@profile_badge_revoke.autocomplete("バッジ名")
+@profile_badge_delete.autocomplete("バッジ名")
+async def profile_badge_name_autocomplete(interaction: discord.Interaction, current: str):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    badge_defs = global_cfg.get("badge_defs", {})
+    choices = [
+        app_commands.Choice(name=b["name"], value=b["name"])
+        for b in badge_defs.values()
+        if current.lower() in b.get("name", "").lower()
+    ]
+    return choices[:25]
 
 
 # ====================================================================
