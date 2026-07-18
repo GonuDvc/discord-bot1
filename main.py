@@ -7,6 +7,7 @@ import os
 import sys
 import re
 import json
+import uuid
 import math
 import random
 import asyncio
@@ -488,6 +489,10 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("automod_ng_words_enabled", False),
         ("ng_words", []),
         ("automod_ai_enabled", False),  # True: AIによる荒らし・誹謗中傷・遠回しな迷惑発言の自動検知を有効化
+        ("vibe_monitor_enabled", False),  # True: サーバーの空気（緊張度）をAIが定期監視
+        ("vibe_monitor_channel_id", None),  # 緊張度アラートの通知先チャンネルID（未設定なら監視対象チャンネルへ通知）
+        ("vibe_monitor_threshold", 7),  # このスコア(1-10)以上でアラート通知
+        ("vibe_monitor_last_alert_ts", {}),  # チャンネルID(str) -> 最終アラート送信時刻(epoch秒)。クールダウン用
         ("mod_log_channel_id", None),
         ("custom_triggers", []),
         ("custom_commands", {}),
@@ -631,9 +636,72 @@ def get_user_app_data(all_data: dict, user_id_str: str) -> dict:
     if user_id_str not in all_data["user_apps"]:
         all_data["user_apps"][user_id_str] = {
             "memos": [],
-            "bookmarks": []
+            "bookmarks": [],
+            "gacha_personas": [],       # AI人格ガチャで排出したペルソナのリスト
+            "gacha_active_persona_id": None,  # /ai で現在適用中のガチャペルソナID（Noneなら無効）
         }
+    else:
+        # 既存データへの互換性のためキーが無ければ追加
+        all_data["user_apps"][user_id_str].setdefault("gacha_personas", [])
+        all_data["user_apps"][user_id_str].setdefault("gacha_active_persona_id", None)
     return all_data["user_apps"][user_id_str]
+
+
+# ====================================================================
+# AI人格ガチャ（Mコインを消費してAI生成のオリジナル人格を排出する機能）
+# ====================================================================
+
+GACHA_COST = 100  # 1回あたりの消費Mコイン
+GACHA_MAX_PERSONAS_PER_USER = 30  # 1ユーザーが保持できるペルソナの上限（超えたら最古のものを破棄）
+
+# レアリティ: (表示名, 排出率%, 個性の強さの指示文)
+GACHA_RARITIES = [
+    ("N", 60, "ごく普通で親しみやすい、ありふれた個性にしてください。"),
+    ("R", 27, "少し個性的で分かりやすい特徴を1つ持たせてください。"),
+    ("SR", 10, "かなり尖った個性・強い口調や独特な世界観を持たせてください。"),
+    ("SSR", 3, "非常に独特で強烈な、一度見たら忘れられないレベルの個性にしてください。"),
+]
+
+GACHA_RARITY_COLORS = {
+    "N": discord.Color.light_grey(),
+    "R": discord.Color.blue(),
+    "SR": discord.Color.purple(),
+    "SSR": discord.Color.gold(),
+}
+
+
+def _gacha_roll_rarity() -> tuple:
+    """排出率に基づきレアリティを1つ抽選し、(name, flavor_instruction) を返します。"""
+    import random
+    roll = random.uniform(0, 100)
+    cumulative = 0.0
+    for name, rate, flavor in GACHA_RARITIES:
+        cumulative += rate
+        if roll <= cumulative:
+            return name, flavor
+    return GACHA_RARITIES[0][0], GACHA_RARITIES[0][2]  # 保険（丸め誤差対策）
+
+
+def _gacha_persona_to_system_prompt(persona: dict) -> str:
+    """ガチャで生成したペルソナ辞書を、/ai で使うシステムプロンプト文字列に変換します。"""
+    name = persona.get("name", "名無し")
+    first_person = persona.get("first_person", "私")
+    personality = persona.get("personality", "")
+    speech_style = persona.get("speech_style", "")
+    catchphrase = persona.get("catchphrase", "")
+
+    parts = [
+        f"あなたは「{name}」という名前のキャラクターとして振る舞ってください。",
+        f"一人称は「{first_person}」を使ってください。",
+    ]
+    if personality:
+        parts.append(f"性格: {personality}")
+    if speech_style:
+        parts.append(f"話し方の特徴: {speech_style}")
+    if catchphrase:
+        parts.append(f"よく使う口癖・決め台詞: 「{catchphrase}」")
+    parts.append("このキャラクター設定を一貫して維持し、キャラクターを崩さずに応答してください。")
+    return "\n".join(parts)
 
 
 # ====================================================================
@@ -774,6 +842,8 @@ say_group = app_commands.Group(name="say", description="Botに代わりに発言
 embed_group = app_commands.Group(name="embed", description="Embedメッセージの作成・送信")
 my_group = app_commands.Group(name="my", description="サーバー・権限・URLなどの各種スキャン・確認機能")
 ai_chat_group = app_commands.Group(name="ai_chat", description="AIチャット機能の設定・管理")
+vibe_group = app_commands.Group(name="vibe", description="サーバーの空気（緊張度）をAIが監視するモデレーター機能の設定・確認")
+gacha_group = app_commands.Group(name="gacha", description="Mコインを使ってAI生成のオリジナル人格を引くガチャ")
 ai_chat_my_prompt_group = app_commands.Group(name="my_prompt", description="自分専用のAIチャット人格設定（システムプロンプト）を管理します", parent=ai_chat_group)
 ai_chat_summary_group = app_commands.Group(name="weekly_summary", description="【オーナー限定】サーバー活動のAIサマリー機能の管理", parent=ai_chat_group)
 ai_debate_group = app_commands.Group(name="ai_debate", description="【オーナー限定】AI同士（2人格）の自動会話機能の管理")
@@ -807,6 +877,8 @@ bot.tree.add_command(say_group)
 bot.tree.add_command(embed_group)
 bot.tree.add_command(my_group)
 bot.tree.add_command(ai_chat_group)
+bot.tree.add_command(vibe_group)
+bot.tree.add_command(gacha_group)
 bot.tree.add_command(ai_debate_group)
 bot.tree.add_command(profile_group)
 
@@ -4214,6 +4286,12 @@ async def on_ready():
         _ai_automod_loop_task = asyncio.create_task(_ai_automod_loop())
         print("  > AI自動モデレーションループ: 起動しました")
 
+    # Vibeモニター（空気・緊張度監視）のバッチ判定ループを起動（再接続時の重複起動を防止）
+    global _vibe_monitor_loop_task
+    if _vibe_monitor_loop_task is None or _vibe_monitor_loop_task.done():
+        _vibe_monitor_loop_task = asyncio.create_task(_vibe_monitor_loop())
+        print("  > Vibeモニターループ: 起動しました")
+
     # 起動時にスラッシュコマンドを自動同期（コマンド候補欄に表示されない問題の対策）
     try:
         synced = await bot.tree.sync()
@@ -4974,6 +5052,10 @@ async def on_message(message: discord.Message):
             if guild_config.get("automod_ai_enabled", False):
                 _ai_automod_enqueue(message)
 
+            # 2.6 Vibeモニター用バッファへ登録（空気・緊張度の定期監視、判定は別タスク）
+            if guild_config.get("vibe_monitor_enabled", False):
+                _vibe_monitor_enqueue(message)
+
         # 2. 招待リンク・NGワード・IPロガー・画像OCR招待リンク削除（共通ヘルパー呼び出し）
         # 招待リンク・画像OCR招待リンクは _run_automod_checks 内部で個別に対象判定
         # （_is_invite_automod_target）を行うため、ここでは _is_automod_target による
@@ -5535,6 +5617,56 @@ def _ai_extract_json_response(raw: str) -> Optional[dict]:
         return json.loads(cleaned)
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None
+
+
+_GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE = (
+    "あなたはDiscord Bot向けのオリジナルキャラクター設定を考案するクリエイターです。"
+    "以下の条件を満たす、既存の作品・実在の人物・著作物に依拠しない完全オリジナルの"
+    "キャラクター設定を1つ考案してください。\n"
+    "{flavor_instruction}\n\n"
+    "必ず次のJSON形式のみで出力してください。説明文やコードブロックは不要です。\n"
+    '{{"name": "キャラクター名(日本語、10文字以内)", '
+    '"first_person": "一人称(例: 私、僕、俺、わし 等、5文字以内)", '
+    '"personality": "性格の説明(日本語、40文字以内)", '
+    '"speech_style": "話し方の特徴(日本語、40文字以内)", '
+    '"catchphrase": "口癖や決め台詞(日本語、20文字以内)", '
+    '"flavor_text": "このキャラクターの一言紹介文(日本語、50文字以内)"}}'
+)
+
+
+async def _gacha_generate_persona(guild_id: Optional[int] = None) -> Optional[dict]:
+    """レアリティを抽選し、AIにキャラクター設定を生成させます。失敗時はNoneを返します。"""
+    rarity_name, flavor_instruction = _gacha_roll_rarity()
+
+    prompt = _GACHA_PERSONA_SYSTEM_PROMPT_TEMPLATE.format(flavor_instruction=flavor_instruction)
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "オリジナルキャラクターを1体生成してください。"},
+    ]
+
+    try:
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
+    except Exception as e:
+        print(f"[AI人格ガチャ] LLM呼び出しに失敗: {e}")
+        return None
+
+    parsed = _ai_extract_json_response(raw)
+    if not isinstance(parsed, dict):
+        return None
+
+    persona_id = uuid.uuid4().hex[:12]
+    return {
+        "id": persona_id,
+        "rarity": rarity_name,
+        "name": str(parsed.get("name", "名無し")).strip()[:20] or "名無し",
+        "first_person": str(parsed.get("first_person", "私")).strip()[:10] or "私",
+        "personality": str(parsed.get("personality", "")).strip()[:100],
+        "speech_style": str(parsed.get("speech_style", "")).strip()[:100],
+        "catchphrase": str(parsed.get("catchphrase", "")).strip()[:50],
+        "flavor_text": str(parsed.get("flavor_text", "")).strip()[:100],
+        "obtained_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
 
 
 async def _translate_message_text(text: str, secondary_lang: str, guild_id: Optional[int] = None) -> Optional[Tuple[str, str]]:
@@ -8715,6 +8847,22 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
         if provider_override not in ("groq", "cerebras", "mistral", "openrouter", "gemini"):
             provider_override = None
 
+    # AI人格ガチャで引いたペルソナを適用中の場合、システムプロンプトを差し替える
+    # （ユーザーが /my_prompt 等で個別プロンプトを設定していても、ガチャペルソナ適用中は
+    #  そちらを優先する。/gacha use none で解除するまで有効）
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    active_persona_id = user_app_data.get("gacha_active_persona_id")
+    if active_persona_id:
+        persona = next(
+            (p for p in user_app_data.get("gacha_personas", []) if p.get("id") == active_persona_id),
+            None
+        )
+        if persona:
+            system_prompt = _gacha_persona_to_system_prompt(persona)
+        else:
+            # 参照先が見つからない（データ不整合）場合は静かに解除しておく
+            user_app_data["gacha_active_persona_id"] = None
+
     # 履歴キー: DM/グループDM/サーバーいずれもチャンネルID単位（既存の自動応答と同じ仕組みを再利用）
     channel_id = interaction.channel_id
     history = _ai_chat_get_history(channel_id, interaction.user.id)
@@ -10164,6 +10312,173 @@ async def _ai_automod_loop():
         await asyncio.sleep(AI_AUTOMOD_BATCH_INTERVAL_SECONDS)
 
 
+# ====================================================================
+# Vibeモニター（サーバーの空気・緊張度をAIが監視する機能）
+# ====================================================================
+# 既存のAI自動モデレーション（_ai_automod_*）は「1件ずつの発言」が
+# 誹謗中傷・荒らしに該当するかを個別判定し、該当すれば削除・警告する仕組みです。
+# Vibeモニターはそれとは異なり、削除・警告のような介入は一切行わず、
+# 「チャンネル全体の会話の流れ」を定期的にAIへまとめて見せ、
+# 険悪さ・煽り合いの兆候といった空気感を 1〜10 のスコアで評価してもらい、
+# スコアが閾値を超えたときだけ管理者向けに通知するという、
+# 早期警戒・可視化のための補助機能です（自動介入はしません＝誤判定リスクを抑える設計）。
+
+_VIBE_SYSTEM_PROMPT = (
+    "あなたはDiscordサーバーの空気（雰囲気）を分析する観測者です。"
+    "これから1つのチャンネルにおける直近の会話ログ（発言者名: 発言内容 の連続）が提示されます。"
+    "その場の空気がどれくらい険悪・緊迫しているかを 1（穏やか・平常）〜10（激しい喧嘩・大荒れ）の"
+    "整数スコアで評価してください。\n"
+    "評価の際は次の点を考慮してください。\n"
+    "・単なる activeな雑談、ノリの良い冗談、ゲームでの興奮した発言は高スコアにしないでください。\n"
+    "・特定の個人への継続的な攻撃、罵り合いのエスカレーション、複数人が険悪になっている兆候を重視してください。\n"
+    "・判定に迷う場合は低め（穏当な方）に倒してください（過検知を避けるため）。\n\n"
+    "必ず次のJSON形式のみで出力してください。説明文やコードブロックは不要です。\n"
+    '{"score": 1から10の整数, "reason": "日本語で40文字以内の簡潔な理由", "summary": "会話で今何が起きているかの日本語一行要約(30文字以内)"}'
+)
+
+# {channel_id: [{"author": str, "content": str, "ts": epoch}, ...]}
+_vibe_monitor_buffer: dict = {}
+_vibe_monitor_loop_task: Optional[asyncio.Task] = None
+
+VIBE_MONITOR_BUFFER_MAX = 25          # チャンネルあたり最大バッファ件数（超えたら古い順に判定対象へ）
+VIBE_MONITOR_MIN_MESSAGES = 6         # この件数未満では判定を行わない（材料不足のため）
+VIBE_MONITOR_LOOP_INTERVAL_SECONDS = 60  # 何秒おきに各チャンネルのバッファを確認するか
+VIBE_MONITOR_ALERT_COOLDOWN_SECONDS = 600  # 同一チャンネルでの再アラートまでの最短間隔
+
+
+def _vibe_monitor_enqueue(message: discord.Message):
+    """Vibeモニター用に発言をバッファへ積みます（判定は別タスクでバッチ実行）。"""
+    if not message.content or not message.content.strip():
+        return
+
+    channel_id = message.channel.id
+    buf = _vibe_monitor_buffer.setdefault(channel_id, [])
+    buf.append({
+        "author": str(message.author.display_name)[:32],
+        "content": message.content[:300],
+        "ts": time.time(),
+    })
+    if len(buf) > VIBE_MONITOR_BUFFER_MAX:
+        del buf[: len(buf) - VIBE_MONITOR_BUFFER_MAX]
+
+
+async def _vibe_monitor_judge(channel_id: int, guild_id: int) -> Optional[dict]:
+    """バッファ中の会話ログをAIに渡し、緊張度スコアを取得します。失敗時はNoneを返します。"""
+    buf = _vibe_monitor_buffer.get(channel_id) or []
+    if len(buf) < VIBE_MONITOR_MIN_MESSAGES:
+        return None
+
+    log_lines = "\n".join(f"{item['author']}: {item['content']}" for item in buf)
+    messages = [
+        {"role": "system", "content": _VIBE_SYSTEM_PROMPT},
+        {"role": "user", "content": log_lines},
+    ]
+
+    try:
+        provider_override = await _ai_get_provider_override(guild_id)
+        raw, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
+    except Exception as e:
+        print(f"[Vibeモニター] LLM呼び出しに失敗: {e}")
+        return None
+
+    parsed = _ai_extract_json_response(raw)
+    if not isinstance(parsed, dict):
+        return None
+
+    try:
+        score = int(parsed.get("score"))
+    except (TypeError, ValueError):
+        return None
+    score = max(1, min(10, score))
+
+    return {
+        "score": score,
+        "reason": str(parsed.get("reason", "")).strip()[:100] or "詳細不明",
+        "summary": str(parsed.get("summary", "")).strip()[:60],
+    }
+
+
+async def _vibe_monitor_process_all():
+    """全チャンネルのバッファを確認し、vibe_monitor_enabledなサーバーのみ判定・通知します。"""
+    if not _vibe_monitor_buffer:
+        return
+    if not GROQ_API_KEY:
+        return
+
+    all_data = load_data()
+    target_channel_ids = list(_vibe_monitor_buffer.keys())
+    data_dirty = False
+
+    for channel_id in target_channel_ids:
+        channel = bot.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "guild") or channel.guild is None:
+            _vibe_monitor_buffer.pop(channel_id, None)
+            continue
+
+        guild = channel.guild
+        guild_config = get_guild_config(all_data, str(guild.id))
+        if not guild_config.get("vibe_monitor_enabled", False):
+            # 無効化されているサーバーのバッファは溜め続けても無意味なので破棄
+            _vibe_monitor_buffer.pop(channel_id, None)
+            continue
+
+        result = await _vibe_monitor_judge(channel_id, guild.id)
+        # 判定を消費したら（成功/失敗問わず）バッファはクリアし、以降の会話で再蓄積させる
+        _vibe_monitor_buffer.pop(channel_id, None)
+
+        if result is None:
+            continue
+
+        threshold = guild_config.get("vibe_monitor_threshold", 7)
+        if result["score"] < threshold:
+            continue
+
+        # クールダウン確認（チャンネルごと）
+        last_alert_map = guild_config.setdefault("vibe_monitor_last_alert_ts", {})
+        last_ts = last_alert_map.get(str(channel_id), 0)
+        now_ts = time.time()
+        if now_ts - last_ts < VIBE_MONITOR_ALERT_COOLDOWN_SECONDS:
+            continue
+
+        notify_channel_id = guild_config.get("vibe_monitor_channel_id") or channel_id
+        notify_channel = guild.get_channel(notify_channel_id)
+        if notify_channel is None:
+            notify_channel = channel
+
+        embed = discord.Embed(
+            title="[Vibeモニター] 空気の緊張度が高まっています",
+            description=(
+                f"チャンネル: {channel.mention if hasattr(channel, 'mention') else channel_id}\n"
+                f"緊張度スコア: **{result['score']}/10**\n"
+                f"状況: {result['summary'] or '（要約なし）'}\n"
+                f"理由: {result['reason']}"
+            ),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="これは自動介入ではなく通知のみです。必要に応じて状況を確認してください。")
+        try:
+            await notify_channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        last_alert_map[str(channel_id)] = now_ts
+        data_dirty = True
+
+    if data_dirty:
+        save_data(all_data)
+
+
+async def _vibe_monitor_loop():
+    """一定間隔でVibeモニターのバッチ判定を実行するループタスクです。"""
+    await bot.wait_until_ready()
+    while True:
+        try:
+            await _vibe_monitor_process_all()
+        except Exception as e:
+            print(f"[Vibeモニター] ループ内エラー: {e}")
+        await asyncio.sleep(VIBE_MONITOR_LOOP_INTERVAL_SECONDS)
+
+
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -10904,6 +11219,7 @@ async def help_command(interaction: discord.Interaction):
             "`/server protect ip_ban_check` : ウェブ認証を利用したBAN逃れ（同一IP）対策を設定します\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
             "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
+            "`/gacha draw` : Mコインを消費してAI生成のオリジナル人格を引きます（`/gacha list`で確認、`/gacha use`で/aiに適用）\n"
             "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
         ),
         inline=False
@@ -10917,6 +11233,16 @@ async def help_command(interaction: discord.Interaction):
             "`/voice_sound list` : 登録済み音源の一覧を表示します\n"
             "`/voice_sound add` : 音源ファイルを名前付きで登録します（誰でも使用可能）\n"
             "`/voice_sound remove` : 登録済み音源を削除します（オーナー限定）"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Vibeモニター（空気・緊張度の監視）",
+        value=(
+            "`/vibe setup` : 【モデレーター専用】会話の空気をAIが定期監視する機能を有効化します\n"
+            "`/vibe status` : 現在の設定状況を確認します\n"
+            "`/vibe threshold` : アラートを送る緊張度スコアの閾値(1-10)を変更します\n"
+            "※発言の削除や警告は行わず、険悪な空気を検知した際の通知のみ行います"
         ),
         inline=False
     )
@@ -12843,7 +13169,294 @@ async def ai_chat_user_status(interaction: discord.Interaction, user: discord.Us
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-AI_CHAT_USER_PROMPT_MAX_LENGTH = 500  # 一般メンバーが自分で設定できるシステムプロンプトの最大文字数
+# --------------------------------------------------------------------
+# /vibe — サーバーの空気（緊張度）をAIが監視するモデレーター機能
+# --------------------------------------------------------------------
+
+@vibe_group.command(name="setup", description="【モデレーター専用】Vibeモニターを有効化し、通知先チャンネルと閾値を設定します")
+@app_commands.describe(
+    通知先チャンネル="緊張度アラートを送るチャンネル（未指定なら監視対象チャンネルへそのまま通知）",
+    閾値="このスコア(1-10)以上でアラートを送ります（既定7、高いほど鈍感＝大きな荒れのみ通知）"
+)
+async def vibe_setup(
+    interaction: discord.Interaction,
+    通知先チャンネル: Optional[discord.TextChannel] = None,
+    閾値: Optional[app_commands.Range[int, 1, 10]] = None,
+):
+    if not await is_moderator(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["vibe_monitor_enabled"] = True
+    if 通知先チャンネル is not None:
+        guild_config["vibe_monitor_channel_id"] = 通知先チャンネル.id
+    if 閾値 is not None:
+        guild_config["vibe_monitor_threshold"] = 閾値
+    save_data(all_data)
+
+    threshold = guild_config.get("vibe_monitor_threshold", 7)
+    notify_desc = 通知先チャンネル.mention if 通知先チャンネル else "（各チャンネルへ個別通知）"
+    await interaction.response.send_message(
+        "[設定完了] Vibeモニターを有効化しました。\n"
+        f"通知先: {notify_desc}\n"
+        f"アラート閾値: {threshold}/10\n\n"
+        "会話の様子を定期的にAIが観測し、険悪な空気が続いていると判断した場合のみ通知します。"
+        "発言の削除や警告など自動介入は一切行いません。",
+        ephemeral=True
+    )
+
+
+@vibe_group.command(name="toggle", description="【モデレーター専用】Vibeモニターの有効/無効を切り替えます")
+async def vibe_toggle(interaction: discord.Interaction):
+    if not await is_moderator(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    new_state = not guild_config.get("vibe_monitor_enabled", False)
+    guild_config["vibe_monitor_enabled"] = new_state
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[設定完了] Vibeモニターを{'有効化' if new_state else '無効化'}しました。",
+        ephemeral=True
+    )
+
+
+@vibe_group.command(name="threshold", description="【モデレーター専用】Vibeモニターのアラート閾値(1-10)を変更します")
+@app_commands.describe(閾値="このスコア以上でアラートを送ります（高いほど大きな荒れのみ通知）")
+async def vibe_threshold(interaction: discord.Interaction, 閾値: app_commands.Range[int, 1, 10]):
+    if not await is_moderator(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["vibe_monitor_threshold"] = 閾値
+    save_data(all_data)
+
+    await interaction.response.send_message(f"[設定完了] アラート閾値を{閾値}/10に設定しました。", ephemeral=True)
+
+
+@vibe_group.command(name="channel", description="【モデレーター専用】Vibeモニターのアラート通知先チャンネルを設定します")
+@app_commands.describe(チャンネル="通知先チャンネル（未指定で解除し、監視対象チャンネルへ個別通知する設定に戻ります）")
+async def vibe_channel(interaction: discord.Interaction, チャンネル: Optional[discord.TextChannel] = None):
+    if not await is_moderator(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    guild_config["vibe_monitor_channel_id"] = チャンネル.id if チャンネル else None
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[設定完了] 通知先を{チャンネル.mention if チャンネル else '（監視対象チャンネルへ個別通知）'}に設定しました。",
+        ephemeral=True
+    )
+
+
+@vibe_group.command(name="status", description="Vibeモニターの現在の設定状況を確認します")
+async def vibe_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    enabled = guild_config.get("vibe_monitor_enabled", False)
+    threshold = guild_config.get("vibe_monitor_threshold", 7)
+    notify_channel_id = guild_config.get("vibe_monitor_channel_id")
+    notify_channel = interaction.guild.get_channel(notify_channel_id) if notify_channel_id else None
+
+    embed = discord.Embed(
+        title="[Vibeモニター] 現在の設定",
+        color=discord.Color.blue() if enabled else discord.Color.greyple()
+    )
+    embed.add_field(name="状態", value="有効" if enabled else "無効", inline=True)
+    embed.add_field(name="アラート閾値", value=f"{threshold}/10", inline=True)
+    embed.add_field(
+        name="通知先",
+        value=notify_channel.mention if notify_channel else "（監視対象チャンネルへ個別通知）",
+        inline=False
+    )
+    embed.set_footer(text="発言の削除や警告など自動介入は行わず、通知のみ行う機能です。")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /gacha — AI人格ガチャ（Mコインを消費してAI生成のオリジナル人格を排出）
+# --------------------------------------------------------------------
+
+@gacha_group.command(name="draw", description=f"Mコインを{GACHA_COST}消費して、AI生成のオリジナル人格を1体引きます")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_draw(interaction: discord.Interaction):
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "現在この機能は利用できません（Botの設定が未完了です）。", ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    wallet = get_global_balance(all_data, interaction.user.id)
+    if wallet < GACHA_COST:
+        coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+        await interaction.response.send_message(
+            f"Mコインが足りません（必要: {GACHA_COST:,} {coin_name} / 所持: {wallet:,} {coin_name}）。\n"
+            "`/economy work` で稼いでからもう一度お試しください。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    persona = await _gacha_generate_persona(
+        guild_id=interaction.guild.id if interaction.guild is not None else None
+    )
+    if persona is None:
+        await interaction.followup.send(
+            "ガチャの生成に失敗しました（AIの応答取得に失敗）。コインは消費されていません。もう一度お試しください。"
+        )
+        return
+
+    # ここまで来て初めてコインを消費する（生成失敗時に課金しないため）
+    all_data = load_data()  # defer中に他の操作で残高が変わっている可能性があるため再読込
+    wallet = get_global_balance(all_data, interaction.user.id)
+    if wallet < GACHA_COST:
+        coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+        await interaction.followup.send(
+            f"Mコインが足りません（必要: {GACHA_COST:,} {coin_name} / 所持: {wallet:,} {coin_name}）。"
+        )
+        return
+    add_global_balance(all_data, interaction.user.id, -GACHA_COST)
+
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    persona_list = user_app_data.setdefault("gacha_personas", [])
+    persona_list.append(persona)
+    if len(persona_list) > GACHA_MAX_PERSONAS_PER_USER:
+        del persona_list[: len(persona_list) - GACHA_MAX_PERSONAS_PER_USER]
+
+    save_data(all_data)
+
+    coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+    rarity = persona["rarity"]
+    embed = discord.Embed(
+        title=f"[{rarity}] {persona['name']} を獲得しました！",
+        description=persona.get("flavor_text", ""),
+        color=GACHA_RARITY_COLORS.get(rarity, discord.Color.default())
+    )
+    embed.add_field(name="一人称", value=persona["first_person"], inline=True)
+    embed.add_field(name="レアリティ", value=rarity, inline=True)
+    embed.add_field(name="性格", value=persona.get("personality") or "（未設定）", inline=False)
+    embed.add_field(name="話し方", value=persona.get("speech_style") or "（未設定）", inline=False)
+    if persona.get("catchphrase"):
+        embed.add_field(name="口癖", value=f"「{persona['catchphrase']}」", inline=False)
+    embed.set_footer(text=f"ID: {persona['id']} ／ `/gacha use` でこの人格を /ai に適用できます（消費: {GACHA_COST:,} {coin_name}）")
+    await interaction.followup.send(embed=embed)
+
+
+@gacha_group.command(name="list", description="自分が所持しているAI人格ガチャのペルソナ一覧を確認します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_list(interaction: discord.Interaction):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    personas = user_app_data.get("gacha_personas", [])
+    active_id = user_app_data.get("gacha_active_persona_id")
+
+    if not personas:
+        await interaction.response.send_message(
+            "まだAI人格ガチャを引いていません。`/gacha draw` から始められます。", ephemeral=True
+        )
+        return
+
+    lines = []
+    for p in reversed(personas[-25:]):  # 新しい順、最大25件
+        mark = "[適用中] " if p.get("id") == active_id else ""
+        lines.append(f"{mark}`[{p['rarity']}]` **{p['name']}** (ID: `{p['id']}`)")
+
+    embed = discord.Embed(
+        title="[AI人格ガチャ] 所持ペルソナ一覧",
+        description="\n".join(lines),
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=f"所持数: {len(personas)}体 ／ `/gacha use <ID>` で /ai に適用できます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@gacha_group.command(name="use", description="所持しているガチャペルソナを /ai コマンドに適用します（IDを省略すると解除）")
+@app_commands.describe(id="適用するペルソナのID（`/gacha list`で確認できます）。省略すると適用を解除します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_use(interaction: discord.Interaction, id: Optional[str] = None):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+
+    if id is None:
+        user_app_data["gacha_active_persona_id"] = None
+        save_data(all_data)
+        await interaction.response.send_message(
+            "AI人格ガチャの適用を解除しました。`/ai` は通常の設定で応答します。", ephemeral=True
+        )
+        return
+
+    persona = next((p for p in user_app_data.get("gacha_personas", []) if p.get("id") == id), None)
+    if persona is None:
+        await interaction.response.send_message(
+            "指定されたIDのペルソナが見つかりません。`/gacha list` でIDを確認してください。", ephemeral=True
+        )
+        return
+
+    user_app_data["gacha_active_persona_id"] = id
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[{persona['rarity']}] **{persona['name']}** を `/ai` に適用しました。\n"
+        "以降、`/ai` はこのキャラクターとして応答します（`/gacha use` をID無しで実行すると解除されます）。",
+        ephemeral=True
+    )
+
+
+@gacha_group.command(name="info", description="所持しているガチャペルソナの詳細を確認します")
+@app_commands.describe(id="確認するペルソナのID（`/gacha list`で確認できます）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def gacha_info(interaction: discord.Interaction, id: str):
+    all_data = load_data()
+    user_app_data = get_user_app_data(all_data, str(interaction.user.id))
+    persona = next((p for p in user_app_data.get("gacha_personas", []) if p.get("id") == id), None)
+
+    if persona is None:
+        await interaction.response.send_message(
+            "指定されたIDのペルソナが見つかりません。`/gacha list` でIDを確認してください。", ephemeral=True
+        )
+        return
+
+    rarity = persona["rarity"]
+    embed = discord.Embed(
+        title=f"[{rarity}] {persona['name']}",
+        description=persona.get("flavor_text", ""),
+        color=GACHA_RARITY_COLORS.get(rarity, discord.Color.default())
+    )
+    embed.add_field(name="一人称", value=persona["first_person"], inline=True)
+    embed.add_field(name="レアリティ", value=rarity, inline=True)
+    embed.add_field(name="性格", value=persona.get("personality") or "（未設定）", inline=False)
+    embed.add_field(name="話し方", value=persona.get("speech_style") or "（未設定）", inline=False)
+    if persona.get("catchphrase"):
+        embed.add_field(name="口癖", value=f"「{persona['catchphrase']}」", inline=False)
+    embed.set_footer(text=f"ID: {persona['id']}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
 
 
 async def _ai_chat_process_my_prompt_submission(interaction: discord.Interaction, text: str):
