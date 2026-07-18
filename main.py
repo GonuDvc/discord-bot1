@@ -5298,6 +5298,84 @@ def _ai_chat_record_request(guild_id: int, user_id: int):
 
 
 # --------------------------------------------------------------------
+# /aiコマンドの利用統計（「誰が/aiコマンドを使っているか」を確認できるようにするため）
+# --------------------------------------------------------------------
+# {(guild_key_str, user_id_str): 未保存分の利用回数} — 永続化していない直近の増分バッファ。
+# guild_key_str は通常サーバーIDの文字列、DM/グループDMからの利用は "dm" にまとめる。
+_ai_command_usage_unsaved: dict = {}
+# {(guild_key_str, user_id_str): 直近に確認できた表示名} — 永続化データに書き込む表示名用
+_ai_command_usage_last_seen_names: dict = {}
+
+
+def _ai_command_usage_guild_key(guild_id: Optional[int]) -> str:
+    """/aiコマンド利用統計を保存する際のキー。guild無し（DM/グループDM）は固定文字列 "dm" にまとめる。"""
+    return str(guild_id) if guild_id is not None else "dm"
+
+
+def _ai_command_record_usage(guild_id: Optional[int], user_id: int, display_name: str):
+    """
+    /aiコマンドの利用を記録します。インメモリには即座に反映し、ディスクへの反映は
+    ある程度たまってから非同期でまとめて行います（毎回同期I/Oするとイベントループを
+    圧迫するため。コマンド実行数カウンタ(_flush_command_exec_count)と同じ考え方です）。
+    レート制限用の _ai_chat_record_request とは別物（あちらは直近時刻のみ、こちらは
+    永続的な利用回数・利用者一覧の把握が目的）です。
+    """
+    guild_key = _ai_command_usage_guild_key(guild_id)
+    user_key = str(user_id)
+    key = (guild_key, user_key)
+    _ai_command_usage_unsaved[key] = _ai_command_usage_unsaved.get(key, 0) + 1
+    _ai_command_usage_last_seen_names[key] = display_name
+
+    if sum(_ai_command_usage_unsaved.values()) >= 5:
+        pending = dict(_ai_command_usage_unsaved)
+        pending_names = dict(_ai_command_usage_last_seen_names)
+        _ai_command_usage_unsaved.clear()
+        _ai_command_usage_last_seen_names.clear()
+        asyncio.create_task(_flush_ai_command_usage(pending, pending_names))
+
+
+async def _flush_ai_command_usage(pending: dict, pending_names: dict):
+    """/aiコマンド利用統計の増分を非同期でディスクへ反映します。"""
+    try:
+        all_data = await aload_data()
+        stats = all_data.setdefault("ai_command_usage_stats", {})
+        now = time.time()
+        for (guild_key, user_key), increment in pending.items():
+            guild_bucket = stats.setdefault(guild_key, {})
+            entry = guild_bucket.setdefault(user_key, {"count": 0, "last_used": 0, "display_name": ""})
+            entry["count"] = entry.get("count", 0) + increment
+            entry["last_used"] = now
+            entry["display_name"] = pending_names.get((guild_key, user_key), entry.get("display_name", ""))
+        await asave_data(all_data)
+    except Exception as e:
+        print(f"[警告] /aiコマンド利用統計の永続化に失敗しました: {e}")
+
+
+def _ai_command_get_usage_stats(guild_key: str) -> dict:
+    """
+    指定したguild_key（サーバーIDの文字列、またはDM用の"dm"）における
+    /aiコマンド利用統計を返します。ディスクに永続化済みの値と、
+    まだ非同期フラッシュされていない直近の増分（インメモリ）をマージして返します。
+    戻り値: {user_id_str: {"count": int, "last_used": epoch秒, "display_name": str}}
+    """
+    all_data = load_data()
+    stats = all_data.get("ai_command_usage_stats", {})
+    merged = {k: dict(v) for k, v in stats.get(guild_key, {}).items()}
+
+    now = time.time()
+    for (g_key, user_key), increment in _ai_command_usage_unsaved.items():
+        if g_key != guild_key:
+            continue
+        entry = merged.setdefault(user_key, {"count": 0, "last_used": 0, "display_name": ""})
+        entry["count"] = entry.get("count", 0) + increment
+        entry["last_used"] = now
+        name = _ai_command_usage_last_seen_names.get((g_key, user_key))
+        if name:
+            entry["display_name"] = name
+    return merged
+
+
+# --------------------------------------------------------------------
 # 他BOTの発言への自動応答（bot_reply）: 連鎖ターン数・クールダウン管理
 # --------------------------------------------------------------------
 # {channel_id: consecutive_turn_count} — このBotが「他Botの発言」に連続で応答した回数。
@@ -8592,6 +8670,11 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
     ]
 
     _ai_chat_record_request(_AI_COMMAND_DM_GUILD_KEY, interaction.user.id)
+    _ai_command_record_usage(
+        interaction.guild.id if interaction.guild is not None else None,
+        interaction.user.id,
+        getattr(interaction.user, "display_name", None) or str(interaction.user)
+    )
 
     try:
         reply_text, _used_provider = await _ai_call_llm_with_fallback(
@@ -12098,6 +12181,49 @@ async def ai_chat_set_cooldown(interaction: discord.Interaction, seconds: app_co
             f"以降、ユーザーは同じサーバー内で{seconds}秒間隔を空けないとAIチャットを利用できません。",
             ephemeral=True
         )
+
+
+@ai_chat_group.command(name="usage", description="【オーナー限定】このサーバーで/aiコマンドを誰がどれだけ使っているか確認できます")
+@app_commands.describe(件数="表示する人数（既定10、最大25）")
+async def ai_chat_usage(interaction: discord.Interaction, 件数: Optional[int] = 10):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    limit = max(1, min(件数 or 10, 25))
+    guild_key = _ai_command_usage_guild_key(interaction.guild.id)
+    combined = _ai_command_get_usage_stats(guild_key)
+
+    if not combined:
+        await interaction.response.send_message(
+            "このサーバーではまだ `/ai` コマンドの利用記録がありません。", ephemeral=True
+        )
+        return
+
+    ranked = sorted(combined.items(), key=lambda kv: kv[1].get("count", 0), reverse=True)[:limit]
+
+    lines = []
+    for i, (user_key, entry) in enumerate(ranked, start=1):
+        try:
+            user_id = int(user_key)
+        except ValueError:
+            continue
+        mention = f"<@{user_id}>"
+        display_name = entry.get("display_name") or "不明"
+        count = entry.get("count", 0)
+        last_used_ts = entry.get("last_used", 0)
+        last_used_text = f"<t:{int(last_used_ts)}:R>" if last_used_ts else "不明"
+        lines.append(f"**{i}.** {mention}（{display_name}） — **{count}回** ／ 最終利用: {last_used_text}")
+
+    total_uses = sum(e.get("count", 0) for e in combined.values())
+    embed = discord.Embed(
+        title="📊 /aiコマンド 利用状況",
+        description="\n".join(lines),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"このサーバーでの利用者数: {len(combined)}人 ／ 合計利用回数: {total_uses}回")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @ai_chat_group.command(name="set_provider", description="【オーナー限定】このサーバーで使うAIプロバイダを切り替えられます")
@@ -23958,6 +24084,15 @@ async def _main():
                 await _flush_command_exec_count(pending)
         except Exception as e:
             print(f"[警告] 終了時のコマンド実行数保存に失敗しました: {e}")
+        try:
+            if _ai_command_usage_unsaved:
+                pending_usage = dict(_ai_command_usage_unsaved)
+                pending_usage_names = dict(_ai_command_usage_last_seen_names)
+                _ai_command_usage_unsaved.clear()
+                _ai_command_usage_last_seen_names.clear()
+                await _flush_ai_command_usage(pending_usage, pending_usage_names)
+        except Exception as e:
+            print(f"[警告] 終了時の/aiコマンド利用統計保存に失敗しました: {e}")
 
 
 asyncio.run(_main())
