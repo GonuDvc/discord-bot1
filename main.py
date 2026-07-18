@@ -11029,36 +11029,37 @@ async def sync_command(ctx):
     arg = ctx.message.content.replace("!sync", "").strip().lower()
 
     if arg == "global":
-        await ctx.send("全サーバーへグローバル同期中... 反映まで最大1時間かかります。")
+        msg = await ctx.send("[更新中] 全サーバーへグローバル同期しています…反映まで最大1時間かかります。")
         try:
             synced = await bot.tree.sync()
-            await ctx.send(f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
+            await msg.edit(content=f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
         except discord.errors.HTTPException as e:
-            await ctx.send(f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
+            await msg.edit(content=f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
 
     elif arg == "clear":
         if not ctx.guild:
             await ctx.send("このコマンドはサーバー内で実行してください。")
             return
+        msg = await ctx.send("[更新中] このサーバーのギルドコマンドをクリアしています…")
         bot.tree.clear_commands(guild=ctx.guild)
         await bot.tree.sync(guild=ctx.guild)
-        await ctx.send("このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。")
+        await msg.edit(content="このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。")
 
     else:
         if not ctx.guild:
             await ctx.send("サーバー内で実行してください。グローバル同期は `!sync global` を使用してください。")
             return
-        await ctx.send("このサーバーへ即時同期中...")
+        msg = await ctx.send("[更新中] このサーバーへ即時同期しています…")
         try:
             bot.tree.copy_global_to(guild=ctx.guild)
             synced = await bot.tree.sync(guild=ctx.guild)
-            await ctx.send(
+            await msg.edit(content=(
                 f"このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
                 "すぐに `/` で確認できます。\n"
                 "全サーバーへ反映したい場合は `!sync global` を実行してください（最大1時間）。"
-            )
+            ))
         except discord.errors.HTTPException as e:
-            await ctx.send(f"同期に失敗しました。\n`{e}`")
+            await msg.edit(content=f"同期に失敗しました。\n`{e}`")
 
 
 @sync_command.error
@@ -11086,35 +11087,39 @@ async def sync_slash(interaction: discord.Interaction, 範囲: app_commands.Choi
     if not await is_owner_check(interaction):
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
     scope = 範囲.value if 範囲 else "guild"
+
+    scope_label = {
+        "global": "全サーバーへグローバル同期",
+        "clear": "このサーバーのギルドコマンドをクリア",
+        "guild": "このサーバーへ即時同期",
+    }.get(scope, "同期")
+    await interaction.response.send_message(f"[更新中] {scope_label}を実行しています…しばらくお待ちください。", ephemeral=True)
 
     if scope == "global":
         try:
             synced = await bot.tree.sync()
-            await interaction.followup.send(
-                f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。反映まで最大1時間かかります。",
-                ephemeral=True
+            await interaction.edit_original_response(
+                content=f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。反映まで最大1時間かかります。"
             )
         except discord.HTTPException as e:
-            await interaction.followup.send(
-                f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`", ephemeral=True
+            await interaction.edit_original_response(
+                content=f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`"
             )
         return
 
     # guild / clear はサーバーに紐付くため、DM・グループDMでは実行不可
     if not interaction.guild:
-        await interaction.followup.send(
-            "サーバー内で実行してください。DM・グループDMでは「グローバル同期」のみ利用できます。",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content="サーバー内で実行してください。DM・グループDMでは「グローバル同期」のみ利用できます。"
         )
         return
 
     if scope == "clear":
         bot.tree.clear_commands(guild=interaction.guild)
         await bot.tree.sync(guild=interaction.guild)
-        await interaction.followup.send(
-            "このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。", ephemeral=True
+        await interaction.edit_original_response(
+            content="このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。"
         )
         return
 
@@ -11122,13 +11127,14 @@ async def sync_slash(interaction: discord.Interaction, 範囲: app_commands.Choi
     try:
         bot.tree.copy_global_to(guild=interaction.guild)
         synced = await bot.tree.sync(guild=interaction.guild)
-        await interaction.followup.send(
-            f"このサーバーへの即時同期が完了しました（{len(synced)}個）。すぐに `/` で確認できます。\n"
-            "全サーバーへ反映したい場合は 範囲=グローバル同期 を指定してください（最大1時間）。",
-            ephemeral=True
+        await interaction.edit_original_response(
+            content=(
+                f"このサーバーへの即時同期が完了しました（{len(synced)}個）。すぐに `/` で確認できます。\n"
+                "全サーバーへ反映したい場合は 範囲=グローバル同期 を指定してください（最大1時間）。"
+            )
         )
     except discord.HTTPException as e:
-        await interaction.followup.send(f"同期に失敗しました。\n`{e}`", ephemeral=True)
+        await interaction.edit_original_response(content=f"同期に失敗しました。\n`{e}`")
 
 
 # ====================================================================
