@@ -106,6 +106,9 @@ OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "2048"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "2048"))
+# 画像生成専用モデル（/image コマンド）。日本語プロンプトの理解精度が高く、
+# Imagen系（2026/8/17廃止予定）ではなくGemini 2.5 Flash Image（通称Nano Banana）を既定にする。
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 # --- Web検索API（AIチャットのWeb検索機能）---
 # AIモデル自体は学習データの時点までの知識しか持たないため、最新情報（ニュース・現在の状況等）
@@ -164,9 +167,11 @@ if MEM0_API_KEY:
 
 # --- 画像生成API（/image コマンド） ---
 # 1社の無料枠上限・障害時でも機能が完全に止まらないよう、優先順位付きでフォールバックする。
-# 優先順位: Cloudflare Workers AI（要アカウント・APIトークン、1日あたりの無料枠あり） →
-#           キー不要の無料エンドポイント（サインアップ不要・レート制限は緩やか）
-# 未設定の場合は自動的にキー不要側のみを使用する。
+# 優先順位: Gemini（Gemini 2.5 Flash Image。日本語プロンプトの理解精度が高いため最優先） →
+#           Cloudflare Workers AI（要アカウント・APIトークン、1日あたりの無料枠あり。英語プロンプト向き） →
+#           キー不要の無料エンドポイント（サインアップ不要・レート制限は緩やか。英語プロンプト向き）
+# GeminiはAIチャット機能（GEMINI_API_KEY）と同じキーを流用する。未設定時はCloudflare→キー不要側の順で試す。
+IMAGE_GEN_GEMINI_AVAILABLE = bool(GEMINI_API_KEY)
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 IMAGE_GEN_PRIMARY_AVAILABLE = bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)
@@ -9238,18 +9243,88 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
 # ====================================================================
 # /image コマンド（画像生成機能）
 # ====================================================================
-# 2段構成のフォールバックで画像生成を行う:
-#   1. Cloudflare Workers AI（Stable Diffusion XL） — 要アカウント・APIトークン。
-#      正規のAPI認証に基づく無料枠（1日あたり）があり、匿名アクセスより安定した生成が期待できる。
-#   2. Pollinations.ai — APIキー・サインアップ不要の無料エンドポイント。
-#      1の未設定時、またはエラー時のフォールバック先として使う。
-# どちらのサービス名・使用モデル名もユーザーには開示しない（/helpやコマンド説明文・埋め込み等）。
+# 3段構成のフォールバックで画像生成を行う:
+#   1. Gemini（Gemini 2.5 Flash Image） — GEMINI_API_KEY流用。日本語プロンプトの
+#      理解精度が高く、翻訳を挟まなくても日本語の意図を汲んだ画像が生成されやすい。
+#   2. Cloudflare Workers AI（Stable Diffusion XL） — 要アカウント・APIトークン。
+#      英語プロンプト向き。1が未設定または失敗した場合のフォールバック先。
+#   3. Pollinations.ai — APIキー・サインアップ不要の無料エンドポイント。
+#      1・2の両方が未設定時、またはエラー時の最終フォールバック先として使う。
+# どのサービス名・使用モデル名もユーザーには開示しない（/helpやコマンド説明文・埋め込み等）。
 # ====================================================================
 
 _IMAGE_COMMAND_GUILD_KEY = -2  # /image 利用時のクールダウン管理用の疑似ギルドID（他機能のキーと衝突しないよう負の値にする）
 IMAGE_COMMAND_COOLDOWN_SECONDS = 15  # キー不要側（Pollinations）の匿名レート制限目安に合わせた最小間隔
 IMAGE_COMMAND_MIN_SIZE = 256
 IMAGE_COMMAND_MAX_SIZE = 1536
+
+
+async def _gemini_generate_image(prompt: str, width: int, height: int) -> bytes:
+    """
+    Gemini（Gemini 2.5 Flash Image）を呼び出し、画像バイナリを返します。
+    AIチャット機能と同じGEMINI_API_KEYを流用します。
+    日本語プロンプトをそのまま渡せます（内部で高精度に解釈される）。
+    失敗した場合は例外を送出します（呼び出し元でハンドリングする）。
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY が設定されていません。")
+
+    # Gemini 2.5 Flash Imageはピクセル指定のwidth/heightパラメータを持たないため、
+    # 縦横比が近いアスペクト比ヒントをプロンプトに含めて誘導する。
+    aspect_hint = ""
+    if width and height:
+        ratio = width / height
+        if abs(ratio - 1.0) > 0.05:
+            if ratio > 1.0:
+                aspect_hint = f"（横長・アスペクト比おおよそ{ratio:.2f}:1の画像として生成してください）"
+            else:
+                aspect_hint = f"（縦長・アスペクト比おおよそ1:{(1/ratio):.2f}の画像として生成してください）"
+
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt + aspect_hint}]}
+        ],
+        "generationConfig": {"responseModalities": ["IMAGE"]},
+    }
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_IMAGE_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            if resp.status == 429:
+                err_text = await resp.text()
+                retry_after = _extract_gemini_retry_after(err_text)
+                raise RuntimeError(
+                    f"画像生成プロバイダG レート制限（HTTP 429）"
+                    f"{f'、{retry_after:.0f}秒後に再試行可能' if retry_after else ''}: {err_text[:200]}"
+                )
+            if resp.status != 200:
+                err_text = await resp.text()
+                raise RuntimeError(f"画像生成プロバイダG エラー（HTTP {resp.status}）: {err_text[:300]}")
+            data = await resp.json()
+
+    try:
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"画像生成プロバイダG の応答形式が想定と異なります: {data}")
+
+    for part in parts:
+        inline_data = part.get("inlineData") or part.get("inline_data")
+        if inline_data and inline_data.get("data"):
+            try:
+                return base64.b64decode(inline_data["data"])
+            except Exception as e:
+                raise RuntimeError(f"画像生成プロバイダG の画像データ解析に失敗しました: {e}")
+
+    finish_reason = candidate.get("finishReason", "")
+    if finish_reason == "SAFETY" or finish_reason == "IMAGE_SAFETY":
+        raise RuntimeError("画像生成プロバイダG がセーフティフィルターにより画像生成をブロックしました。")
+    raise RuntimeError(f"画像生成プロバイダG のレスポンスに画像データが含まれていません（finishReason: {finish_reason}）。")
 
 
 async def _cloudflare_generate_image(prompt: str, width: int, height: int) -> bytes:
@@ -9324,12 +9399,19 @@ async def _pollinations_generate_image(prompt: str, width: int, height: int) -> 
 
 async def _generate_image_with_fallback(prompt: str, width: int, height: int) -> bytes:
     """
-    設定済みの画像生成プロバイダを優先順位（Cloudflare→Pollinations）の順に試し、
+    設定済みの画像生成プロバイダを優先順位（Gemini→Cloudflare→Pollinations）の順に試し、
     最初に成功したものの画像バイナリを返します。
-    Cloudflare未設定時は最初からPollinationsのみを使用します。
-    両方失敗した場合は最後に発生した例外を送出します。
+    Gemini・Cloudflareが未設定の場合はPollinationsのみを使用します。
+    すべて失敗した場合は最後に発生した例外を送出します。
     """
     last_error: Optional[Exception] = None
+
+    if IMAGE_GEN_GEMINI_AVAILABLE:
+        try:
+            return await _gemini_generate_image(prompt, width, height)
+        except Exception as e:
+            print(f"[画像生成] プロバイダG（Gemini）が失敗したため次のプロバイダへフォールバックします: {e}")
+            last_error = e
 
     if IMAGE_GEN_PRIMARY_AVAILABLE:
         try:
