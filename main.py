@@ -629,7 +629,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_bot_reply_max_turns", 4),     # 1つの発言連鎖につき、こちらが連続で応答する最大ターン数（無限ループ防止）
         ("ai_chat_bot_reply_cooldown_seconds", 15),  # 同じチャンネルでBotへ応答してから次に応答するまでの最短間隔（秒）
         # --- AIチャット：mem0による長期記憶（ユーザーごとの事実・好みをサーバー横断で記憶）---
-        ("ai_chat_memory_enabled", True),  # True: mem0が利用可能な環境（MEM0_API_KEY設定済み）であれば長期記憶を使用する。管理者が /ai_chat set_memory で切り替え
+        ("ai_chat_memory_enabled", True),  # True: mem0が利用可能な環境（MEM0_API_KEY設定済み）であれば長期記憶を使用する。管理者が /ai_chat memory toggle で切り替え
         # --- サーバー活動のAIサマリー機能 ---
         ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
         ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
@@ -13996,12 +13996,12 @@ async def ai_chat_set_search_provider(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /ai_chat set_memory, /ai_chat memory — mem0による長期記憶のON/OFF・閲覧・削除
+# /ai_chat memory toggle, /ai_chat memory list, /ai_chat memory forget — mem0による長期記憶のON/OFF・閲覧・削除
 # --------------------------------------------------------------------
 
 class AIChatMemoryToggleView(discord.ui.View):
     """
-    /ai_chat set_memory で表示される、mem0長期記憶のON/OFFをボタン1つで切り替えられるビュー。
+    /ai_chat memory toggle で表示される、mem0長期記憶のON/OFFをボタン1つで切り替えられるビュー。
     Web検索のトグル（AIChatSearchToggleView）と同じ構成。
     """
     def __init__(self, guild_id: int, enabled: bool):
@@ -14041,7 +14041,10 @@ class AIChatMemoryToggleView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-@ai_chat_group.command(name="set_memory", description="【管理者専用】AIチャットの長期記憶（mem0）機能を、ボタン一つでON/OFFできます")
+ai_chat_memory_group = app_commands.Group(name="memory", description="AIチャットの長期記憶（mem0）を管理・確認します", parent=ai_chat_group)
+
+
+@ai_chat_memory_group.command(name="toggle", description="【管理者専用】AIチャットの長期記憶（mem0）機能を、ボタン一つでON/OFFできます")
 async def ai_chat_set_memory(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
@@ -14071,9 +14074,6 @@ async def ai_chat_set_memory(interaction: discord.Interaction):
     )
     view = AIChatMemoryToggleView(interaction.guild.id, memory_enabled_for_guild)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
-ai_chat_memory_group = app_commands.Group(name="memory", description="AIチャットの長期記憶（mem0）を自分で確認・削除します", parent=ai_chat_group)
 
 
 @ai_chat_memory_group.command(name="list", description="AIチャットがあなたについて覚えている長期記憶の一覧を確認します")
