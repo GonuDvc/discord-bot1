@@ -19909,7 +19909,14 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
         __type(name: "Query") {
             fields {
                 name
-                args { name type { name kind ofType { name kind } } }
+                args {
+                    name
+                    type {
+                        name
+                        kind
+                        ofType { name kind ofType { name kind ofType { name kind } } }
+                    }
+                }
             }
         }
     }
@@ -19919,6 +19926,7 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
 
     keywords = ["cost", "usage", "invoice", "billing", "price", "estimate", "workspace", "team", "subscription", "credit", "spend"]
     matched = [f for f in all_fields if any(kw in f["name"].lower() for kw in keywords)]
+    metrics_field = next((f for f in all_fields if f["name"] == "metrics"), None)
 
     introspection_query = """
     query IntrospectQuery($name: String!) {
@@ -19945,7 +19953,7 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
     }
     """
     # 見つかった料金関連フィールドの返り値の型名を集めて、それぞれの型定義も取得する
-    type_names_to_check = {"MetricTagInput", "AggregatedUsage", "MetricMeasurement"}
+    type_names_to_check = {"MetricTagInput", "AggregatedUsage", "MetricTags"}
 
     def _unwrap_type_name(type_obj):
         t = type_obj
@@ -19961,17 +19969,41 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
         tn = _unwrap_type_name(f.get("type"))
         if tn:
             type_names_to_check.add(tn)
+    if metrics_field:
+        for arg in metrics_field.get("args", []):
+            tn = _unwrap_type_name(arg.get("type"))
+            if tn:
+                type_names_to_check.add(tn)
 
     results = {}
     for type_name in type_names_to_check:
         d = await _railway_graphql_request(introspection_query, {"name": type_name})
         results[type_name] = d.get("__type") if d else None
 
+    # MetricMeasurementはENUM型なのでfieldsではなくenumValuesで取得する
+    enum_query = """
+    query IntrospectEnum($name: String!) {
+        __type(name: $name) {
+            name
+            kind
+            enumValues {
+                name
+            }
+        }
+    }
+    """
+    enum_data = await _railway_graphql_request(enum_query, {"name": "MetricMeasurement"})
+    metric_measurement_enum = enum_data.get("__type") if enum_data else None
+
     output_lines = []
-    output_lines.append("=== 料金・使用量関連っぽいQueryフィールド一覧（自動抽出） ===")
+    output_lines.append("=== metrics フィールドの引数定義 ===")
+    output_lines.append(json.dumps(metrics_field, ensure_ascii=False, indent=2))
+    output_lines.append("\n=== 料金・使用量関連っぽいQueryフィールド一覧（自動抽出） ===")
     output_lines.append(json.dumps(matched, ensure_ascii=False, indent=2))
     output_lines.append("\n=== Queryの全フィールド名一覧（参考） ===")
     output_lines.append(json.dumps([f["name"] for f in all_fields], ensure_ascii=False, indent=2))
+    output_lines.append("\n=== MetricMeasurement（enum全値） ===")
+    output_lines.append(json.dumps(metric_measurement_enum, ensure_ascii=False, indent=2))
     for type_name, type_def in results.items():
         output_lines.append(f"\n=== 型定義: {type_name} ===")
         output_lines.append(json.dumps(type_def, ensure_ascii=False, indent=2))
