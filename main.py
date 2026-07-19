@@ -199,6 +199,21 @@ STORAGE_CLEANUP_THRESHOLD_PERCENT = float(os.getenv("STORAGE_CLEANUP_THRESHOLD_P
 STORAGE_MONITOR_INTERVAL_SECONDS = int(os.getenv("STORAGE_MONITOR_INTERVAL_SECONDS", str(6 * 3600)))
 STORAGE_MONITOR_PATH = "/app/data"
 
+# --- Railway ステータス監視（CPU/メモリ/ストレージ/料金のリアルタイム表示） ---
+# Railwayダッシュボード → Account Settings → Tokens で発行したAPIトークンと、
+# 監視対象プロジェクトのIDを指定する。いずれか未設定の場合はRailway監視機能自体を無効化する。
+# プロジェクトIDは railway.app/project/xxxxxxxx-xxxx-... のUUID部分（Ctrl/Cmd+Kの
+# コマンドパレットから「Copy Project ID」でも取得可）。
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
+RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID", "")
+# 環境ID省略時はプロジェクトの最初の環境（通常 production）を自動使用する。
+RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID", "")
+RAILWAY_MONITOR_AVAILABLE = bool(RAILWAY_API_TOKEN and RAILWAY_PROJECT_ID)
+RAILWAY_GRAPHQL_ENDPOINT = "https://backboard.railway.com/graphql/v2"
+# 常時表示（埋め込み自動更新）の更新間隔（秒）。Railwayのメトリクス取得API呼び出し頻度を
+# 抑えるため、デフォルトは60秒。Discord埋め込み編集のレート制限にも配慮した値。
+RAILWAY_MONITOR_REFRESH_SECONDS = int(os.getenv("RAILWAY_MONITOR_REFRESH_SECONDS", "60"))
+
 
 # --------------------------------------------------------------------
 # ボイスチャンネル再生（/voice play 等）用の FFmpeg オプション
@@ -19494,6 +19509,440 @@ async def _storage_monitor_loop():
             await asyncio.sleep(STORAGE_MONITOR_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         raise
+
+
+# ====================================================================
+# Railway ステータス監視（CPU/メモリ/ストレージ/料金のリアルタイム表示）
+# ====================================================================
+# Railway公式のGraphQL Public API（backboard.railway.com/graphql/v2）を使用する。
+# 参考: https://docs.railway.com/reference/public-api
+#
+# 取得する情報:
+#   - プロジェクト内の各サービスのCPU使用率・メモリ使用量（metrics クエリ）
+#   - ボリューム（ストレージ）の使用量・上限（volumes / volumeInstances クエリ）
+#   - 現在の請求期間の推定使用料金（usage クエリ。取得できないプラン/権限の場合もあるため
+#     取得失敗時はその旨を正直に表示する）
+#
+# 注意: RailwayのGraphQLスキーマは非公開の内部実装に依存する部分があり、将来的な
+# スキーマ変更で一部フィールドが取得できなくなる可能性がある。取得に失敗した項目は
+# 例外を握りつぶして「取得できませんでした」と表示し、Bot全体が落ちないようにする。
+
+_railway_monitor_sessions: dict = {}  # {(guild_id, channel_id): {"message_id": int, "task": asyncio.Task}}
+
+
+async def _railway_graphql_request(query: str, variables: dict) -> Optional[dict]:
+    """Railway GraphQL APIにクエリを送信し、data部分を返します。失敗時はNoneを返します。"""
+    if not RAILWAY_MONITOR_AVAILABLE:
+        return None
+    headers = {
+        "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"query": query, "variables": variables}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                RAILWAY_GRAPHQL_ENDPOINT, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200 or "errors" in body:
+                    errs = body.get("errors") if isinstance(body, dict) else None
+                    print(f"[Railway監視] GraphQLエラー（status={resp.status}）: {errs}")
+                    return None
+                return body.get("data")
+    except Exception as e:
+        print(f"[Railway監視] GraphQL API呼び出しに失敗しました: {e}")
+        return None
+
+
+async def _railway_fetch_project_overview() -> Optional[dict]:
+    """プロジェクト名・環境一覧・サービス一覧（サービスID/名前）を取得します。"""
+    query = """
+    query ProjectOverview($projectId: String!) {
+        project(id: $projectId) {
+            id
+            name
+            environments {
+                edges {
+                    node {
+                        id
+                        name
+                    }
+                }
+            }
+            services {
+                edges {
+                    node {
+                        id
+                        name
+                    }
+                }
+            }
+        }
+    }
+    """
+    data = await _railway_graphql_request(query, {"projectId": RAILWAY_PROJECT_ID})
+    if not data or not data.get("project"):
+        return None
+    return data["project"]
+
+
+async def _railway_fetch_metrics(environment_id: str) -> list:
+    """
+    指定環境の直近メトリクス（CPU使用量・メモリ使用量）をサービスごとに取得します。
+    Railwayのメトリクス測定種別（measurement）: CPU_USAGE（コア数）, MEMORY_USAGE_GB（GB）。
+    取得に失敗した場合は空リストを返します（呼び出し側でその旨を表示）。
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(minutes=10)
+    query = """
+    query Metrics($environmentId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
+        metrics(
+            environmentId: $environmentId
+            startDate: $startDate
+            endDate: $endDate
+            measurements: $measurements
+        ) {
+            measurement
+            tags {
+                serviceId
+            }
+            values {
+                ts
+                value
+            }
+        }
+    }
+    """
+    variables = {
+        "environmentId": environment_id,
+        "startDate": start.isoformat(),
+        "endDate": now.isoformat(),
+        "measurements": ["CPU_USAGE", "MEMORY_USAGE_GB"],
+    }
+    data = await _railway_graphql_request(query, variables)
+    if not data or data.get("metrics") is None:
+        return []
+    return data["metrics"]
+
+
+async def _railway_fetch_volumes() -> list:
+    """プロジェクトに紐づくボリューム（ストレージ）の使用量・上限一覧を取得します。"""
+    query = """
+    query ProjectVolumes($projectId: String!) {
+        project(id: $projectId) {
+            volumes {
+                edges {
+                    node {
+                        id
+                        name
+                        volumeInstances {
+                            edges {
+                                node {
+                                    currentSizeMB
+                                    sizeMB
+                                    environmentId
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+    data = await _railway_graphql_request(query, {"projectId": RAILWAY_PROJECT_ID})
+    if not data or not data.get("project"):
+        return []
+    volumes = data["project"].get("volumes", {}).get("edges", [])
+    return [v["node"] for v in volumes]
+
+
+async def _railway_fetch_estimated_cost() -> Optional[float]:
+    """
+    現在の請求期間における、このプロジェクトの推定使用料金（USD）を取得します。
+    Railway側のスキーマ・プランにより取得できない場合はNoneを返します。
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    query = """
+    query ProjectUsage($projectId: String!, $startDate: DateTime!, $endDate: DateTime!) {
+        usage(
+            projectId: $projectId
+            startDate: $startDate
+            endDate: $endDate
+        ) {
+            estimatedCost
+        }
+    }
+    """
+    variables = {
+        "projectId": RAILWAY_PROJECT_ID,
+        "startDate": month_start.isoformat(),
+        "endDate": now.isoformat(),
+    }
+    data = await _railway_graphql_request(query, variables)
+    if not data or data.get("usage") is None:
+        return None
+    usage_entries = data["usage"]
+    if isinstance(usage_entries, list):
+        total = 0.0
+        found = False
+        for entry in usage_entries:
+            cost = entry.get("estimatedCost")
+            if cost is not None:
+                total += float(cost)
+                found = True
+        return total if found else None
+    return None
+
+
+def _railway_latest_value(metric_values: list) -> Optional[float]:
+    """メトリクスのvalues配列（ts昇順とは限らない）から最新の値を取り出します。"""
+    if not metric_values:
+        return None
+    try:
+        latest = max(metric_values, key=lambda v: v.get("ts", ""))
+        return latest.get("value")
+    except Exception:
+        return None
+
+
+async def _railway_build_status_embed() -> discord.Embed:
+    """Railwayの現在のCPU/メモリ/ストレージ/料金状況をまとめたEmbedを構築します。"""
+    if not RAILWAY_MONITOR_AVAILABLE:
+        embed = discord.Embed(
+            title="[Railway監視] 未設定",
+            description=(
+                "環境変数 `RAILWAY_API_TOKEN` / `RAILWAY_PROJECT_ID` が設定されていないため、"
+                "Railwayの使用状況を取得できません。\n"
+                "Railwayダッシュボード → Account Settings → Tokens でトークンを発行し、"
+                "対象プロジェクトのIDとあわせて環境変数に設定してください。"
+            ),
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        return embed
+
+    project = await _railway_fetch_project_overview()
+    if project is None:
+        embed = discord.Embed(
+            title="[Railway監視] 取得エラー",
+            description=(
+                "Railway APIからプロジェクト情報を取得できませんでした。\n"
+                "`RAILWAY_API_TOKEN` の有効性・`RAILWAY_PROJECT_ID` が正しいかご確認ください。"
+            ),
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        return embed
+
+    project_name = project.get("name", "(不明なプロジェクト)")
+    env_edges = project.get("environments", {}).get("edges", [])
+    service_edges = project.get("services", {}).get("edges", [])
+    service_name_by_id = {s["node"]["id"]: s["node"]["name"] for s in service_edges}
+
+    # 環境ID決定: 指定があればそれを使用、なければ先頭の環境（通常production）
+    environment_id = RAILWAY_ENVIRONMENT_ID
+    environment_name = None
+    if not environment_id and env_edges:
+        environment_id = env_edges[0]["node"]["id"]
+        environment_name = env_edges[0]["node"]["name"]
+    else:
+        for e in env_edges:
+            if e["node"]["id"] == environment_id:
+                environment_name = e["node"]["name"]
+                break
+
+    embed = discord.Embed(
+        title=f"[Railway監視] {project_name}",
+        description=f"環境: `{environment_name or '不明'}` ／ 自動更新中（{RAILWAY_MONITOR_REFRESH_SECONDS}秒間隔）",
+        color=discord.Color.blue(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+    # --- CPU / メモリ ---
+    if environment_id:
+        metrics = await _railway_fetch_metrics(environment_id)
+    else:
+        metrics = []
+
+    if metrics:
+        cpu_by_service: dict = {}
+        mem_by_service: dict = {}
+        for m in metrics:
+            measurement = m.get("measurement")
+            service_id = (m.get("tags") or {}).get("serviceId")
+            value = _railway_latest_value(m.get("values", []))
+            if value is None:
+                continue
+            if measurement == "CPU_USAGE":
+                cpu_by_service[service_id] = value
+            elif measurement == "MEMORY_USAGE_GB":
+                mem_by_service[service_id] = value
+
+        if cpu_by_service or mem_by_service:
+            lines = []
+            all_service_ids = set(cpu_by_service.keys()) | set(mem_by_service.keys())
+            for sid in all_service_ids:
+                name = service_name_by_id.get(sid, sid or "(不明なサービス)")
+                cpu_val = cpu_by_service.get(sid)
+                mem_val = mem_by_service.get(sid)
+                cpu_text = f"{cpu_val * 100:.1f}%" if cpu_val is not None else "取得不可"
+                mem_text = f"{mem_val:.2f} GB" if mem_val is not None else "取得不可"
+                lines.append(f"**{name}**\nCPU: {cpu_text} ／ メモリ: {mem_text}")
+            embed.add_field(name="CPU・メモリ使用状況（サービス別）", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(
+                name="CPU・メモリ使用状況",
+                value="直近のメトリクスデータが見つかりませんでした（デプロイ直後等は反映まで時間がかかる場合があります）。",
+                inline=False,
+            )
+    else:
+        embed.add_field(
+            name="CPU・メモリ使用状況",
+            value="取得できませんでした（APIエラー、またはこのプランで利用できない可能性があります）。",
+            inline=False,
+        )
+
+    # --- ストレージ（ボリューム） ---
+    volumes = await _railway_fetch_volumes()
+    if volumes:
+        lines = []
+        for vol in volumes:
+            vol_name = vol.get("name", "(名称未設定)")
+            instances = vol.get("volumeInstances", {}).get("edges", [])
+            for inst in instances:
+                node = inst["node"]
+                current_mb = node.get("currentSizeMB")
+                size_mb = node.get("sizeMB")
+                if current_mb is not None and size_mb:
+                    percent = current_mb / size_mb * 100
+                    lines.append(f"**{vol_name}**: {current_mb:,.0f} MB / {size_mb:,.0f} MB（{percent:.1f}%）")
+                elif current_mb is not None:
+                    lines.append(f"**{vol_name}**: {current_mb:,.0f} MB使用中（上限不明）")
+        if lines:
+            embed.add_field(name="ストレージ（ボリューム）使用状況", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="ストレージ（ボリューム）使用状況", value="このプロジェクトにボリュームは見つかりませんでした。", inline=False)
+    else:
+        embed.add_field(
+            name="ストレージ（ボリューム）使用状況",
+            value="取得できませんでした（ボリューム未作成、またはAPIエラーの可能性があります）。",
+            inline=False,
+        )
+
+    # --- 料金 ---
+    cost = await _railway_fetch_estimated_cost()
+    if cost is not None:
+        embed.add_field(name="今月の推定使用料金", value=f"${cost:.2f}", inline=False)
+    else:
+        embed.add_field(
+            name="今月の推定使用料金",
+            value="取得できませんでした（このAPIトークン・プランでは料金情報を取得できない場合があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。",
+            inline=False,
+        )
+
+    embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります")
+    return embed
+
+
+async def _railway_monitor_update_loop(guild_id: int, channel_id: int, message_id: int):
+    """
+    設置した埋め込みメッセージを RAILWAY_MONITOR_REFRESH_SECONDS 間隔で編集し続け、
+    Railwayの使用状況を常時表示するバックグラウンドタスクです。
+    """
+    await bot.wait_until_ready()
+    try:
+        while True:
+            await asyncio.sleep(RAILWAY_MONITOR_REFRESH_SECONDS)
+            key = (guild_id, channel_id)
+            if key not in _railway_monitor_sessions:
+                return  # /railway_monitor stop 等でセッションが削除されていたら終了
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                continue
+            try:
+                message = await channel.fetch_message(message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                print(f"[Railway監視] メッセージ取得に失敗したため監視ループを終了します（channel_id={channel_id}）。")
+                _railway_monitor_sessions.pop(key, None)
+                return
+            try:
+                embed = await _railway_build_status_embed()
+                await message.edit(embed=embed)
+            except Exception as e:
+                print(f"[Railway監視] 埋め込みの自動更新に失敗しました: {e}")
+    except asyncio.CancelledError:
+        raise
+
+
+railway_group = app_commands.Group(name="railway", description="【オーナー限定】RailwayのCPU/メモリ/ストレージ/料金状況の確認")
+
+
+@railway_group.command(name="status", description="【オーナー限定】現在のRailway使用状況（CPU/メモリ/ストレージ/料金）を1回だけ表示します")
+async def railway_status_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    await interaction.response.defer(thinking=True, ephemeral=False)
+    embed = await _railway_build_status_embed()
+    await interaction.followup.send(embed=embed)
+
+
+@railway_group.command(name="monitor_start", description="【オーナー限定】このチャンネルにRailway使用状況を常時表示する埋め込みを設置します")
+async def railway_monitor_start_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("このコマンドはサーバー内のチャンネルで実行してください。", ephemeral=True)
+        return
+
+    key = (interaction.guild.id, interaction.channel.id)
+    if key in _railway_monitor_sessions:
+        await interaction.response.send_message(
+            "このチャンネルには既にRailway監視の埋め込みが設置されています。"
+            "先に `/railway monitor_stop` で停止してから再度実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=False)
+    embed = await _railway_build_status_embed()
+    message = await interaction.channel.send(embed=embed)
+
+    task = asyncio.create_task(_railway_monitor_update_loop(interaction.guild.id, interaction.channel.id, message.id))
+    _railway_monitor_sessions[key] = {"message_id": message.id, "task": task}
+
+    await interaction.followup.send(
+        f"このチャンネルにRailway監視の埋め込みを設置しました。{RAILWAY_MONITOR_REFRESH_SECONDS}秒ごとに自動更新されます。\n"
+        f"停止するには `/railway monitor_stop` を実行してください。",
+        ephemeral=True,
+    )
+
+
+@railway_group.command(name="monitor_stop", description="【オーナー限定】このチャンネルのRailway常時表示埋め込みの自動更新を停止します")
+async def railway_monitor_stop_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("このコマンドはサーバー内のチャンネルで実行してください。", ephemeral=True)
+        return
+
+    key = (interaction.guild.id, interaction.channel.id)
+    session = _railway_monitor_sessions.pop(key, None)
+    if session is None:
+        await interaction.response.send_message("このチャンネルにはRailway監視の埋め込みが設置されていません。", ephemeral=True)
+        return
+
+    task = session.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+
+    await interaction.response.send_message("Railway監視の自動更新を停止しました（設置済みの埋め込みメッセージ自体は残ります）。", ephemeral=True)
+
+
+bot.tree.add_command(railway_group)
 
 
 async def voice_sound_name_autocomplete(interaction: discord.Interaction, current: str):
