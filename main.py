@@ -141,6 +141,27 @@ NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY", "")
 # いずれか1つでもWeb検索APIキーが設定されていれば、Web検索機能（ツール）自体をAIに提示する。
 WEB_SEARCH_AVAILABLE = bool(TAVILY_API_KEY or EXA_API_KEY or FIRECRAWL_API_KEY or NEWSDATA_API_KEY)
 
+# --- mem0（AIチャットの長期記憶）---
+# 既存の会話履歴（_ai_chat_histories）はチャンネル単位・1時間TTL・直近10往復までの「短期記憶」で、
+# Bot再起動やチャンネルを跨ぐと引き継がれない。mem0はこれとは別レイヤーとして、
+# ユーザーごとの長期的な事実・好み（例:「甘いものが苦手」「猫を飼っている」）を
+# サーバー・チャンネルを跨いで覚えておくための機能。
+# mem0公式のクラウドAPI（https://app.mem0.ai）を利用するため、APIキーの取得が必要。
+# 未設定（MEM0_API_KEY未設定）の場合は長期記憶機能自体が無効になり、
+# 既存の短期記憶のみで動作する（既存の動作と同じ）。
+MEM0_API_KEY = os.getenv("MEM0_API_KEY", "")
+MEM0_AVAILABLE = False
+_mem0_client = None
+if MEM0_API_KEY:
+    try:
+        from mem0 import MemoryClient as _Mem0MemoryClient
+        _mem0_client = _Mem0MemoryClient(api_key=MEM0_API_KEY)
+        MEM0_AVAILABLE = True
+    except ImportError:
+        print("[mem0] mem0aiパッケージが未インストールのため、長期記憶機能は無効です（pip install mem0ai で有効化できます）。")
+    except Exception as e:
+        print(f"[mem0] クライアント初期化エラー: {e}。長期記憶機能は無効です。")
+
 # --- 画像生成API（/image コマンド） ---
 # 1社の無料枠上限・障害時でも機能が完全に止まらないよう、優先順位付きでフォールバックする。
 # 優先順位: Cloudflare Workers AI（要アカウント・APIトークン、1日あたりの無料枠あり） →
@@ -607,6 +628,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
         ("ai_chat_bot_reply_max_turns", 4),     # 1つの発言連鎖につき、こちらが連続で応答する最大ターン数（無限ループ防止）
         ("ai_chat_bot_reply_cooldown_seconds", 15),  # 同じチャンネルでBotへ応答してから次に応答するまでの最短間隔（秒）
+        # --- AIチャット：mem0による長期記憶（ユーザーごとの事実・好みをサーバー横断で記憶）---
+        ("ai_chat_memory_enabled", True),  # True: mem0が利用可能な環境（MEM0_API_KEY設定済み）であれば長期記憶を使用する。管理者が /ai_chat set_memory で切り替え
         # --- サーバー活動のAIサマリー機能 ---
         ("ai_summary_enabled", False),        # True: 毎週の定期自動実行を有効化
         ("ai_summary_channel_id", None),      # サマリーを投稿するチャンネルID
@@ -5513,6 +5536,119 @@ def _ai_chat_clear_history(channel_id: int, user_id: Optional[int] = None):
         _ai_chat_histories.pop(key, None)
 
 
+# --------------------------------------------------------------------
+# mem0 長期記憶ヘルパー
+# --------------------------------------------------------------------
+# 会話履歴（_ai_chat_histories）が「直近の文脈」を覚える短期記憶なのに対し、
+# mem0は「ユーザーについての事実・好み」をサーバー・チャンネルを跨いで覚える長期記憶として使う。
+# user_idはDiscordユーザーIDをそのまま文字列化して使うため、同じユーザーであれば
+# どのサーバー・チャンネルで会話しても同じ記憶を参照できる。
+# API呼び出しの失敗（レート制限・ネットワークエラー等）はAIチャット本体の応答を止めないよう、
+# 呼び出し側で例外を握りつぶして「記憶なし」として続行できる設計にする。
+
+_MEM0_SEARCH_TIMEOUT_SECONDS = 5    # 検索が遅いとAI応答全体が遅延するため、短めのタイムアウトを設ける
+_MEM0_ADD_TIMEOUT_SECONDS = 10
+_MEM0_SEARCH_LIMIT = 5              # system_promptに埋め込む記憶の最大件数（多すぎるとトークン消費・ノイズが増える）
+
+
+def _mem0_is_enabled(guild_config: Optional[dict]) -> bool:
+    """この呼び出しでmem0長期記憶を使うべきかどうかを判定します。"""
+    if not MEM0_AVAILABLE:
+        return False
+    if guild_config is not None and not guild_config.get("ai_chat_memory_enabled", True):
+        return False
+    return True
+
+
+async def _mem0_search_memories(user_id: int, query: str) -> list:
+    """
+    ユーザーの長期記憶から、今回の質問に関連しそうなものを検索して文字列のリストで返します。
+    見つからない・エラー・タイムアウトの場合は空リストを返します（呼び出し側は必ずこれを前提にする）。
+    """
+    if not query or not query.strip():
+        return []
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_mem0_client.search, query, user_id=str(user_id), limit=_MEM0_SEARCH_LIMIT),
+            timeout=_MEM0_SEARCH_TIMEOUT_SECONDS
+        )
+        # mem0のレスポンス形式はSDKバージョンによって {"results": [...]} だったり list 直接だったりするため両対応
+        items = results.get("results", results) if isinstance(results, dict) else results
+        memories = []
+        for item in (items or []):
+            text = item.get("memory") if isinstance(item, dict) else None
+            if text:
+                memories.append(text)
+        return memories
+    except asyncio.TimeoutError:
+        print(f"[mem0] 検索がタイムアウトしました（{_MEM0_SEARCH_TIMEOUT_SECONDS}秒）。記憶なしで続行します。")
+        return []
+    except Exception as e:
+        print(f"[mem0] 検索エラー: {e}。記憶なしで続行します。")
+        return []
+
+
+def _mem0_build_context_block(memories: list) -> str:
+    """検索で得た記憶リストを、system_promptに埋め込むための説明ブロックに整形します。"""
+    if not memories:
+        return ""
+    lines = "\n".join(f"- {m}" for m in memories)
+    return (
+        "\n\n[このユーザーについて過去に記憶した情報（参考程度に、矛盾があれば今回の発言を優先してください）]\n"
+        f"{lines}"
+    )
+
+
+async def _mem0_add_memory(user_id: int, user_content: str, assistant_content: str):
+    """
+    今回の往復をmem0に記憶させます（非同期・失敗しても他処理に影響しないようログのみ）。
+    mem0側で「記憶する価値があるか」の判定・重複排除・更新まで自動で行われるため、
+    呼び出し側は単純に往復をそのまま渡せばよい。
+    """
+    if not user_content or not user_content.strip():
+        return
+    try:
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ]
+        await asyncio.wait_for(
+            asyncio.to_thread(_mem0_client.add, messages, user_id=str(user_id)),
+            timeout=_MEM0_ADD_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        print(f"[mem0] 記憶の保存がタイムアウトしました（{_MEM0_ADD_TIMEOUT_SECONDS}秒）。")
+    except Exception as e:
+        print(f"[mem0] 記憶の保存エラー: {e}")
+
+
+async def _mem0_get_all_memories(user_id: int) -> list:
+    """ユーザーの長期記憶を全件取得します（/ai_chat memory list 用）。エラー時は空リスト。"""
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_mem0_client.get_all, user_id=str(user_id)),
+            timeout=_MEM0_SEARCH_TIMEOUT_SECONDS
+        )
+        items = results.get("results", results) if isinstance(results, dict) else results
+        return items or []
+    except Exception as e:
+        print(f"[mem0] 全件取得エラー: {e}")
+        return []
+
+
+async def _mem0_delete_all_memories(user_id: int) -> bool:
+    """ユーザーの長期記憶を全件削除します（/ai_chat memory forget 用）。成功時True。"""
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_mem0_client.delete_all, user_id=str(user_id)),
+            timeout=_MEM0_ADD_TIMEOUT_SECONDS
+        )
+        return True
+    except Exception as e:
+        print(f"[mem0] 全件削除エラー: {e}")
+        return False
+
+
 # {(guild_id, user_id): last_request_epoch_seconds} — クールダウン（連投制限）用の直近リクエスト時刻
 _ai_chat_last_request: dict = {}
 
@@ -8736,6 +8872,12 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     )
     model = user_setting["model"] or None  # Noneなら _ai_chat_call_groq側でGROQ_MODELが使われる
 
+    # mem0による長期記憶の検索（サーバー・チャンネルを跨いで覚えている、このユーザーについての情報）
+    use_memory = _mem0_is_enabled(guild_config)
+    if use_memory and content:
+        memories = await _mem0_search_memories(message.author.id, content)
+        system_prompt += _mem0_build_context_block(memories)
+
     history = _ai_chat_get_history(message.channel.id, message.author.id)
 
     if image_url is not None:
@@ -8832,6 +8974,10 @@ async def _handle_ai_chat_message(message: discord.Message, guild_config: dict):
     # 添付画像のURLは時間経過で失効するため、履歴として持ち回らせない設計。
     history_user_content = content if content else "（画像を送信）"
     _ai_chat_append_history(message.channel.id, message.author.id, history_user_content, reply_text)
+
+    # mem0への記憶保存はレイテンシに影響させないよう、応答送信を待たせずバックグラウンドで実行する
+    if use_memory and history_user_content and history_user_content != "（画像を送信）":
+        asyncio.create_task(_mem0_add_memory(message.author.id, history_user_content, reply_text))
 
     # Discordの1メッセージ2000文字制限に合わせて分割送信
     chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
@@ -9026,7 +9172,16 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
     # 履歴キー: DM/グループDM/サーバーいずれもチャンネルID単位（既存の自動応答と同じ仕組みを再利用）
     channel_id = interaction.channel_id
     history = _ai_chat_get_history(channel_id, interaction.user.id)
-    messages = [{"role": "system", "content": _ai_chat_finalize_system_prompt(system_prompt, guild_config=guild_config)}] + history + [
+
+    final_system_prompt = _ai_chat_finalize_system_prompt(system_prompt, guild_config=guild_config)
+
+    # mem0による長期記憶の検索（サーバー・チャンネルを跨いで覚えている、このユーザーについての情報）
+    use_memory = _mem0_is_enabled(guild_config)
+    if use_memory:
+        memories = await _mem0_search_memories(interaction.user.id, 質問)
+        final_system_prompt += _mem0_build_context_block(memories)
+
+    messages = [{"role": "system", "content": final_system_prompt}] + history + [
         {"role": "user", "content": 質問}
     ]
 
@@ -9065,6 +9220,10 @@ async def ai_command(interaction: discord.Interaction, 質問: str):
         reply_text = "（応答の生成に失敗しました。もう一度お試しください）"
 
     _ai_chat_append_history(channel_id, interaction.user.id, 質問, reply_text)
+
+    # mem0への記憶保存はレイテンシに影響させないよう、応答送信を待たせずバックグラウンドで実行する
+    if use_memory:
+        asyncio.create_task(_mem0_add_memory(interaction.user.id, 質問, reply_text))
 
     # Discordの1メッセージ2000文字制限に合わせて分割送信
     chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)] or [""]
@@ -9477,38 +9636,105 @@ def _profile_card_sanitize_text(font, text: str) -> str:
 def _badge_generate_image(font_path: str, name: str, symbol: str, color: tuple, size: int = 96) -> "Image.Image":
     """
     バッジのデザインをその場で自動生成します（PIL製、外部素材不要）。
-    円形グラデーション＋縁取り＋中央に記号（絵文字1文字 or バッジ名の頭文字）を描画したRGBA画像を返します。
-    プロフィールカード合成用に呼び出し側でリサイズして使うことを想定し、少し大きめ(96px)で生成します。
+    「宝石調のメダル」を模したデザイン：外側の縁取りリング（金属風の二重リング）＋
+    中央の色付き宝石（放射状グラデーション＋斜めのハイライト）＋外周のドロップシャドウ、
+    という構成で立体感を出します。
+    4倍の解像度で描画してから縮小する（スーパーサンプリング）ことで、
+    フチのギザギザを無くし滑らかな仕上がりにしています。
     """
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    SS = 4  # スーパーサンプリング倍率（この倍率で描いてから最終サイズへLANCZOS縮小する）
+    S = size * SS
+    cx, cy = S / 2, S / 2
+
+    def _clamp(v):
+        return max(0, min(255, int(v)))
+
+    def _lighten(c, amt):
+        return tuple(_clamp(v + amt) for v in c)
+
+    def _darken(c, amt):
+        return tuple(_clamp(v - amt) for v in c)
 
     r, g, b = color
-    # 中心を明るく、外周を暗くした放射状グラデーションで立体感を出す
-    light = (min(255, r + 60), min(255, g + 60), min(255, b + 60))
-    dark = (max(0, r - 40), max(0, g - 40), max(0, b - 40))
-    cx, cy = size / 2, size / 2
-    max_r = size / 2
-    for radius in range(int(max_r), 0, -1):
-        t = radius / max_r
+    canvas = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+
+    # --- 1. 外周の柔らかいグロー（バッジ本体より少し大きく、ぼかして下に敷く） ---
+    glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    glow_r = S * 0.47
+    gd.ellipse((cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r), fill=(r, g, b, 130))
+    glow = glow.filter(ImageFilter.GaussianBlur(S * 0.05))
+    canvas = Image.alpha_composite(canvas, glow)
+
+    # --- 2. ドロップシャドウ（本体よりやや下にオフセットした黒いぼかし楕円） ---
+    shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    shadow_r = S * 0.40
+    sd.ellipse((cx - shadow_r, cy - shadow_r + S * 0.035, cx + shadow_r, cy + shadow_r + S * 0.035),
+               fill=(0, 0, 0, 110))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(S * 0.025))
+    canvas = Image.alpha_composite(canvas, shadow)
+
+    # --- 3. 金属風の縁取りリング（外側から内側へ、明暗を交互に重ねて金属の反射を疑似的に表現） ---
+    ring_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(ring_layer)
+    outer_r = S * 0.40
+    # ベースのリング色は、バッジカラーを白側に大きく寄せた「アンティークゴールド風」の中立色にすることで
+    # どのバッジカラーでも馴染むようにする
+    ring_base = _lighten((r, g, b), 40)
+    ring_tones = [
+        (outer_r * 1.00, _darken(ring_base, 70)),
+        (outer_r * 0.94, _lighten(ring_base, 30)),
+        (outer_r * 0.88, _darken(ring_base, 40)),
+        (outer_r * 0.83, _lighten(ring_base, 60)),
+    ]
+    for radius, tone in ring_tones:
+        rd.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(*tone, 255))
+    canvas = Image.alpha_composite(canvas, ring_layer)
+
+    # --- 4. 中央の「宝石」部分：放射状グラデーション（中心が明るく外周が暗い） ---
+    gem_layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    gd2 = ImageDraw.Draw(gem_layer)
+    gem_r = outer_r * 0.76
+    light = _lighten((r, g, b), 65)
+    dark = _darken((r, g, b), 55)
+    steps = 60
+    for i in range(steps, 0, -1):
+        t = i / steps
+        radius = gem_r * t
         rr = int(dark[0] + (light[0] - dark[0]) * (1 - t))
         gg = int(dark[1] + (light[1] - dark[1]) * (1 - t))
         bb = int(dark[2] + (light[2] - dark[2]) * (1 - t))
-        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(rr, gg, bb, 255))
+        gd2.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(rr, gg, bb, 255))
+    canvas = Image.alpha_composite(canvas, gem_layer)
 
-    # 光沢のハイライト（左上に薄い白丸）
-    highlight = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(highlight)
-    hd.ellipse((size * 0.18, size * 0.12, size * 0.55, size * 0.42), fill=(255, 255, 255, 70))
-    highlight = highlight.filter(ImageFilter.GaussianBlur(6))
-    img = Image.alpha_composite(img, highlight)
-    draw = ImageDraw.Draw(img)
+    # --- 5. 宝石表面の斜めハイライト（左上に楕円形の光沢、ガラス質の反射感を出す） ---
+    shine = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    shd = ImageDraw.Draw(shine)
+    shd.ellipse(
+        (cx - gem_r * 0.62, cy - gem_r * 0.70, cx + gem_r * 0.05, cy - gem_r * 0.05),
+        fill=(255, 255, 255, 110)
+    )
+    shine = shine.filter(ImageFilter.GaussianBlur(S * 0.02))
+    canvas = Image.alpha_composite(canvas, shine)
+    # 小さく鋭いキャッチライト（点状のハイライトで宝石らしいきらめきを追加）
+    sharp_shine = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ssd = ImageDraw.Draw(sharp_shine)
+    catch_r = gem_r * 0.10
+    catch_x, catch_y = cx - gem_r * 0.32, cy - gem_r * 0.40
+    ssd.ellipse((catch_x - catch_r, catch_y - catch_r, catch_x + catch_r, catch_y + catch_r), fill=(255, 255, 255, 190))
+    sharp_shine = sharp_shine.filter(ImageFilter.GaussianBlur(S * 0.006))
+    canvas = Image.alpha_composite(canvas, sharp_shine)
 
-    # 外周の縁取り
-    draw.ellipse((2, 2, size - 2, size - 2), outline=(255, 255, 255, 200), width=3)
+    draw = ImageDraw.Draw(canvas)
 
-    # 中央のシンボル文字（絵文字等でフォント未対応なら、バッジ名の先頭1文字にフォールバック）
-    symbol_font = _profile_card_load_font(font_path, int(size * 0.46), "Bold")
+    # --- 6. リングの内側の輪郭線（宝石とリングの境目を軽く縁取りして引き締める） ---
+    draw.ellipse((cx - gem_r, cy - gem_r, cx + gem_r, cy + gem_r), outline=(*_darken((r, g, b), 80), 200), width=max(1, int(S * 0.006)))
+    # 最外周の輪郭線
+    draw.ellipse((cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r), outline=(*_darken(ring_base, 90), 220), width=max(1, int(S * 0.006)))
+
+    # --- 7. 中央のシンボル文字（絵文字等でフォント未対応なら、バッジ名の先頭1文字にフォールバック） ---
+    symbol_font = _profile_card_load_font(font_path, int(gem_r * 1.15), "Bold")
     display_symbol = symbol.strip() if symbol else ""
     if not display_symbol or not _profile_card_glyph_supported(symbol_font, display_symbol[0]):
         fallback = _profile_card_sanitize_text(symbol_font, name.strip()) if name else ""
@@ -9518,12 +9744,15 @@ def _badge_generate_image(font_path: str, name: str, symbol: str, color: tuple, 
 
     bbox = draw.textbbox((0, 0), display_symbol, font=symbol_font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(
-        (cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]),
-        display_symbol, font=symbol_font, fill=(255, 255, 255, 255)
-    )
+    text_x, text_y = cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]
+    # 文字の視認性を確保するため、薄い影を1段挟んでから本体の文字を描く
+    shadow_offset = max(1, S * 0.008)
+    draw.text((text_x + shadow_offset, text_y + shadow_offset), display_symbol, font=symbol_font, fill=(0, 0, 0, 90))
+    draw.text((text_x, text_y), display_symbol, font=symbol_font, fill=(255, 255, 255, 255))
 
-    return img
+    # --- 8. 高解像度で描いた画像を最終サイズへ縮小（アンチエイリアス効果でフチが滑らかになる） ---
+    result = canvas.resize((size, size), Image.LANCZOS)
+    return result
 
 
 def _profile_card_make_circle_avatar(img: "Image.Image", size: int, border_color, border_width: int) -> "Image.Image":
@@ -13765,6 +13994,184 @@ async def ai_chat_set_search_provider(interaction: discord.Interaction):
     view = AIChatSearchProviderView(interaction.guild.id, current_order_ids, is_custom=is_custom)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+
+# --------------------------------------------------------------------
+# /ai_chat set_memory, /ai_chat memory — mem0による長期記憶のON/OFF・閲覧・削除
+# --------------------------------------------------------------------
+
+class AIChatMemoryToggleView(discord.ui.View):
+    """
+    /ai_chat set_memory で表示される、mem0長期記憶のON/OFFをボタン1つで切り替えられるビュー。
+    Web検索のトグル（AIChatSearchToggleView）と同じ構成。
+    """
+    def __init__(self, guild_id: int, enabled: bool):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self._update_button_style(enabled)
+
+    def _update_button_style(self, enabled: bool):
+        self.toggle_button.label = "🔴 長期記憶をOFFにする" if enabled else "🟢 長期記憶をONにする"
+        self.toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+
+    @discord.ui.button(label="切り替え", style=discord.ButtonStyle.secondary)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("このボタンは管理者のみ操作できます。", ephemeral=True)
+            return
+
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(self.guild_id))
+        current = guild_config.get("ai_chat_memory_enabled", True)
+        new_value = not current
+        guild_config["ai_chat_memory_enabled"] = new_value
+        save_data(all_data)
+
+        self._update_button_style(new_value)
+
+        embed = discord.Embed(
+            title="AIチャット 長期記憶（mem0）",
+            description=(
+                f"このサーバーでの設定を **{'✅ 有効' if new_value else '⏸️ 無効'}** に変更しました。\n\n"
+                + ("AIがユーザーごとの事実・好みを覚え、サーバー・チャンネルを跨いで会話に活かします。"
+                   if new_value else
+                   "AIは長期記憶を参照・記録せず、直近の会話履歴のみで応答します。")
+            ),
+            color=discord.Color.green() if new_value else discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@ai_chat_group.command(name="set_memory", description="【管理者専用】AIチャットの長期記憶（mem0）機能を、ボタン一つでON/OFFできます")
+async def ai_chat_set_memory(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
+        return
+
+    if not MEM0_AVAILABLE:
+        await interaction.response.send_message(
+            "❌ 長期記憶機能（mem0）用のAPIキーがBotに設定されていないため、このサーバーでON/OFFを切り替えても"
+            "実際の動作は変わりません（常に長期記憶なしで応答します）。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    memory_enabled_for_guild = guild_config.get("ai_chat_memory_enabled", True)
+
+    embed = discord.Embed(
+        title="AIチャット 長期記憶（mem0）",
+        description=(
+            f"現在の設定: **{'✅ 有効' if memory_enabled_for_guild else '⏸️ 無効'}**\n\n"
+            "有効にすると、AIはこのサーバーでの会話からユーザーごとの事実・好みを覚え、"
+            "別のサーバーやDMでの会話にも活かします。\n"
+            "下のボタンで切り替えできます。"
+        ),
+        color=discord.Color.green() if memory_enabled_for_guild else discord.Color.orange()
+    )
+    view = AIChatMemoryToggleView(interaction.guild.id, memory_enabled_for_guild)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+ai_chat_memory_group = app_commands.Group(name="memory", description="AIチャットの長期記憶（mem0）を自分で確認・削除します", parent=ai_chat_group)
+
+
+@ai_chat_memory_group.command(name="list", description="AIチャットがあなたについて覚えている長期記憶の一覧を確認します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def ai_chat_memory_list(interaction: discord.Interaction):
+    if not MEM0_AVAILABLE:
+        await interaction.response.send_message(
+            "長期記憶機能（mem0）はこのBotで設定されていないため、記憶は保存されていません。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    memories = await _mem0_get_all_memories(interaction.user.id)
+
+    if not memories:
+        await interaction.followup.send(
+            "あなたについて記憶している情報はまだありません。AIチャットで会話すると、"
+            "覚えておくべき情報が自動的に蓄積されていきます。",
+            ephemeral=True
+        )
+        return
+
+    lines = []
+    for m in memories[:25]:
+        text = m.get("memory") if isinstance(m, dict) else str(m)
+        if text:
+            lines.append(f"・{text}")
+
+    embed = discord.Embed(
+        title="[AIチャット] あなたについての長期記憶",
+        description="\n".join(lines) if lines else "（表示できる記憶がありません）",
+        color=discord.Color.blue()
+    )
+    if len(memories) > 25:
+        embed.set_footer(text=f"他 {len(memories) - 25} 件（表示は先頭25件まで）／ `/ai_chat memory forget` で全て削除できます")
+    else:
+        embed.set_footer(text="`/ai_chat memory forget` でこれらの記憶を全て削除できます")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class AIChatMemoryForgetConfirmView(discord.ui.View):
+    """長期記憶の全削除を実行する前の最終確認ボタンです（取り消せない操作のため一段階挟みます）。"""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self._done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("これはあなたの確認ではありません。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="全て削除する", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            await interaction.response.send_message("この操作は既に処理済みです。", ephemeral=True)
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+
+        success = await _mem0_delete_all_memories(self.user_id)
+        if success:
+            await interaction.response.edit_message(content="あなたについての長期記憶を全て削除しました。", embed=None, view=self)
+        else:
+            await interaction.response.edit_message(
+                content="削除中にエラーが発生しました。時間をおいて再度お試しください。", embed=None, view=self
+            )
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._done:
+            return
+        self._done = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="削除をキャンセルしました。", embed=None, view=self)
+
+
+@ai_chat_memory_group.command(name="forget", description="AIチャットがあなたについて覚えている長期記憶を全て削除します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def ai_chat_memory_forget(interaction: discord.Interaction):
+    if not MEM0_AVAILABLE:
+        await interaction.response.send_message(
+            "長期記憶機能（mem0）はこのBotで設定されていないため、削除できる記憶はありません。", ephemeral=True
+        )
+        return
+
+    view = AIChatMemoryForgetConfirmView(interaction.user.id)
+    await interaction.response.send_message(
+        "あなたについての長期記憶を**全て**削除します。この操作は取り消せません。よろしいですか？",
+        view=view,
+        ephemeral=True
+    )
 
 
 @ai_chat_group.command(name="user_config", description="【オーナー限定】特定のユーザーだけAIチャットの設定（使うモデル・人格）を変えられます")
