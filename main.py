@@ -17433,6 +17433,120 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
     )
 
 
+# --------------------------------------------------------------------
+# /automod panel - お洒落なパネルUI（太字タイトル＋現在値＋セレクトメニュー）
+# --------------------------------------------------------------------
+# 表示ラベル・保存キー・機能有効化に必要なAPIキー未設定時の警告文・補足注記を1箇所にまとめ、
+# /automod toggle（コマンド引数形式）と /automod panel（セレクトメニュー形式）の両方から
+# 同じ定義を参照する。
+AUTOMOD_TOGGLE_DEFS = [
+    {"value": "spam", "label": "スパム検知", "key": "automod_spam_enabled"},
+    {"value": "invite", "label": "招待リンク削除", "key": "automod_invite_enabled"},
+    {"value": "ngword", "label": "NGワード検知", "key": "automod_ng_words_enabled"},
+    {
+        "value": "ai", "label": "AI自動モデレーション", "key": "automod_ai_enabled",
+        "requires": lambda: bool(GROQ_API_KEY),
+        "requires_error": "GROQ_API_KEY が設定されていないため、AI自動モデレーションを有効化できません。Botの環境変数を確認してください。",
+        "enabled_note": f"判定は{AI_AUTOMOD_BATCH_INTERVAL_SECONDS}秒間隔でまとめて実行されるため、削除まで多少のタイムラグがあります",
+    },
+    {
+        "value": "image_ocr_invite", "label": "画像OCR招待リンク検知", "key": "automod_image_ocr_invite_enabled",
+        "requires": lambda: bool(OCR_SPACE_API_KEY),
+        "requires_error": "OCR_SPACE_API_KEY が設定されていないため、画像OCR招待リンク検知を有効化できません。Botの環境変数を確認してください。",
+        "enabled_note": "テキスト本文の招待リンク削除とは独立した設定です。画像添付があるメッセージのみOCR解析を行います",
+    },
+    {
+        "value": "nsfw_image", "label": "画像NSFW検知", "key": "automod_nsfw_image_enabled",
+        "requires": lambda: bool(GROQ_VISION_MODEL),
+        "requires_error": "GROQ_VISION_MODEL が設定されていないため、画像NSFW検知を有効化できません。Botの環境変数を確認してください。",
+        "enabled_note": "NSFWチャンネルとして設定済みのチャンネルは対象外です。管理者権限を持つユーザーは対象外です",
+    },
+]
+
+
+def _automod_get_def(value: str) -> Optional[dict]:
+    return next((d for d in AUTOMOD_TOGGLE_DEFS if d["value"] == value), None)
+
+
+def _automod_build_panel_embed(cfg: dict) -> discord.Embed:
+    """お洒落なパネルUI用のEmbedを構築します（太字タイトル＋機能ごとの現在値一覧）。"""
+    embed = discord.Embed(title="AutoMod設定", color=discord.Color.blurple())
+    lines = []
+    for d in AUTOMOD_TOGGLE_DEFS:
+        enabled = cfg.get(d["key"], False)
+        mark = "🟢 ON" if enabled else "⚪ OFF"
+        lines.append(f"**{d['label']}**\n現在: {mark}")
+    embed.description = "\n\n".join(lines)
+    return embed
+
+
+class AutomodPanelSelect(discord.ui.Select):
+    """AutoMod設定パネルの「操作を選択」セレクトメニューです。選択した機能をその場でON/OFFトグルします。"""
+    def __init__(self, guild_id: int):
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(label=f"{d['label']} を切り替える", value=d["value"])
+            for d in AUTOMOD_TOGGLE_DEFS
+        ]
+        super().__init__(placeholder="操作を選択", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        target_value = self.values[0]
+        d = _automod_get_def(target_value)
+        if d is None:
+            await interaction.response.send_message("不明な項目です。", ephemeral=True)
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        new_state = not cfg.get(d["key"], False)
+
+        requires = d.get("requires")
+        if new_state and requires and not requires():
+            await interaction.response.send_message(d["requires_error"], ephemeral=True)
+            return
+
+        cfg[d["key"]] = new_state
+        save_data(all_data)
+
+        status = "ON" if new_state else "OFF"
+        note = f"\n-# {d['enabled_note']}" if new_state and d.get("enabled_note") else ""
+        embed = _automod_build_panel_embed(cfg)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+        await interaction.followup.send(
+            f"「{d['label']}」を **{status}** に設定しました。{note}",
+            ephemeral=True
+        )
+
+
+class AutomodPanelView(discord.ui.View):
+    """/automod panel コマンドで表示される、セレクトメニュー形式のAutoMod設定パネルです。"""
+    def __init__(self, guild_id: int, moderator_id: int):
+        super().__init__(timeout=180)
+        self.moderator_id = moderator_id
+        self.add_item(AutomodPanelSelect(guild_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("この操作パネルはコマンド実行者のみ使用できます。", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+@automod_group.command(name="panel", description="【モデレーター専用】自動モデレーションの設定をパネルUIでまとめて確認・切り替えできます")
+async def automod_panel(interaction: discord.Interaction):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    embed = _automod_build_panel_embed(cfg)
+    view = AutomodPanelView(guild_id=interaction.guild.id, moderator_id=interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @automod_group.command(name="ngword_add", description="【モデレーター専用】NGワードを新しく登録できます")
 async def automod_ngword_add(interaction: discord.Interaction, word: str):
     if not await is_moderator(interaction): return
