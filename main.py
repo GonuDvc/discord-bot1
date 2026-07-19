@@ -4085,10 +4085,18 @@ class AntinukeStatusView(discord.ui.LayoutView):
     """/antinuke status 用のComponents V2レイアウト。
     旧来のdiscord.Embedを廃止し、Container + TextDisplay + Separatorで同等の情報を表示する。
     Components V2はdiscord.py 2.6以降で利用可能（本Botのボイス機能・DAVEプロトコル対応と同じバージョン系列のため、
-    ボイス機能との併用に技術的な制約はない）。"""
+    ボイス機能との併用に技術的な制約はない）。
+    「更新」ボタンをContainer内に配置し、押下時に最新の設定でその場を再描画する。"""
 
     def __init__(self, guild: discord.Guild, cfg: dict, footer_text: Optional[str] = None):
         super().__init__(timeout=None)
+        self.guild = guild
+        self.footer_text = footer_text
+        self._render(cfg)
+
+    def _render(self, cfg: dict):
+        self.clear_items()
+        guild = self.guild
 
         enabled = cfg["enabled"]
         accent = discord.Color.blue() if enabled else discord.Color.greyple()
@@ -4123,12 +4131,28 @@ class AntinukeStatusView(discord.ui.LayoutView):
             "**監視対象の操作**\nメンバーBAN / チャンネル削除 / ロール削除 / Webhook作成"
         ))
 
-        if footer_text:
+        if self.footer_text:
             # embed.set_footer相当。"-# " は小さいサブテキスト表示のMarkdown記法。
             container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-            container.add_item(discord.ui.TextDisplay(f"-# {footer_text}"))
+            container.add_item(discord.ui.TextDisplay(f"-# {self.footer_text}"))
+
+        # --- 更新ボタン（Container内のActionRowとして配置） ---
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        refresh_row = discord.ui.ActionRow()
+        refresh_button = discord.ui.Button(label="🔄 更新", style=discord.ButtonStyle.secondary)
+        refresh_button.callback = self._on_refresh
+        refresh_row.add_item(refresh_button)
+        container.add_item(refresh_row)
 
         self.add_item(container)
+
+    async def _on_refresh(self, interaction: discord.Interaction):
+        if not await is_guild_admin(interaction):
+            return
+        all_data = load_data()
+        cfg = get_antinuke_config(all_data, str(self.guild.id))
+        self._render(cfg)
+        await interaction.response.edit_message(view=self)
 
 
 def _build_antinuke_status_view(
@@ -13637,59 +13661,85 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+class ServerStatusView(discord.ui.LayoutView):
+    """/server status 用のComponents V2レイアウト。
+    「更新」ボタンをContainer内に配置し、押下時に最新の設定でその場を再描画する。"""
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self._render()
+
+    def _render(self):
+        self.clear_items()
+        g = self.guild
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(g.id))
+
+        container = discord.ui.Container(accent_color=discord.Color.blue())
+
+        header_text = discord.ui.TextDisplay(
+            f"## {g.name} - 設定状況\nこのサーバーで有効化されている設定一覧です。"
+        )
+        if g.icon:
+            # embed.set_thumbnail相当。Sectionのaccessoryとしてサムネイルを右側に表示する。
+            container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(g.icon.url)))
+        else:
+            container.add_item(header_text)
+        container.add_item(discord.ui.Separator())
+
+        from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
+        to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
+        forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
+        container.add_item(discord.ui.TextDisplay(f"**メッセージ転送設定**\n{forward_status}"))
+
+        v_ch = g.get_channel(cfg.get("verify_channel")) if cfg.get("verify_channel") else None
+        v_role = g.get_role(cfg.get("verify_role")) if cfg.get("verify_role") else None
+        verify_status = f"有効\n・設置ch: {v_ch.mention if v_ch else '削除済'}\n・付与ロール: {v_role.mention if v_role else '削除済'}" if (v_ch or v_role) else "未設定"
+        container.add_item(discord.ui.TextDisplay(f"**サーバー認証設定**\n{verify_status}"))
+
+        a_ch = g.get_channel(cfg.get("announce_channel")) if cfg.get("announce_channel") else None
+        a_role = g.get_role(cfg.get("announce_role")) if cfg.get("announce_role") else None
+        announce_status = f"有効\n・お知らせch: {a_ch.mention if a_ch else '削除済'}\n・メンション対象: {a_role.mention if a_role else '削除済'}" if (a_ch or a_role) else "未設定"
+        container.add_item(discord.ui.TextDisplay(f"**配信・お知らせ設定**\n{announce_status}"))
+
+        m_ch = g.get_channel(cfg.get("mention_trigger_channel")) if cfg.get("mention_trigger_channel") else None
+        m_role = g.get_role(cfg.get("mention_target_role")) if cfg.get("mention_target_role") else None
+        m_msg = cfg.get("mention_custom_message", "未設定（デフォルト文章）")
+        mention_status = f"有効\n・監視ch: {m_ch.mention if m_ch else '削除済'}\n・通知ロール: {m_role.mention if m_role else '削除済'}\n・返信テキスト: `{m_msg}`" if (m_ch or m_role) else "未設定"
+        container.add_item(discord.ui.TextDisplay(f"**自動返信ロールメンション設定**\n{mention_status}"))
+
+        panel_roles_ids = cfg.get("panel_roles", [])
+        valid_panel_roles = [g.get_role(rid).name for rid in panel_roles_ids if g.get_role(rid)]
+        panel_status = f"紐付け済み ({len(valid_panel_roles)}個)\n`{', '.join(valid_panel_roles)}`" if valid_panel_roles else "パネル未登録"
+        container.add_item(discord.ui.TextDisplay(f"**ロールパネル対象**\n{panel_status}"))
+
+        allowed_users = cfg.get("allowed_users", [])
+        allowed_status = ", ".join([f"<@{uid}>" for uid in allowed_users]) if allowed_users else "なし（管理者のみ使用可能）"
+        container.add_item(discord.ui.TextDisplay(f"**コマンド使用許可ユーザー**\n{allowed_status}"))
+
+        # --- 更新ボタン（Container内のActionRowとして配置） ---
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        refresh_row = discord.ui.ActionRow()
+        refresh_button = discord.ui.Button(label="🔄 更新", style=discord.ButtonStyle.secondary)
+        refresh_button.callback = self._on_refresh
+        refresh_row.add_item(refresh_button)
+        container.add_item(refresh_row)
+
+        self.add_item(container)
+
+    async def _on_refresh(self, interaction: discord.Interaction):
+        if not await is_guild_admin(interaction):
+            return
+        self._render()
+        await interaction.response.edit_message(view=self)
+
+
 @server_group.command(name="status", description="今このサーバーの各機能がどう設定されているか確認できます")
 async def server_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction): return
     if not interaction.guild: return
-    g = interaction.guild
-    g_id_str = str(g.id)
-    all_data = load_data()
-    cfg = get_guild_config(all_data, g_id_str)
-
-    container = discord.ui.Container(accent_color=discord.Color.blue())
-
-    header_text = discord.ui.TextDisplay(
-        f"## {g.name} - 設定状況\nこのサーバーで有効化されている設定一覧です。"
-    )
-    if g.icon:
-        # embed.set_thumbnail相当。Sectionのaccessoryとしてサムネイルを右側に表示する。
-        container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(g.icon.url)))
-    else:
-        container.add_item(header_text)
-    container.add_item(discord.ui.Separator())
-
-    from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
-    to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
-    forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
-    container.add_item(discord.ui.TextDisplay(f"**メッセージ転送設定**\n{forward_status}"))
-
-    v_ch = g.get_channel(cfg.get("verify_channel")) if cfg.get("verify_channel") else None
-    v_role = g.get_role(cfg.get("verify_role")) if cfg.get("verify_role") else None
-    verify_status = f"有効\n・設置ch: {v_ch.mention if v_ch else '削除済'}\n・付与ロール: {v_role.mention if v_role else '削除済'}" if (v_ch or v_role) else "未設定"
-    container.add_item(discord.ui.TextDisplay(f"**サーバー認証設定**\n{verify_status}"))
-
-    a_ch = g.get_channel(cfg.get("announce_channel")) if cfg.get("announce_channel") else None
-    a_role = g.get_role(cfg.get("announce_role")) if cfg.get("announce_role") else None
-    announce_status = f"有効\n・お知らせch: {a_ch.mention if a_ch else '削除済'}\n・メンション対象: {a_role.mention if a_role else '削除済'}" if (a_ch or a_role) else "未設定"
-    container.add_item(discord.ui.TextDisplay(f"**配信・お知らせ設定**\n{announce_status}"))
-
-    m_ch = g.get_channel(cfg.get("mention_trigger_channel")) if cfg.get("mention_trigger_channel") else None
-    m_role = g.get_role(cfg.get("mention_target_role")) if cfg.get("mention_target_role") else None
-    m_msg = cfg.get("mention_custom_message", "未設定（デフォルト文章）")
-    mention_status = f"有効\n・監視ch: {m_ch.mention if m_ch else '削除済'}\n・通知ロール: {m_role.mention if m_role else '削除済'}\n・返信テキスト: `{m_msg}`" if (m_ch or m_role) else "未設定"
-    container.add_item(discord.ui.TextDisplay(f"**自動返信ロールメンション設定**\n{mention_status}"))
-
-    panel_roles_ids = cfg.get("panel_roles", [])
-    valid_panel_roles = [g.get_role(rid).name for rid in panel_roles_ids if g.get_role(rid)]
-    panel_status = f"紐付け済み ({len(valid_panel_roles)}個)\n`{', '.join(valid_panel_roles)}`" if valid_panel_roles else "パネル未登録"
-    container.add_item(discord.ui.TextDisplay(f"**ロールパネル対象**\n{panel_status}"))
-
-    allowed_users = cfg.get("allowed_users", [])
-    allowed_status = ", ".join([f"<@{uid}>" for uid in allowed_users]) if allowed_users else "なし（管理者のみ使用可能）"
-    container.add_item(discord.ui.TextDisplay(f"**コマンド使用許可ユーザー**\n{allowed_status}"))
-
-    view = discord.ui.LayoutView(timeout=None)
-    view.add_item(container)
+    view = ServerStatusView(interaction.guild)
     await interaction.response.send_message(view=view, ephemeral=True)
 
 
