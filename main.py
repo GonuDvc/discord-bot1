@@ -213,6 +213,14 @@ RAILWAY_GRAPHQL_ENDPOINT = "https://backboard.railway.com/graphql/v2"
 # 常時表示（埋め込み自動更新）の更新間隔（秒）。Railwayのメトリクス取得API呼び出し頻度を
 # 抑えるため、デフォルトは60秒。Discord埋め込み編集のレート制限にも配慮した値。
 RAILWAY_MONITOR_REFRESH_SECONDS = int(os.getenv("RAILWAY_MONITOR_REFRESH_SECONDS", "60"))
+# --- Railway Webhook連動ステータス（ビルド中/デプロイ中の自動表示） ---
+# Railwayプロジェクトの Settings → Webhooks で、このBotのURL + "/webhook/railway"
+# （RAILWAY_WEBHOOK_SECRET設定時は "/webhook/railway/<秘密トークン>"）を登録すると、
+# デプロイ状態の変化をリアルタイムでDiscordの視聴ステータスに反映する。
+# RAILWAY_API_TOKEN / RAILWAY_PROJECT_ID が設定されていること（RAILWAY_MONITOR_AVAILABLE）が前提。
+# RAILWAY_WEBHOOK_SECRET は任意だが、第三者に推測されないURLにするため設定を推奨する。
+# 実際の定義（RAILWAY_WEBHOOK_SECRET / RAILWAY_DEPLOY_STATUS_HOLD_SECONDS）は
+# Railway Webhook連動セクション（本ファイル後方）を参照。
 
 
 # --------------------------------------------------------------------
@@ -393,6 +401,14 @@ else:
 
 # Botのカスタムステータステキスト保存用変数
 current_custom_status = None
+
+# --- Railwayデプロイ連動ステータス（Webhook経由） ---
+# デプロイ中（Building/Deploying等）は、current_custom_status やローテーション表示より
+# 優先してこの内容を表示する。デプロイが完了/失敗したら数秒後に自動でクリアし、
+# 通常のローテーション表示に戻る。
+_railway_deploy_status_override: Optional[str] = None
+_railway_deploy_status_clear_task: Optional[asyncio.Task] = None
+
 
 # --------------------------------------------------------------------
 # ステータスローテーション表示用のグローバル状態
@@ -1461,6 +1477,12 @@ async def _status_rotation_loop(client):
     index = 0
     while True:
         try:
+            if _railway_deploy_status_override:
+                # Railwayのデプロイ中は、他の何よりも優先してこの表示を維持する。
+                await _set_presence_text(client, _railway_deploy_status_override, discord.ActivityType.watching)
+                await asyncio.sleep(_status_rotation_interval)
+                continue
+
             if current_custom_status:
                 # カスタムステータスが手動設定されている間はローテーションを休止し、
                 # 固定表示を維持する（update_bot_status側で既に反映済み）。
@@ -19957,6 +19979,120 @@ async def _railway_monitor_update_loop(guild_id: int, channel_id: int, message_i
         raise
 
 
+# --------------------------------------------------------------------
+# Railway Webhook連動: デプロイ中はBotの「視聴中」ステータスを自動更新する
+# --------------------------------------------------------------------
+# Railway側のプロジェクト設定 → Webhooks で、このBotのWebサーバーURL + "/webhook/railway"
+# を登録することで、デプロイ状態の変化（Building/Deploying/Success/Failed等）を
+# リアルタイムで受け取り、Discordのプレゼンス（視聴ステータス）に反映する。
+# 参考: https://docs.railway.com/observability/webhooks
+#
+# Webhookペイロード例:
+# {
+#   "type": "Deployment.building",
+#   "details": {"id": "...", "status": "BUILDING", ...},
+#   "resource": {
+#       "project": {"id": "...", "name": "..."},
+#       "environment": {"id": "...", "name": "..."},
+#       "service": {"id": "...", "name": "..."},
+#       "deployment": {"id": "..."}
+#   },
+#   "timestamp": "..."
+# }
+#
+# 任意設定。RAILWAY_WEBHOOK_SECRETを設定すると、Railway側から送られる署名ヘッダ
+# （未検証仕様のため、まずはURLの秘匿性のみで防御し、判明次第署名検証を追加する）
+# の代わりに、URLパスに秘密のトークンを含める簡易認証を行う。
+RAILWAY_WEBHOOK_SECRET = os.getenv("RAILWAY_WEBHOOK_SECRET", "")
+
+# デプロイ完了・失敗後、何秒間その結果表示を維持してから通常のローテーションに戻すか
+RAILWAY_DEPLOY_STATUS_HOLD_SECONDS = int(os.getenv("RAILWAY_DEPLOY_STATUS_HOLD_SECONDS", "20"))
+
+# Railwayのデプロイ状態(type末尾 or details.status)ごとの日本語表示テキスト。
+# type は "Deployment.<状態>" の形式（例: "Deployment.building"）で送られてくる。
+_RAILWAY_DEPLOY_STATUS_TEXT = {
+    "queued": "キュー待機中",
+    "initializing": "初期化中",
+    "building": "ビルド中",
+    "deploying": "デプロイ中",
+    "success": "デプロイ完了",
+    "failed": "デプロイ失敗",
+    "crashed": "クラッシュ",
+    "removed": "削除済み",
+    "removing": "削除中",
+    "sleeping": "スリープ中",
+}
+
+
+async def _railway_apply_deploy_status(service_name: str, status_key: str):
+    """
+    Webhookで受け取ったデプロイ状態をDiscordの視聴ステータスへ即時反映します。
+    進行中の状態（ビルド中・デプロイ中等）はそのまま表示し続け、
+    完了系の状態（成功・失敗等）は一定時間表示した後、自動的に通常表示へ戻します。
+    """
+    global _railway_deploy_status_override, _railway_deploy_status_clear_task
+
+    status_text = _RAILWAY_DEPLOY_STATUS_TEXT.get(status_key, status_key)
+    display_text = f"{service_name}を{status_text}"
+
+    # 既存のクリア待ちタスクがあればキャンセル（新しいイベントで上書きするため）
+    if _railway_deploy_status_clear_task is not None and not _railway_deploy_status_clear_task.done():
+        _railway_deploy_status_clear_task.cancel()
+        _railway_deploy_status_clear_task = None
+
+    _railway_deploy_status_override = display_text
+    try:
+        await _set_presence_text(bot, display_text, discord.ActivityType.watching)
+    except Exception as e:
+        print(f"[Railway Webhook] プレゼンス即時反映に失敗しました: {e}")
+
+    print(f"[Railway Webhook] ステータス反映: {display_text}")
+
+    # 進行中ではない（＝最終状態）の場合は、一定時間後にオーバーライドを解除する
+    is_terminal = status_key in ("success", "failed", "crashed", "removed", "sleeping")
+    if is_terminal:
+        async def _clear_after_delay():
+            try:
+                await asyncio.sleep(RAILWAY_DEPLOY_STATUS_HOLD_SECONDS)
+                global _railway_deploy_status_override
+                _railway_deploy_status_override = None
+                print("[Railway Webhook] デプロイ状態表示をクリアし、通常表示に戻します。")
+            except asyncio.CancelledError:
+                pass
+
+        _railway_deploy_status_clear_task = asyncio.create_task(_clear_after_delay())
+
+
+async def _railway_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """RailwayのWebhookを受信し、デプロイ状態をBotのステータスへ反映するハンドラです。"""
+    # URLパスに秘密トークンを含める簡易認証（RAILWAY_WEBHOOK_SECRET設定時のみ）
+    if RAILWAY_WEBHOOK_SECRET:
+        token = request.match_info.get("secret", "")
+        if token != RAILWAY_WEBHOOK_SECRET:
+            return aiohttp.web.Response(status=403, text="Forbidden")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return aiohttp.web.Response(status=400, text="Invalid JSON")
+
+    event_type = payload.get("type", "")  # 例: "Deployment.building"
+    if not event_type.startswith("Deployment."):
+        # デプロイ以外のWebhookイベント（ボリューム使用率アラート等）は今回は無視する
+        return aiohttp.web.Response(status=200, text="ignored (not a deployment event)")
+
+    status_key = event_type.split(".", 1)[1].lower() if "." in event_type else ""
+    resource = payload.get("resource", {}) or {}
+    service_name = (resource.get("service") or {}).get("name", "サービス")
+
+    try:
+        await _railway_apply_deploy_status(service_name, status_key)
+    except Exception as e:
+        print(f"[Railway Webhook] 処理中にエラーが発生しました: {e}")
+
+    return aiohttp.web.Response(status=200, text="ok")
+
+
 railway_group = app_commands.Group(name="railway", description="【オーナー限定】RailwayのCPU/メモリ/ストレージ/料金状況の確認")
 
 
@@ -20090,6 +20226,49 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
 
 
 
+
+
+@railway_group.command(name="webhook_url", description="【オーナー限定】RailwayのWebhook設定画面に登録するURLを表示します")
+async def railway_webhook_url_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+
+    if not RAILWAY_MONITOR_AVAILABLE:
+        await interaction.response.send_message(
+            "この機能を使うには先に `RAILWAY_API_TOKEN` / `RAILWAY_PROJECT_ID` を設定してください。",
+            ephemeral=True,
+        )
+        return
+
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    path = f"/webhook/railway/{RAILWAY_WEBHOOK_SECRET}" if RAILWAY_WEBHOOK_SECRET else "/webhook/railway"
+
+    if public_domain:
+        webhook_url = f"https://{public_domain}{path}"
+        description = (
+            f"以下のURLを、Railwayダッシュボード → 対象プロジェクト → **Settings → Webhooks** に登録してください。\n"
+            f"```{webhook_url}```\n"
+            f"登録後、デプロイのビルド/デプロイ中に自動でBotの視聴ステータスが切り替わります。"
+        )
+    else:
+        description = (
+            "環境変数 `RAILWAY_PUBLIC_DOMAIN` が見つかりませんでした。\n"
+            "このサービスの Networking 設定で Public Domain（Generate Domain）を有効にすると、"
+            "自動的にこの環境変数が使えるようになります。\n"
+            f"有効化後のURLは次の形式になります:\n```https://<公開ドメイン>{path}```"
+        )
+        if not RAILWAY_WEBHOOK_SECRET:
+            description += (
+                "\n\n**注意**: `RAILWAY_WEBHOOK_SECRET` が未設定です。"
+                "誰でも推測できるURLになるため、ランダムな文字列を環境変数に設定することを推奨します。"
+            )
+
+    embed = discord.Embed(
+        title="[Railway監視] Webhook設定用URL",
+        description=description,
+        color=discord.Color.blue(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @railway_group.command(name="status", description="【オーナー限定】現在のRailway使用状況（CPU/メモリ/ストレージ/料金）を1回だけ表示します")
@@ -24453,6 +24632,11 @@ async def _start_web_server():
     app.router.add_get("/board/manage", _board_manage_handler)
     app.router.add_post("/board/manage/save", _board_manage_save_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
+    if RAILWAY_MONITOR_AVAILABLE:
+        if RAILWAY_WEBHOOK_SECRET:
+            app.router.add_post("/webhook/railway/{secret}", _railway_webhook_handler)
+        else:
+            app.router.add_post("/webhook/railway", _railway_webhook_handler)
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", OAUTH_PORT)
@@ -28023,9 +28207,13 @@ async def _start_interview(interaction: discord.Interaction):
 
 async def _main():
     """BotとWebサーバーを同時に起動します。"""
-    # OAuth2設定が揃っている場合のみWebサーバーを起動
+    # OAuth2設定、またはRailway Webhook機能（デプロイ連動ステータス）のいずれかが
+    # 有効な場合にWebサーバーを起動する。
     if DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and OAUTH_REDIRECT_URI:
         await _start_web_server()
+    elif RAILWAY_MONITOR_AVAILABLE:
+        await _start_web_server()
+        print("[Webサーバー] OAuth2は未設定ですが、Railway Webhook機能のためWebサーバーを起動しました。")
     else:
         print("[警告] OAuth2の環境変数（DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / OAUTH_REDIRECT_URI）が未設定のため、Webサーバーは起動しません。")
         print("       サーバーブラックリスト機能を使用する場合は、これらの環境変数を設定してください。")
