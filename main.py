@@ -19599,17 +19599,19 @@ async def _railway_fetch_metrics(environment_id: str) -> list:
     """
     指定環境の直近メトリクス（CPU使用量・メモリ使用量）をサービスごとに取得します。
     Railwayのメトリクス測定種別（measurement）: CPU_USAGE（コア数）, MEMORY_USAGE_GB（GB）。
+    groupBy: SERVICE_ID を指定することで、tags.serviceId ごとに値が分解されて返る。
     取得に失敗した場合は空リストを返します（呼び出し側でその旨を表示）。
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now - datetime.timedelta(minutes=10)
     query = """
-    query Metrics($environmentId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
+    query Metrics($environmentId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!, $groupBy: [MetricTag!]) {
         metrics(
             environmentId: $environmentId
             startDate: $startDate
             endDate: $endDate
             measurements: $measurements
+            groupBy: $groupBy
         ) {
             measurement
             tags {
@@ -19627,10 +19629,29 @@ async def _railway_fetch_metrics(environment_id: str) -> list:
         "startDate": start.isoformat(),
         "endDate": now.isoformat(),
         "measurements": ["CPU_USAGE", "MEMORY_USAGE_GB"],
+        "groupBy": ["SERVICE_ID"],
     }
     data = await _railway_graphql_request(query, variables)
     if not data or data.get("metrics") is None:
-        return []
+        # groupBy引数（enum値名）が違う可能性があるため、groupByなしでも一度試す
+        variables_fallback = {k: v for k, v in variables.items() if k != "groupBy"}
+        query_fallback = """
+        query Metrics($environmentId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
+            metrics(
+                environmentId: $environmentId
+                startDate: $startDate
+                endDate: $endDate
+                measurements: $measurements
+            ) {
+                measurement
+                tags { serviceId }
+                values { ts value }
+            }
+        }
+        """
+        data = await _railway_graphql_request(query_fallback, variables_fallback)
+        if not data or data.get("metrics") is None:
+            return []
     metrics = data["metrics"]
     if os.getenv("RAILWAY_MONITOR_DEBUG"):
         print(f"[Railway監視][DEBUG] metrics生データ: {json.dumps(metrics, ensure_ascii=False)[:3000]}")
@@ -19669,21 +19690,37 @@ async def _railway_fetch_volumes() -> list:
     return [v["node"] for v in volumes]
 
 
-async def _railway_fetch_estimated_cost() -> Optional[float]:
+# Railway公式サイト（railway.com/pricing）で公表されている従量課金の単価。
+# 2026年7月時点の値。Railway側の価格改定があれば実際の請求額とズレるため、
+# あくまで「概算」であることを表示側で明記する。
+RAILWAY_PRICE_PER_GB_SECOND_MEMORY = 0.00000386   # メモリ: $/GB秒
+RAILWAY_PRICE_PER_VCPU_SECOND_CPU = 0.00000772    # CPU: $/vCPU秒
+RAILWAY_PRICE_PER_GB_SECOND_VOLUME = 0.00000006   # ボリューム: $/GB秒
+RAILWAY_PRICE_PER_GB_EGRESS = 0.05                # ネットワーク送信(egress): $/GB
+
+
+async def _railway_fetch_usage_totals() -> Optional[dict]:
     """
-    現在の請求期間における、このプロジェクトの推定使用料金（USD）を取得します。
-    Railway側のスキーマ・プランにより取得できない場合はNoneを返します。
+    今月（月初〜現在）のCPU・メモリ・ボリューム・ネットワーク使用量の積算値を取得します。
+    Railway Public APIには金額そのものを返すフィールドが存在しないため、
+    ここで取得した使用量にRailway公式の単価をかけて概算金額を算出する。
+    取得失敗時はNoneを返します。
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     query = """
-    query ProjectUsage($projectId: String!, $startDate: DateTime!, $endDate: DateTime!) {
+    query ProjectUsage($projectId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
         usage(
             projectId: $projectId
             startDate: $startDate
             endDate: $endDate
+            measurements: $measurements
         ) {
-            estimatedCost
+            measurement
+            tags {
+                serviceId
+            }
+            value
         }
     }
     """
@@ -19691,21 +19728,38 @@ async def _railway_fetch_estimated_cost() -> Optional[float]:
         "projectId": RAILWAY_PROJECT_ID,
         "startDate": month_start.isoformat(),
         "endDate": now.isoformat(),
+        "measurements": ["CPU_USAGE", "MEMORY_USAGE_GB", "DISK_USAGE_GB", "NETWORK_TX_GB"],
     }
     data = await _railway_graphql_request(query, variables)
     if not data or data.get("usage") is None:
         return None
-    usage_entries = data["usage"]
-    if isinstance(usage_entries, list):
-        total = 0.0
-        found = False
-        for entry in usage_entries:
-            cost = entry.get("estimatedCost")
-            if cost is not None:
-                total += float(cost)
-                found = True
-        return total if found else None
-    return None
+
+    if os.getenv("RAILWAY_MONITOR_DEBUG"):
+        print(f"[Railway監視][DEBUG] usage生データ: {json.dumps(data['usage'], ensure_ascii=False)[:3000]}")
+
+    totals = {"CPU_USAGE": 0.0, "MEMORY_USAGE_GB": 0.0, "DISK_USAGE_GB": 0.0, "NETWORK_TX_GB": 0.0}
+    for entry in data["usage"]:
+        measurement = entry.get("measurement")
+        value = entry.get("value")
+        if measurement in totals and value is not None:
+            totals[measurement] += float(value)
+    return totals
+
+
+def _railway_estimate_cost_from_usage(totals: dict) -> float:
+    """
+    使用量の積算値（秒単位の値であることを前提）に、Railway公式単価をかけて
+    概算のUSD金額を算出します。
+    注意: Railway APIが返すvalueの単位（秒 or 分 or 時間積算）が公式ドキュメントで
+    明記されていないため、この計算値はあくまで目安。正確な金額はダッシュボードで確認する。
+    """
+    cpu_cost = totals.get("CPU_USAGE", 0.0) * RAILWAY_PRICE_PER_VCPU_SECOND_CPU
+    mem_cost = totals.get("MEMORY_USAGE_GB", 0.0) * RAILWAY_PRICE_PER_GB_SECOND_MEMORY
+    disk_cost = totals.get("DISK_USAGE_GB", 0.0) * RAILWAY_PRICE_PER_GB_SECOND_VOLUME
+    egress_cost = totals.get("NETWORK_TX_GB", 0.0) * RAILWAY_PRICE_PER_GB_EGRESS
+    return cpu_cost + mem_cost + disk_cost + egress_cost
+
+
 
 
 def _railway_latest_value(metric_values: list) -> Optional[float]:
@@ -19850,17 +19904,26 @@ async def _railway_build_status_embed() -> discord.Embed:
             inline=False,
         )
 
-    # --- 料金 ---
-    cost = await _railway_fetch_estimated_cost()
-    if cost is not None:
-        embed.add_field(name="今月の推定使用料金", value=f"${cost:.2f}", inline=False)
+    # --- 料金（概算） ---
+    # Railway Public APIには金額そのものを返すフィールドが存在しないため、
+    # CPU/メモリ/ストレージ/ネットワークの使用量にRailway公式単価をかけて概算する。
+    usage_totals = await _railway_fetch_usage_totals()
+    if usage_totals is not None:
+        estimated_cost = _railway_estimate_cost_from_usage(usage_totals)
+        cost_value = (
+            f"**約 ${estimated_cost:.2f}**（今月・月初からの概算）\n"
+            f"-# Railway公式単価から算出した概算値です。正確な金額は Railway ダッシュボードの Usage ページでご確認ください。"
+        )
+        if os.getenv("RAILWAY_MONITOR_DEBUG"):
+            cost_value += f"\n```使用量積算値: {json.dumps(usage_totals, ensure_ascii=False)}```"
+        embed.add_field(name="今月の推定使用料金（概算）", value=cost_value, inline=False)
     else:
-        cost_value = "取得できませんでした（このAPIトークン・プランでは料金情報を取得できない場合があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。"
+        cost_value = "取得できませんでした（APIエラー、またはこのプランでは使用量データを取得できない可能性があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。"
         if os.getenv("RAILWAY_MONITOR_DEBUG") and _railway_last_graphql_error:
             cost_value += f"\n```{_railway_last_graphql_error[:900]}```"
         embed.add_field(name="今月の推定使用料金", value=cost_value, inline=False)
 
-    embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります")
+    embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります ／ 料金は概算です")
     return embed
 
 
@@ -19994,6 +20057,8 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
     """
     enum_data = await _railway_graphql_request(enum_query, {"name": "MetricMeasurement"})
     metric_measurement_enum = enum_data.get("__type") if enum_data else None
+    metric_tag_enum_data = await _railway_graphql_request(enum_query, {"name": "MetricTag"})
+    metric_tag_enum = metric_tag_enum_data.get("__type") if metric_tag_enum_data else None
 
     output_lines = []
     output_lines.append("=== metrics フィールドの引数定義 ===")
@@ -20004,6 +20069,8 @@ async def railway_debug_schema_command(interaction: discord.Interaction):
     output_lines.append(json.dumps([f["name"] for f in all_fields], ensure_ascii=False, indent=2))
     output_lines.append("\n=== MetricMeasurement（enum全値） ===")
     output_lines.append(json.dumps(metric_measurement_enum, ensure_ascii=False, indent=2))
+    output_lines.append("\n=== MetricTag（groupBy用enum全値） ===")
+    output_lines.append(json.dumps(metric_tag_enum, ensure_ascii=False, indent=2))
     for type_name, type_def in results.items():
         output_lines.append(f"\n=== 型定義: {type_name} ===")
         output_lines.append(json.dumps(type_def, ensure_ascii=False, indent=2))
