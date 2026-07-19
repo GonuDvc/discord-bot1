@@ -19530,8 +19530,12 @@ async def _storage_monitor_loop():
 _railway_monitor_sessions: dict = {}  # {(guild_id, channel_id): {"message_id": int, "task": asyncio.Task}}
 
 
+_railway_last_graphql_error: Optional[str] = None
+
+
 async def _railway_graphql_request(query: str, variables: dict) -> Optional[dict]:
     """Railway GraphQL APIにクエリを送信し、data部分を返します。失敗時はNoneを返します。"""
+    global _railway_last_graphql_error
     if not RAILWAY_MONITOR_AVAILABLE:
         return None
     headers = {
@@ -19548,10 +19552,13 @@ async def _railway_graphql_request(query: str, variables: dict) -> Optional[dict
                 body = await resp.json()
                 if resp.status != 200 or "errors" in body:
                     errs = body.get("errors") if isinstance(body, dict) else None
+                    _railway_last_graphql_error = f"status={resp.status} errors={errs}"
                     print(f"[Railway監視] GraphQLエラー（status={resp.status}）: {errs}")
                     return None
+                _railway_last_graphql_error = None
                 return body.get("data")
     except Exception as e:
+        _railway_last_graphql_error = f"例外: {e}"
         print(f"[Railway監視] GraphQL API呼び出しに失敗しました: {e}")
         return None
 
@@ -19624,7 +19631,10 @@ async def _railway_fetch_metrics(environment_id: str) -> list:
     data = await _railway_graphql_request(query, variables)
     if not data or data.get("metrics") is None:
         return []
-    return data["metrics"]
+    metrics = data["metrics"]
+    if os.getenv("RAILWAY_MONITOR_DEBUG"):
+        print(f"[Railway監視][DEBUG] metrics生データ: {json.dumps(metrics, ensure_ascii=False)[:3000]}")
+    return metrics
 
 
 async def _railway_fetch_volumes() -> list:
@@ -19771,9 +19781,12 @@ async def _railway_build_status_embed() -> discord.Embed:
     if metrics:
         cpu_by_service: dict = {}
         mem_by_service: dict = {}
+        raw_tags_seen = []
         for m in metrics:
             measurement = m.get("measurement")
-            service_id = (m.get("tags") or {}).get("serviceId")
+            tags = m.get("tags") or {}
+            service_id = tags.get("serviceId")
+            raw_tags_seen.append(tags)
             value = _railway_latest_value(m.get("values", []))
             if value is None:
                 continue
@@ -19792,7 +19805,11 @@ async def _railway_build_status_embed() -> discord.Embed:
                 cpu_text = f"{cpu_val * 100:.1f}%" if cpu_val is not None else "取得不可"
                 mem_text = f"{mem_val:.2f} GB" if mem_val is not None else "取得不可"
                 lines.append(f"**{name}**\nCPU: {cpu_text} ／ メモリ: {mem_text}")
-            embed.add_field(name="CPU・メモリ使用状況（サービス別）", value="\n".join(lines)[:1024], inline=False)
+            field_value = "\n".join(lines)[:1024]
+            if os.getenv("RAILWAY_MONITOR_DEBUG"):
+                field_value += f"\n```tags例: {json.dumps(raw_tags_seen[:3], ensure_ascii=False)[:500]}```"
+                field_value += f"\n```登録サービス一覧: {json.dumps(service_name_by_id, ensure_ascii=False)[:500]}```"
+            embed.add_field(name="CPU・メモリ使用状況（サービス別）", value=field_value[:1024], inline=False)
         else:
             embed.add_field(
                 name="CPU・メモリ使用状況",
@@ -19838,11 +19855,10 @@ async def _railway_build_status_embed() -> discord.Embed:
     if cost is not None:
         embed.add_field(name="今月の推定使用料金", value=f"${cost:.2f}", inline=False)
     else:
-        embed.add_field(
-            name="今月の推定使用料金",
-            value="取得できませんでした（このAPIトークン・プランでは料金情報を取得できない場合があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。",
-            inline=False,
-        )
+        cost_value = "取得できませんでした（このAPIトークン・プランでは料金情報を取得できない場合があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。"
+        if os.getenv("RAILWAY_MONITOR_DEBUG") and _railway_last_graphql_error:
+            cost_value += f"\n```{_railway_last_graphql_error[:900]}```"
+        embed.add_field(name="今月の推定使用料金", value=cost_value, inline=False)
 
     embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります")
     return embed
