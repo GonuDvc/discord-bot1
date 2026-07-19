@@ -20228,6 +20228,202 @@ async def _railway_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.
 
 
 # ====================================================================
+# コンテキストメニューコマンド（メッセージ / ユーザーの右クリック→アプリから実行）
+# ====================================================================
+
+@bot.tree.context_menu(name="AIに翻訳させる")
+async def context_translate_message(interaction: discord.Interaction, message: discord.Message):
+    """
+    メッセージを右クリック→アプリから実行できるコンテキストメニューコマンドです。
+    対象メッセージの言語を自動判定し、日本語なら英語へ、それ以外の言語なら日本語へ翻訳して
+    実行者にのみ見える形（ephemeral）で返します。既存の自動翻訳機能（ai_chat_translate_group）
+    とは独立しており、チャンネル設定に関わらずどのメッセージにも単発で使えます。
+    """
+    content = message.content
+    # Discordのネイティブ「転送」機能で送られたメッセージは本文が空になり、
+    # 実際の内容は message_snapshots 側に入るため、そちらもフォールバックで見る。
+    if not content or not content.strip():
+        for snapshot in getattr(message, "message_snapshots", None) or []:
+            snap_content = getattr(snapshot, "content", None)
+            if snap_content and snap_content.strip():
+                content = snap_content
+                break
+
+    if not content or not content.strip():
+        await interaction.response.send_message("翻訳できるテキストが見つかりませんでした（画像のみのメッセージ等には対応していません）。", ephemeral=True)
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message("AI機能が利用できないため翻訳できません（Bot管理者にお問い合わせください）。", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # 日本語なら英語へ、それ以外の言語なら日本語へ、を自動判定して翻訳する（既存の自動翻訳と同じロジック）
+    result = await _translate_message_text(content, secondary_lang="en", guild_id=interaction.guild.id if interaction.guild else None)
+    if not result:
+        await interaction.followup.send("翻訳に失敗しました。しばらく経ってから再度お試しください。", ephemeral=True)
+        return
+
+    detected_lang, translated_text = result
+    if not translated_text:
+        await interaction.followup.send("翻訳結果を取得できませんでした。", ephemeral=True)
+        return
+
+    embed = discord.Embed(description=translated_text[:4000], color=discord.Color.blurple())
+    embed.set_author(
+        name=f"{message.author.display_name} の投稿を翻訳（検出言語: {detected_lang or '不明'}）",
+        icon_url=message.author.display_avatar.url if message.author.display_avatar else None
+    )
+    embed.set_footer(text="AIによる自動翻訳のため、誤訳を含む場合があります")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(context_translate_message)
+
+
+class _QuickModReasonModal(discord.ui.Modal):
+    """クイックモデレーション（BAN/Kick/Mute）の理由入力モーダルです。"""
+    def __init__(self, action: str, member: discord.Member, default_minutes: int = 10):
+        title_map = {"ban": "BANの理由を入力", "kick": "Kickの理由を入力", "mute": "Muteの理由を入力"}
+        super().__init__(title=title_map.get(action, "理由を入力"))
+        self.action = action
+        self.member = member
+
+        self.reason_input = discord.ui.TextInput(
+            label="理由",
+            placeholder="理由なし の場合は空欄でも構いません",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.reason_input)
+
+        self.minutes_input = None
+        if action == "mute":
+            self.minutes_input = discord.ui.TextInput(
+                label="ミュート時間（分）",
+                placeholder="例: 10",
+                default=str(default_minutes),
+                required=True,
+                max_length=6,
+            )
+            self.add_item(self.minutes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.reason_input.value.strip() or "理由なし"
+
+        if self.action == "ban":
+            try:
+                await self.member.ban(reason=reason)
+                view = BanTrollListView(member=self.member, guild=interaction.guild, reason=reason)
+                await interaction.response.send_message(
+                    f"[BAN] {self.member.mention} をBANしました。\n"
+                    f"理由: {reason}\n\n"
+                    "このユーザーを荒らしリスト（全サーバー共有）に追加しますか？",
+                    view=view
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message("権限が不足しているためBANできません。", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+            return
+
+        if self.action == "kick":
+            try:
+                await self.member.kick(reason=reason)
+                await interaction.response.send_message(f"[KICK] {self.member.mention} をキックしました。\n理由: {reason}")
+            except discord.Forbidden:
+                await interaction.response.send_message("権限が不足しているためキックできません。", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+            return
+
+        if self.action == "mute":
+            minutes_raw = self.minutes_input.value.strip() if self.minutes_input else "10"
+            try:
+                minutes = int(minutes_raw)
+                if minutes <= 0 or minutes > 40320:  # Discordのタイムアウト上限は28日
+                    raise ValueError
+            except ValueError:
+                await interaction.response.send_message("ミュート時間は1〜40320（分）の整数で入力してください。", ephemeral=True)
+                return
+            try:
+                duration = datetime.timedelta(minutes=minutes)
+                await self.member.timeout(duration, reason=reason)
+                await interaction.response.send_message(f"[ミュート] {self.member.mention} を {minutes} 分間ミュートしました。\n理由: {reason}")
+            except discord.Forbidden:
+                await interaction.response.send_message("権限が不足しているためミュートできません。", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+            return
+
+
+class QuickModerationView(discord.ui.View):
+    """
+    ユーザーを右クリック→アプリから実行するクイックモデレーションの、
+    アクション選択ボタンビューです。ボタン押下時に理由入力モーダルを開きます。
+    """
+    def __init__(self, member: discord.Member, moderator_id: int):
+        super().__init__(timeout=60)
+        self.member = member
+        self.moderator_id = moderator_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator_id:
+            await interaction.response.send_message("この操作パネルはコマンド実行者のみ使用できます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Mute（タイムアウト）", style=discord.ButtonStyle.secondary, emoji="🔇")
+    async def mute_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_QuickModReasonModal("mute", self.member))
+
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.primary, emoji="👢")
+    async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_QuickModReasonModal("kick", self.member))
+
+    @discord.ui.button(label="BAN", style=discord.ButtonStyle.danger, emoji="🔨")
+    async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_QuickModReasonModal("ban", self.member))
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="操作をキャンセルしました。", view=self)
+
+
+@bot.tree.context_menu(name="クイックモデレーション")
+async def context_quick_moderation(interaction: discord.Interaction, member: discord.Member):
+    """
+    ユーザーを右クリック→アプリから実行できるコンテキストメニューコマンドです。
+    Mute/Kick/BANのいずれかをボタンで選び、理由入力モーダルを経てから実行します。
+    既存の /moderation コマンドと同じ権限チェック（is_moderator）を行います。
+    """
+    if not await is_moderator(interaction):
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("自分自身に対しては実行できません。", ephemeral=True)
+        return
+    if member.top_role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("Botのロールより上位、または同等のロールを持つユーザーには実行できません。", ephemeral=True)
+        return
+
+    view = QuickModerationView(member=member, moderator_id=interaction.user.id)
+    await interaction.response.send_message(
+        f"{member.mention} に対して行う操作を選んでください。",
+        view=view,
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(context_quick_moderation)
+
+
+# ====================================================================
 # /ai_health - 各AIプロバイダの生存確認（フォールバック順に対応）
 # ====================================================================
 
