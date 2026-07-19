@@ -39,6 +39,15 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+try:
+    # Web検索結果の記事本文取得（JavaScriptで描画されるサイト対応）にのみ使用。
+    # 未インストール、またはブラウザバイナリ未取得（`playwright install chromium`未実行）でも
+    # Bot本体は起動でき、通常のaiohttp取得のみにフォールバックできるようにガードする。
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 # role_channel_mute コマンド等で使う、発言/スレッド権限を持つチャンネル型のUnion
 MuteTargetChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel]
 
@@ -643,6 +652,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # --- AIチャット：Web検索のON/OFF・使用プロバイダ切り替え（管理者専用） ---
         ("ai_chat_web_search_enabled", True),   # True: Web検索ツールをAIに提示する（APIキーが1つも無ければ実際は使われない）。管理者が /ai_chat set_search または埋め込みボタンで切り替え
         ("ai_chat_search_provider_order", None),  # ["tavily","exa","firecrawl","newsdata"] のような優先順位リスト。未設定(None)ならコード既定の優先順位（Tavily→Exa→Firecrawl→NewsData.io）を使用
+        ("ai_chat_playwright_fetch_enabled", True),  # True: Web検索結果の出典URLをPlaywright（実ブラウザ）で開き、JS必須サイトも含め本文を取得してAIに渡す（playwright未導入環境では自動的に無効化される）。管理者が /ai_chat set_playwright で切り替え
         # --- AIチャット：他BOTの発言への自動応答（安全対策付き・オーナー専用） ---
         ("ai_chat_bot_reply_enabled", False),   # True: 登録済みBotの発言にAIチャットチャンネルで自動応答する
         ("ai_chat_bot_reply_target_ids", []),   # [bot_id_int, ...] 反応対象として明示的に登録されたBotのユーザーID一覧
@@ -6288,6 +6298,135 @@ class WebSearchError(RuntimeError):
     pass
 
 
+# ====================================================================
+# Playwright（Web検索結果の記事本文取得: JavaScript必須サイト対応）
+# ====================================================================
+# 各検索API（Tavily/Exa/Firecrawl/NewsData.io）が返す本文は要約・snippet程度（〜500字）に
+# 留まることが多く、SPA（React/Vue等でクライアント側描画するサイト）では
+# そもそも検索API側のクローラーが本文を取得できていないことがある。
+# そのため、検索結果の出典URLのうち上位数件のみ、実ブラウザ（Chromium）で開いて
+# レンダリング後のテキストを抽出し、AIに渡す情報を補強する。
+#
+# 常時起動のブラウザプロセスは持たず、必要な呼び出しのたびに起動・終了する
+# （Botのメモリ・CPU負荷を抑えるため。Railway等の小規模インスタンスを想定）。
+# playwrightパッケージ、およびブラウザバイナリ（`playwright install chromium`）が
+# 未導入の環境でもBot自体は起動できるよう、_PLAYWRIGHT_AVAILABLEで判定してスキップする。
+# ====================================================================
+
+# Playwrightで本文取得を試みる出典URLの最大件数（検索結果の上位から）。
+# 1件あたり数秒かかるため、AIチャットの応答速度への影響を抑えるために少なめにする。
+PLAYWRIGHT_FETCH_MAX_URLS = int(os.getenv("PLAYWRIGHT_FETCH_MAX_URLS", "2"))
+# 1ページあたりのタイムアウト（ミリ秒）。
+PLAYWRIGHT_FETCH_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_FETCH_TIMEOUT_MS", "12000"))
+# 本文として抽出するテキストの最大文字数（AIへの入力トークンを抑えるため）。
+PLAYWRIGHT_FETCH_MAX_CHARS = int(os.getenv("PLAYWRIGHT_FETCH_MAX_CHARS", "2000"))
+
+_URL_PATTERN = re.compile(r"https?://[^\s\)\]\}\"']+")
+
+
+async def _fetch_article_text_playwright(url: str) -> Optional[str]:
+    """
+    Playwrightで指定URLを開き、レンダリング後の本文らしきテキストを抽出して返します。
+    Playwright未導入、タイムアウト、その他エラー時はNoneを返します（呼び出し元は
+    その場合スニペットのみで継続するため、例外を外へ伝播させません）。
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],  # コンテナ環境（Railway等）での起動対策
+            )
+            try:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    )
+                )
+                page = await context.new_page()
+                await page.goto(url, timeout=PLAYWRIGHT_FETCH_TIMEOUT_MS, wait_until="domcontentloaded")
+                # SPA等、JS描画に時間がかかるサイトのため短時間だけ追加待機する
+                try:
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+                # <script>/<style>/<nav>/<header>/<footer>等のノイズ要素を除いた本文テキストを
+                # ブラウザ内のJSで抽出する（記事本文らしき<article>/<main>があればそれを優先）。
+                text = await page.evaluate("""
+                    () => {
+                        const removeSelectors = ['script', 'style', 'nav', 'header', 'footer', 'noscript', 'iframe'];
+                        const root = document.querySelector('article') || document.querySelector('main') || document.body;
+                        if (!root) return '';
+                        const clone = root.cloneNode(true);
+                        removeSelectors.forEach(sel => {
+                            clone.querySelectorAll(sel).forEach(el => el.remove());
+                        });
+                        return clone.innerText || '';
+                    }
+                """)
+            finally:
+                await browser.close()
+    except Exception as e:
+        print(f"[Web検索/Playwright] {url} の本文取得に失敗しました: {e}")
+        return None
+
+    if not text:
+        return None
+    # 連続する空白・改行を整理してから文字数を絞る
+    cleaned = re.sub(r"[ \t]+", " ", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        return None
+    return cleaned[:PLAYWRIGHT_FETCH_MAX_CHARS]
+
+
+async def _augment_search_result_with_playwright(result_text: str, guild_config: Optional[dict] = None) -> str:
+    """
+    検索APIが返したテキスト（スニペット中心）から出典URLを抽出し、Playwrightが利用可能であれば
+    上位数件についてブラウザで本文を取得して追記します。
+    Playwright未導入、サーバー側で無効化されている、または全件取得失敗の場合は元のテキストをそのまま返します。
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return result_text
+    # サーバーごとにPlaywrightでの本文取得を無効化できる（既定: 有効）。
+    if not (guild_config or {}).get("ai_chat_playwright_fetch_enabled", True):
+        return result_text
+
+    urls = _URL_PATTERN.findall(result_text)
+    if not urls:
+        return result_text
+
+    # 同一URLの重複を除きつつ順序を保持
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    target_urls = unique_urls[:PLAYWRIGHT_FETCH_MAX_URLS]
+    fetched_sections = []
+    for url in target_urls:
+        article_text = await _fetch_article_text_playwright(url)
+        if article_text:
+            fetched_sections.append(f"--- 本文（実ブラウザ取得）: {url} ---\n{article_text}")
+
+    if not fetched_sections:
+        return result_text
+
+    return (
+        result_text
+        + "\n\n"
+        + "\n\n".join(fetched_sections)
+        + "\n\n（注: 上記「本文（実ブラウザ取得）」はJavaScriptで描画されるページも含め、"
+          "実際にブラウザでレンダリングして取得した本文です。要約より詳細な情報が必要な場合はこちらを優先してください。）"
+    )
+
+
 async def _tavily_web_search(query: str, max_results: int = 5) -> str:
     """Tavily Search APIを呼び出し、検索結果をテキスト形式に整形して返します。失敗時はWebSearchErrorをraiseします。"""
     payload = {
@@ -6509,6 +6648,9 @@ async def _web_search_fallback(query: str, max_results: int = 5, guild_config: O
         tried_any = True
         try:
             result_text = await search_func(query, max_results)
+            # JS必須サイト等でスニペットだけでは不十分な場合に備え、Playwrightが利用可能なら
+            # 出典URL上位数件の本文を実ブラウザで取得して補強する（未導入時は元のテキストのまま）。
+            result_text = await _augment_search_result_with_playwright(result_text, guild_config=guild_config)
             # 検索結果本文にツール結果として直接付与する念押し。
             # AIが「Tavilyによると」「Exa.aiの検索結果では」のように検索ツール自体の名称を
             # 情報源として書いてしまう不具合を防ぐため、tool結果の中にも明記しておく
@@ -6551,7 +6693,228 @@ _WEB_SEARCH_TOOL_DEFINITION = {
 }
 
 
-# 一部のモデル（特に量子化・軽量モデル）はネイティブのtool_callsフィールドではなく、
+# ====================================================================
+# Open-Meteo API（AIチャットの天気質問用ツール）
+# ====================================================================
+# Open-Meteo（https://open-meteo.com）はAPIキー登録不要・無料で使える気象APIのため、
+# Web検索とは別に「天気専用ツール」としてAIに持たせる。
+# 地名から直接は天気を引けないため、次の2段階で呼び出す:
+#   1. ジオコーディングAPI（geocoding-api.open-meteo.com）で地名→緯度経度に変換
+#   2. 予報API（api.open-meteo.com）でその緯度経度の天気予報を取得
+# Web検索と同様Tool Use方式で、AIが天気の質問と判断した場合のみ呼び出される。
+# APIキーが不要なため常時有効（他のWeb検索APIキーの設定有無とは独立）。
+# ====================================================================
+
+class WeatherLookupError(RuntimeError):
+    """Open-Meteo呼び出しに関する汎用エラー。"""
+    pass
+
+
+# WMO Weather interpretation codes (Open-Meteoが返すweathercode)を日本語の天気表現に変換
+_WMO_WEATHER_CODE_JA = {
+    0: "快晴", 1: "ほぼ晴れ", 2: "一部曇り", 3: "曇り",
+    45: "霧", 48: "霧氷を伴う霧",
+    51: "弱い霧雨", 53: "霧雨", 55: "強い霧雨",
+    56: "弱い着氷性の霧雨", 57: "着氷性の霧雨",
+    61: "弱い雨", 63: "雨", 65: "強い雨",
+    66: "弱い着氷性の雨", 67: "着氷性の雨",
+    71: "弱い雪", 73: "雪", 75: "強い雪",
+    77: "霧雪",
+    80: "弱いにわか雨", 81: "にわか雨", 82: "激しいにわか雨",
+    85: "弱いにわか雪", 86: "激しいにわか雪",
+    95: "雷雨", 96: "雹を伴う雷雨", 99: "激しい雹を伴う雷雨",
+}
+
+
+def _weather_code_to_ja(code: Optional[int]) -> str:
+    if code is None:
+        return "不明"
+    return _WMO_WEATHER_CODE_JA.get(int(code), f"不明な天気コード({code})")
+
+
+async def _open_meteo_geocode(location: str) -> dict:
+    """
+    地名文字列から緯度経度・正規化された地名を取得します。
+    見つからない場合はWeatherLookupErrorをraiseします。
+    """
+    params = {
+        "name": location,
+        "count": 1,
+        "language": "ja",
+        "format": "json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise WeatherLookupError(f"Open-Meteo ジオコーディングAPIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+    except WeatherLookupError:
+        raise
+    except Exception as e:
+        raise WeatherLookupError(f"Open-Meteo ジオコーディング呼び出しエラー: {e}") from e
+
+    results = data.get("results") or []
+    if not results:
+        # 日本語地名でヒットしない場合、英語名でも1回だけ再試行する
+        if params["language"] == "ja":
+            params["language"] = "en"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://geocoding-api.open-meteo.com/v1/search",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            results = data.get("results") or []
+            except Exception:
+                pass
+        if not results:
+            raise WeatherLookupError(f"「{location}」という地名が見つかりませんでした。")
+
+    top = results[0]
+    return {
+        "name": top.get("name", location),
+        "admin1": top.get("admin1", ""),
+        "country": top.get("country", ""),
+        "latitude": top.get("latitude"),
+        "longitude": top.get("longitude"),
+        "timezone": top.get("timezone", "auto"),
+    }
+
+
+async def _open_meteo_forecast(latitude: float, longitude: float, timezone: str = "auto") -> dict:
+    """指定した緯度経度の現在の天気・当日/週間予報を取得します。失敗時はWeatherLookupErrorをraiseします。"""
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "timezone": timezone or "auto",
+        "forecast_days": 4,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    raise WeatherLookupError(f"Open-Meteo 予報APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                return await resp.json()
+    except WeatherLookupError:
+        raise
+    except Exception as e:
+        raise WeatherLookupError(f"Open-Meteo 予報呼び出しエラー: {e}") from e
+
+
+async def _weather_lookup(location: str) -> str:
+    """
+    地名を受け取り、現在の天気・当日を含む4日間の予報をAIに渡すためのテキストに整形して返します。
+    失敗時はエラー内容を短い日本語テキストとして返します（例外はraiseせず、AIチャット自体は継続させる）。
+    """
+    location = (location or "").strip()
+    if not location:
+        return "（地名が指定されなかったため、天気を取得できませんでした。）"
+
+    try:
+        geo = await _open_meteo_geocode(location)
+        forecast = await _open_meteo_forecast(
+            geo["latitude"], geo["longitude"], geo.get("timezone", "auto")
+        )
+    except WeatherLookupError as e:
+        return f"（天気情報の取得に失敗しました: {e}）"
+    except Exception as e:
+        return f"（天気情報の取得中に予期しないエラーが発生しました: {e}）"
+
+    place_label = geo["name"]
+    if geo.get("admin1"):
+        place_label += f"（{geo['admin1']}, {geo.get('country', '')}）"
+    elif geo.get("country"):
+        place_label += f"（{geo['country']}）"
+
+    lines = [f"地点: {place_label}"]
+
+    current = forecast.get("current") or {}
+    if current:
+        temp = current.get("temperature_2m")
+        feels = current.get("apparent_temperature")
+        humidity = current.get("relative_humidity_2m")
+        precip = current.get("precipitation")
+        wind = current.get("wind_speed_10m")
+        code = current.get("weather_code")
+        lines.append(
+            f"現在: {_weather_code_to_ja(code)} / 気温 {temp}℃"
+            + (f"（体感 {feels}℃）" if feels is not None else "")
+            + (f" / 湿度 {humidity}%" if humidity is not None else "")
+            + (f" / 降水量 {precip}mm" if precip is not None else "")
+            + (f" / 風速 {wind}m/s" if wind is not None else "")
+        )
+
+    daily = forecast.get("daily") or {}
+    dates = daily.get("time") or []
+    codes = daily.get("weather_code") or []
+    tmax = daily.get("temperature_2m_max") or []
+    tmin = daily.get("temperature_2m_min") or []
+    pop = daily.get("precipitation_probability_max") or []
+    if dates:
+        lines.append("今後の予報:")
+        for i, d in enumerate(dates):
+            day_label = "今日" if i == 0 else ("明日" if i == 1 else d)
+            code = codes[i] if i < len(codes) else None
+            hi = tmax[i] if i < len(tmax) else "?"
+            lo = tmin[i] if i < len(tmin) else "?"
+            p = pop[i] if i < len(pop) else None
+            line = f"  {day_label}（{d}）: {_weather_code_to_ja(code)} / 最高{hi}℃ 最低{lo}℃"
+            if p is not None:
+                line += f" / 降水確率{p}%"
+            lines.append(line)
+
+    lines.append("（出典: Open-Meteo）")
+    return "\n".join(lines)
+
+
+_WEATHER_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": (
+            "指定した地名（都市名・地域名）の現在の天気および数日間の天気予報を取得します。"
+            "天気・気温・降水確率・湿度など気象に関する質問の場合はこちらを使用してください。"
+            "ニュースや一般的な最新情報にはweb_searchを使用し、こちらは使わないでください。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "天気を知りたい地名（例: 「東京」「広島市」「Osaka」「New York」）。都市名だけで問題ありません。"
+                }
+            },
+            "required": ["location"]
+        }
+    }
+}
+
+
+# Gemini（functionDeclarations形式）用の天気ツール定義
+_GEMINI_WEATHER_FUNCTION_DECLARATION = {
+    "name": "get_weather",
+    "description": _WEATHER_TOOL_DEFINITION["function"]["description"],
+    "parameters": _WEATHER_TOOL_DEFINITION["function"]["parameters"],
+}
+
+
+
 # 応答本文(content)の中に直接JSON形式でツール呼び出しや、さらには「ツールの実行結果」
 # らしきものまで幻覚(ハルシネーション)で書いてしまうことがある。
 # 当初は {"tool": "web_search", "query": "..."} という単一の決め打ちパターンだけを
@@ -6958,7 +7321,7 @@ async def _ai_chat_call_groq_with_search(
         }
         # 最終ラウンド（検索回数を使い切った後）はツールを渡さず、必ずテキストで応答させる
         if round_idx < max_search_rounds:
-            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION, _WEATHER_TOOL_DEFINITION]
             if round_idx == 0 and _force_search_first_round:
                 payload["tool_choice"] = "required"
                 print(f"[Web検索] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
@@ -7079,6 +7442,12 @@ async def _ai_chat_call_groq_with_search(
                     _search_performed_var.set(True)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            elif func_name == "get_weather":
+                location = str(func_args.get("location", "")).strip()
+                print(f"[AIチャット/天気] 地点: {location}")
+                search_result_text = await _weather_lookup(location)
+                _search_performed_var.set(True)
+
             else:
                 search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
 
@@ -7273,7 +7642,7 @@ async def _ai_chat_call_cerebras_with_search(
             "max_tokens": CEREBRAS_MAX_TOKENS,
         }
         if round_idx < max_search_rounds:
-            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION, _WEATHER_TOOL_DEFINITION]
             if round_idx == 0 and _force_search_first_round:
                 payload["tool_choice"] = "required"
                 print(f"[Web検索/Cerebras] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
@@ -7373,6 +7742,12 @@ async def _ai_chat_call_cerebras_with_search(
                     _search_performed_var.set(True)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            elif func_name == "get_weather":
+                location = str(func_args.get("location", "")).strip()
+                print(f"[AIチャット/天気] 地点: {location}")
+                search_result_text = await _weather_lookup(location)
+                _search_performed_var.set(True)
+
             else:
                 search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
 
@@ -7470,6 +7845,167 @@ async def _ai_chat_call_mistral(messages: list, model: Optional[str] = None) -> 
         reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
 
     return reply_text
+
+
+async def _ai_chat_call_mistral_with_search(
+    messages: list,
+    model: Optional[str] = None,
+    guild_config: Optional[dict] = None
+) -> str:
+    """
+    Web検索（Tool Use）に対応したMistral呼び出し。_ai_chat_call_groq_with_search /
+    _ai_chat_call_cerebras_with_search とほぼ同じロジックです（MistralのChat Completions APIも
+    OpenAI互換のtools形式に対応しているため）。
+
+    Groq・Cerebrasの両方が本日の利用上限（TPD/RPD）に達し、Mistralへフォールバックした場合でも
+    検索機能そのものは引き続き使えるようにするために追加した（従来はMistralへの切り替え時点で
+    検索非対応になり、「検索できません」という断り文だけが返っていた）。
+
+    どのWeb検索APIキーも未設定の場合は検索機能なしの通常呼び出し（_ai_chat_call_mistral）に
+    そのままフォールバックします。
+    """
+    if not WEB_SEARCH_AVAILABLE:
+        return await _ai_chat_call_mistral(messages, model=model)
+
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY が設定されていません。Botの環境変数を確認してください。")
+
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    working_messages = list(messages)  # 呼び出し元のリストは書き換えない
+    max_search_rounds = 2
+
+    _force_search_first_round = _query_likely_needs_search(_extract_latest_user_text(working_messages))
+
+    for round_idx in range(max_search_rounds + 1):
+        payload = {
+            "model": model or MISTRAL_MODEL,
+            "messages": working_messages,
+            "temperature": 0.7,
+            "max_tokens": MISTRAL_MAX_TOKENS,
+        }
+        if round_idx < max_search_rounds:
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION, _WEATHER_TOOL_DEFINITION]
+            if round_idx == 0 and _force_search_first_round:
+                payload["tool_choice"] = "required"
+                print(f"[Web検索/Mistral] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
+            else:
+                payload["tool_choice"] = "auto"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    err_text = await resp.text()
+                    retry_after: Optional[float] = None
+                    header_val = resp.headers.get("Retry-After")
+                    if header_val:
+                        try:
+                            retry_after = float(header_val)
+                        except ValueError:
+                            retry_after = None
+                    if retry_after is None:
+                        retry_after = _parse_groq_retry_after(err_text)  # Mistralも同様の文面のためこのパーサーを流用
+                    raise MistralRateLimitError(retry_after=retry_after, raw_message=err_text[:300])
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    if resp.status == 404 and "model" in err_text.lower():
+                        raise MistralAPIError(
+                            f"Mistral APIエラー（HTTP 404）: 指定されたモデル「{model or MISTRAL_MODEL}」が見つかりません。"
+                            f"Mistral側でモデルの提供が終了・変更された可能性があります。"
+                            f"Botの環境変数 MISTRAL_MODEL を、Mistral公式サイト（console.mistral.ai）で"
+                            f"現在利用可能なモデル名に更新してください。詳細: {err_text[:200]}"
+                        )
+                    raise MistralAPIError(f"Mistral APIエラー（HTTP {resp.status}）: {err_text[:300]}")
+                data = await resp.json()
+
+        try:
+            choice = data["choices"][0]
+            message_obj = choice["message"]
+        except (KeyError, IndexError, TypeError):
+            raise MistralAPIError(f"Mistral APIの応答形式が想定と異なります: {data}")
+
+        tool_calls = message_obj.get("tool_calls")
+        if not tool_calls:
+            if round_idx == 0 and _force_search_first_round:
+                print("[Web検索/Mistral] tool_choice=requiredにも関わらず、Mistralモデルがweb_searchツールを呼び出しませんでした。")
+            raw_content = message_obj.get("content") or ""
+
+            has_leaked_prefix = _strip_leaked_tool_call_prefix(raw_content) != raw_content
+            leaked_call = _try_parse_leaked_tool_call_json(raw_content)
+            if leaked_call is None and has_leaked_prefix:
+                leaked_call = _try_extract_query_from_leaked_prefix(raw_content)
+
+            if leaked_call is not None and round_idx < max_search_rounds:
+                query = str(leaked_call.get("query", "")).strip()
+                print(f"[AIチャット/Web検索/Mistral] 本文へのJSON漏れを検知し、破棄して再検索します。クエリ: {query!r}")
+                if query:
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+                working_messages.append({
+                    "role": "assistant",
+                    "content": "（内部処理: Web検索を実行しました）"
+                })
+                working_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"（システム）先ほどの応答は無効になりました。改めて実際の検索結果を渡します:\n"
+                        f"{search_result_text}\n\n"
+                        "上記の実際の検索結果のみを根拠に、通常の文章で回答してください。"
+                        "JSON形式では出力せず、検索結果に無い情報を付け加えないでください。"
+                    )
+                })
+                continue
+
+            if leaked_call is not None or has_leaked_prefix:
+                return "（検索処理でエラーが発生したため、検索結果なしで回答できませんでした。質問を変えて再度お試しください。）"
+            reply_text = _sanitize_ai_reply_content(raw_content)
+            if choice.get("finish_reason") == "length":
+                reply_text += "\n\n*（出力上限のため応答が途中で切れている可能性があります）*"
+            return reply_text
+
+        working_messages.append(message_obj)
+        for tool_call in tool_calls:
+            func = tool_call.get("function", {})
+            func_name = func.get("name", "")
+            try:
+                func_args = json.loads(func.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                func_args = {}
+
+            if func_name == "web_search":
+                query = str(func_args.get("query", "")).strip()
+                if query:
+                    print(f"[AIチャット/Web検索/Mistral] クエリ: {query}")
+                    search_result_text = await _web_search_fallback(query, guild_config=guild_config)
+                    _search_performed_var.set(True)
+                else:
+                    search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            elif func_name == "get_weather":
+                location = str(func_args.get("location", "")).strip()
+                print(f"[AIチャット/天気] 地点: {location}")
+                search_result_text = await _weather_lookup(location)
+                _search_performed_var.set(True)
+
+            else:
+                search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
+
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": search_result_text
+            })
+
+    return "（検索処理が複雑すぎたため、応答を生成できませんでした。質問を変えて再度お試しください。）"
 
 
 # ====================================================================
@@ -7594,7 +8130,7 @@ async def _ai_chat_call_openrouter_with_search(
             "max_tokens": OPENROUTER_MAX_TOKENS,
         }
         if round_idx < max_search_rounds:
-            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION]
+            payload["tools"] = [_WEB_SEARCH_TOOL_DEFINITION, _WEATHER_TOOL_DEFINITION]
             if round_idx == 0 and _force_search_first_round:
                 payload["tool_choice"] = "required"
                 print(f"[Web検索/OpenRouter] 時事系キーワードを検知したため、検索ツールの呼び出しを必須化します: {_extract_latest_user_text(working_messages)!r}")
@@ -7694,6 +8230,12 @@ async def _ai_chat_call_openrouter_with_search(
                     _search_performed_var.set(True)
                 else:
                     search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+            elif func_name == "get_weather":
+                location = str(func_args.get("location", "")).strip()
+                print(f"[AIチャット/天気] 地点: {location}")
+                search_result_text = await _weather_lookup(location)
+                _search_performed_var.set(True)
+
             else:
                 search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
 
@@ -7893,7 +8435,7 @@ async def _ai_chat_call_gemini_with_search(
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
         if round_idx < max_search_rounds:
-            payload["tools"] = [{"functionDeclarations": [_GEMINI_WEB_SEARCH_FUNCTION_DECLARATION]}]
+            payload["tools"] = [{"functionDeclarations": [_GEMINI_WEB_SEARCH_FUNCTION_DECLARATION, _GEMINI_WEATHER_FUNCTION_DECLARATION]}]
             if round_idx == 0 and _force_search_first_round:
                 payload["toolConfig"] = {
                     "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["web_search"]}
@@ -7979,6 +8521,12 @@ async def _ai_chat_call_gemini_with_search(
                 _search_performed_var.set(True)
             else:
                 search_result_text = "（検索クエリが空だったため検索できませんでした。）"
+        elif func_name == "get_weather":
+            location = str(func_args.get("location", "")).strip()
+            print(f"[AIチャット/天気] 地点: {location}")
+            search_result_text = await _weather_lookup(location)
+            _search_performed_var.set(True)
+
         else:
             search_result_text = f"（未対応のツール呼び出しです: {func_name}）"
 
@@ -8029,12 +8577,11 @@ async def _ai_call_llm_with_fallback(
     Groqの一時的なレート制限（TPM/RPM）や、日次上限以外のエラーはフォールバックせず
     そのまま例外を送出します（TPMは短時間で回復するため、プロバイダを跨ぐ必要が薄いため）。
 
-    enable_search: True の場合、対応している全プロバイダ（Groq/Cerebras/Mistral/OpenRouter/Gemini）
+    enable_search: True の場合、全プロバイダ（Groq/Cerebras/Mistral/OpenRouter/Gemini）
     でWeb検索（既定: Tavily→Exa→Firecrawl→NewsData.ioの優先順位で自動フォールバック。guild_configで
     サーバーごとにON/OFF・優先順位をカスタム設定可能）機能を持たせます
     （どのAPIキーも未設定の場合、またはそのサーバーで検索が無効化されている場合は
     自動的に検索なし呼び出しにフォールバックします）。
-    ※Mistralのみ検索対応版が未実装のため、Mistralへのフォールバック時は検索を使いません。
 
     guild_config: そのサーバーの設定辞書。ai_chat_web_search_enabled（bool）で
     Web検索の有効/無効を、ai_chat_search_provider_order（リスト）で検索プロバイダの
@@ -8071,7 +8618,11 @@ async def _ai_call_llm_with_fallback(
                 "MISTRAL_API_KEYが未設定のため利用できません。/ai_chat set_provider で変更するか、"
                 "Botの環境変数を確認してください。"
             )
-        reply_text = await _ai_chat_call_mistral(messages, model=model)
+        search_enabled_for_guild = (guild_config or {}).get("ai_chat_web_search_enabled", True)
+        if enable_search and search_enabled_for_guild:
+            reply_text = await _ai_chat_call_mistral_with_search(messages, model=model, guild_config=guild_config)
+        else:
+            reply_text = await _ai_chat_call_mistral(messages, model=model)
         return reply_text, "mistral"
 
     if provider_override == "openrouter":
@@ -8154,7 +8705,10 @@ async def _ai_call_llm_with_fallback(
         pass
     else:
         try:
-            reply_text = await _ai_chat_call_mistral(messages)
+            if effective_enable_search:
+                reply_text = await _ai_chat_call_mistral_with_search(messages, guild_config=guild_config)
+            else:
+                reply_text = await _ai_chat_call_mistral(messages)
             return reply_text, "mistral"
         except Exception as e:
             print(f"[AIフォールバック] Mistralへの切り替えにも失敗しました: {e}")
@@ -13912,6 +14466,15 @@ async def ai_chat_search_status(interaction: discord.Interaction):
     configured_count = sum(1 for _pid, _name, is_configured, _fn in provider_order if is_configured())
 
     if WEB_SEARCH_AVAILABLE:
+        playwright_enabled_for_guild = guild_config.get("ai_chat_playwright_fetch_enabled", True)
+        if _PLAYWRIGHT_AVAILABLE:
+            playwright_status_line = (
+                f"記事本文の実ブラウザ取得（Playwright）: "
+                f"{'✅ 有効' if playwright_enabled_for_guild else '⏸️ 無効（管理者により停止中）'}"
+            )
+        else:
+            playwright_status_line = "記事本文の実ブラウザ取得（Playwright）: ❌ 未導入（Bot環境にplaywrightが入っていません）"
+
         embed.description = (
             f"このサーバーでの現在の設定: {'✅ 有効' if search_enabled_for_guild else '⏸️ 無効（管理者により停止中）'}\n\n"
             "有効な場合、AIが「最新情報が必要」と判断した質問（最新ニュース・現在の状況など）に対しては、"
@@ -13919,8 +14482,10 @@ async def ai_chat_search_status(interaction: discord.Interaction):
             "（1つが失敗・上限到達しても次のプロバイダに自動フォールバックします）。\n\n"
             f"{status_text}\n\n"
             f"設定済み: {configured_count}/{len(provider_order)}\n\n"
+            f"{playwright_status_line}\n\n"
             "`/ai_chat set_search` でこのサーバーの検索ON/OFFを、"
-            "`/ai_chat set_search_provider` でプロバイダの優先順位を変更できます。"
+            "`/ai_chat set_search_provider` でプロバイダの優先順位を、"
+            "`/ai_chat set_playwright` で記事本文取得のON/OFFを変更できます。"
         )
         embed.color = discord.Color.green() if search_enabled_for_guild else discord.Color.orange()
     else:
@@ -14002,6 +14567,83 @@ async def ai_chat_set_search(interaction: discord.Interaction):
         color=discord.Color.green() if search_enabled_for_guild else discord.Color.orange()
     )
     view = AIChatSearchToggleView(interaction.guild.id, search_enabled_for_guild)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class AIChatPlaywrightToggleView(discord.ui.View):
+    """
+    /ai_chat set_playwright で表示される、Playwrightによる記事本文取得機能のON/OFFを
+    ボタン1つで切り替えられるビュー。AIChatSearchToggleViewと同じ構造。
+    """
+    def __init__(self, guild_id: int, enabled: bool):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self._update_button_style(enabled)
+
+    def _update_button_style(self, enabled: bool):
+        self.toggle_button.label = "🔴 本文取得をOFFにする" if enabled else "🟢 本文取得をONにする"
+        self.toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+
+    @discord.ui.button(label="切り替え", style=discord.ButtonStyle.secondary)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("このボタンは管理者のみ操作できます。", ephemeral=True)
+            return
+
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, str(self.guild_id))
+        current = guild_config.get("ai_chat_playwright_fetch_enabled", True)
+        new_value = not current
+        guild_config["ai_chat_playwright_fetch_enabled"] = new_value
+        save_data(all_data)
+
+        self._update_button_style(new_value)
+
+        embed = discord.Embed(
+            title="AIチャット 記事本文取得機能（Playwright）",
+            description=(
+                f"このサーバーでの設定を **{'✅ 有効' if new_value else '⏸️ 無効'}** に変更しました。\n\n"
+                + ("Web検索結果の出典URLを実ブラウザで開き、JavaScriptで描画されるページも含めて"
+                   "本文を取得してからAIに渡します。"
+                   if new_value else
+                   "Web検索結果は各検索APIが返す要約（スニペット）のみで応答します。")
+            ),
+            color=discord.Color.green() if new_value else discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@ai_chat_group.command(name="set_playwright", description="【管理者専用】Web検索結果の記事本文を実ブラウザで取得する機能を、ボタン一つでON/OFFできます")
+async def ai_chat_set_playwright(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
+        return
+
+    if not _PLAYWRIGHT_AVAILABLE:
+        await interaction.response.send_message(
+            "❌ PlaywrightがこのBot環境に導入されていないため、このサーバーでON/OFFを切り替えても"
+            "実際の動作は変わりません（常に検索APIのスニペットのみで応答します）。\n"
+            "導入するには `requirements.txt` に `playwright` を追加し、デプロイ時に "
+            "`playwright install --with-deps chromium` を実行するよう設定してください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    playwright_enabled_for_guild = guild_config.get("ai_chat_playwright_fetch_enabled", True)
+
+    embed = discord.Embed(
+        title="AIチャット 記事本文取得機能（Playwright）",
+        description=(
+            f"現在の設定: **{'✅ 有効' if playwright_enabled_for_guild else '⏸️ 無効'}**\n\n"
+            "Web検索結果の出典URL上位数件を実ブラウザ（Chromium）で開き、"
+            "JavaScriptで描画されるページも含めて本文を取得し、要約より詳しい情報をAIに渡します。\n\n"
+            "下のボタンで切り替えできます。"
+        ),
+        color=discord.Color.green() if playwright_enabled_for_guild else discord.Color.orange()
+    )
+    view = AIChatPlaywrightToggleView(interaction.guild.id, playwright_enabled_for_guild)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
