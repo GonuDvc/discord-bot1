@@ -19824,26 +19824,17 @@ async def _railway_build_status_embed() -> discord.Embed:
         )
         return embed
 
-    project_name = project.get("name", "(不明なプロジェクト)")
     env_edges = project.get("environments", {}).get("edges", [])
-    service_edges = project.get("services", {}).get("edges", [])
-    service_name_by_id = {s["node"]["id"]: s["node"]["name"] for s in service_edges}
 
     # 環境ID決定: 指定があればそれを使用、なければ先頭の環境（通常production）
     environment_id = RAILWAY_ENVIRONMENT_ID
-    environment_name = None
     if not environment_id and env_edges:
         environment_id = env_edges[0]["node"]["id"]
-        environment_name = env_edges[0]["node"]["name"]
-    else:
-        for e in env_edges:
-            if e["node"]["id"] == environment_id:
-                environment_name = e["node"]["name"]
-                break
 
+    # プロジェクト名・環境名・サービス名は非公開情報のため、Embed上には一切表示しない。
     embed = discord.Embed(
-        title=f"[Railway監視] {project_name}",
-        description=f"環境: `{environment_name or '不明'}` ／ 自動更新中（{RAILWAY_MONITOR_REFRESH_SECONDS}秒間隔）",
+        title="[Railway監視] 稼働状況",
+        description=f"自動更新中（{RAILWAY_MONITOR_REFRESH_SECONDS}秒間隔）",
         color=discord.Color.blue(),
         timestamp=discord.utils.utcnow(),
     )
@@ -19857,12 +19848,10 @@ async def _railway_build_status_embed() -> discord.Embed:
     if metrics:
         cpu_by_service: dict = {}
         mem_by_service: dict = {}
-        raw_tags_seen = []
         for m in metrics:
             measurement = m.get("measurement")
             tags = m.get("tags") or {}
             service_id = tags.get("serviceId")
-            raw_tags_seen.append(tags)
             value = _railway_latest_value(m.get("values", []))
             if value is None:
                 continue
@@ -19873,18 +19862,16 @@ async def _railway_build_status_embed() -> discord.Embed:
 
         if cpu_by_service or mem_by_service:
             lines = []
-            all_service_ids = set(cpu_by_service.keys()) | set(mem_by_service.keys())
-            for sid in all_service_ids:
-                name = service_name_by_id.get(sid, sid or "(不明なサービス)")
+            all_service_ids = sorted(set(cpu_by_service.keys()) | set(mem_by_service.keys()), key=lambda x: (x is None, x))
+            # サービス名・サービスIDは非公開情報のため表示せず、連番のラベルのみ表示する。
+            for idx, sid in enumerate(all_service_ids, start=1):
+                name = f"サービス{idx}"
                 cpu_val = cpu_by_service.get(sid)
                 mem_val = mem_by_service.get(sid)
                 cpu_text = f"{cpu_val * 100:.1f}%" if cpu_val is not None else "取得不可"
                 mem_text = f"{mem_val:.2f} GB" if mem_val is not None else "取得不可"
                 lines.append(f"**{name}**\nCPU: {cpu_text} ／ メモリ: {mem_text}")
             field_value = "\n".join(lines)[:1024]
-            if os.getenv("RAILWAY_MONITOR_DEBUG"):
-                field_value += f"\n```tags例: {json.dumps(raw_tags_seen[:3], ensure_ascii=False)[:500]}```"
-                field_value += f"\n```登録サービス一覧: {json.dumps(service_name_by_id, ensure_ascii=False)[:500]}```"
             embed.add_field(name="CPU・メモリ使用状況（サービス別）", value=field_value[:1024], inline=False)
         else:
             embed.add_field(
@@ -19936,13 +19923,9 @@ async def _railway_build_status_embed() -> discord.Embed:
             f"**約 ${estimated_cost:.2f}**（今月・月初からの概算）\n"
             f"-# Railway公式単価から算出した概算値です。正確な金額は Railway ダッシュボードの Usage ページでご確認ください。"
         )
-        if os.getenv("RAILWAY_MONITOR_DEBUG"):
-            cost_value += f"\n```使用量積算値: {json.dumps(usage_totals, ensure_ascii=False)}```"
         embed.add_field(name="今月の推定使用料金（概算）", value=cost_value, inline=False)
     else:
         cost_value = "取得できませんでした（APIエラー、またはこのプランでは使用量データを取得できない可能性があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。"
-        if os.getenv("RAILWAY_MONITOR_DEBUG") and _railway_last_graphql_error:
-            cost_value += f"\n```{_railway_last_graphql_error[:900]}```"
         embed.add_field(name="今月の推定使用料金", value=cost_value, inline=False)
 
     embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります ／ 料金は概算です")
