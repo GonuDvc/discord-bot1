@@ -19897,6 +19897,102 @@ async def _railway_monitor_update_loop(guild_id: int, channel_id: int, message_i
 railway_group = app_commands.Group(name="railway", description="【オーナー限定】RailwayのCPU/メモリ/ストレージ/料金状況の確認")
 
 
+@railway_group.command(name="debug_schema", description="【オーナー限定・調査用】metrics/usage/料金関連クエリの正確な引数・型をRailway APIのスキーマから取得します")
+async def railway_debug_schema_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # まずQueryのフィールド名だけを軽量取得し、料金・使用量に関係しそうなものを自動抽出する
+    query_names_query = """
+    query QueryFieldNames {
+        __type(name: "Query") {
+            fields {
+                name
+                args { name type { name kind ofType { name kind } } }
+            }
+        }
+    }
+    """
+    data = await _railway_graphql_request(query_names_query, {})
+    all_fields = (data.get("__type") or {}).get("fields", []) if data else []
+
+    keywords = ["cost", "usage", "invoice", "billing", "price", "estimate", "workspace", "team", "subscription", "credit", "spend"]
+    matched = [f for f in all_fields if any(kw in f["name"].lower() for kw in keywords)]
+
+    introspection_query = """
+    query IntrospectQuery($name: String!) {
+        __type(name: $name) {
+            name
+            kind
+            fields {
+                name
+                args {
+                    name
+                    type {
+                        name
+                        kind
+                        ofType { name kind ofType { name kind ofType { name kind } } }
+                    }
+                }
+                type {
+                    name
+                    kind
+                    ofType { name kind ofType { name kind } }
+                }
+            }
+        }
+    }
+    """
+    # 見つかった料金関連フィールドの返り値の型名を集めて、それぞれの型定義も取得する
+    type_names_to_check = {"MetricTagInput", "AggregatedUsage", "MetricMeasurement"}
+
+    def _unwrap_type_name(type_obj):
+        t = type_obj
+        for _ in range(4):
+            if t is None:
+                return None
+            if t.get("name"):
+                return t["name"]
+            t = t.get("ofType")
+        return None
+
+    for f in matched:
+        tn = _unwrap_type_name(f.get("type"))
+        if tn:
+            type_names_to_check.add(tn)
+
+    results = {}
+    for type_name in type_names_to_check:
+        d = await _railway_graphql_request(introspection_query, {"name": type_name})
+        results[type_name] = d.get("__type") if d else None
+
+    output_lines = []
+    output_lines.append("=== 料金・使用量関連っぽいQueryフィールド一覧（自動抽出） ===")
+    output_lines.append(json.dumps(matched, ensure_ascii=False, indent=2))
+    output_lines.append("\n=== Queryの全フィールド名一覧（参考） ===")
+    output_lines.append(json.dumps([f["name"] for f in all_fields], ensure_ascii=False, indent=2))
+    for type_name, type_def in results.items():
+        output_lines.append(f"\n=== 型定義: {type_name} ===")
+        output_lines.append(json.dumps(type_def, ensure_ascii=False, indent=2))
+
+    full_text = "\n".join(output_lines)
+    buf = io.BytesIO(full_text.encode("utf-8"))
+    file = discord.File(buf, filename="railway_schema_debug.txt")
+    await interaction.followup.send(
+        content=(
+            f"Railway APIのスキーマ調査結果です（オーナーにのみ表示）。"
+            f"料金・使用量関連と思われるフィールドを{len(matched)}件自動抽出しました。"
+            f"この内容を共有していただければ正確なクエリに修正できます。"
+        ),
+        file=file,
+        ephemeral=True,
+    )
+
+
+
+
+
 @railway_group.command(name="status", description="【オーナー限定】現在のRailway使用状況（CPU/メモリ/ストレージ/料金）を1回だけ表示します")
 async def railway_status_command(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
