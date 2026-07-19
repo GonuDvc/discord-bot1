@@ -4399,10 +4399,12 @@ async def on_ready():
             try:
                 guild_id_int = int(guild_id_str)
                 poll_id_int = int(poll_id_str)
-                view = PollView(guild_id_int, poll_id_int, record.get("choices", []))
-                if record.get("status") != "open":
-                    for item in view.children:
-                        item.disabled = True
+                is_closed = record.get("status") != "open"
+                view = PollView(
+                    guild_id_int, poll_id_int, record.get("choices", []),
+                    record.get("question", ""), record.get("creator_name", "不明"),
+                    closed=is_closed,
+                )
                 bot.add_view(view)
             except Exception as e:
                 print(f"[警告] 投票パネルの再登録に失敗しました（guild={guild_id_str}, poll={poll_id_str}）: {e}")
@@ -18021,23 +18023,30 @@ def _get_poll_record(all_data: dict, guild_id: int, poll_id: int) -> dict | None
     return polls.get(str(poll_id))
 
 
-def _build_poll_embed(record: dict, *, closed: bool = False) -> discord.Embed:
-    """投票データから一覧表示用のEmbed（投票受付中）を組み立てます。"""
+def _build_poll_container(record: dict, *, closed: bool = False) -> discord.ui.Container:
+    """投票データから一覧表示用のContainer（Components V2、投票受付中）を組み立てます。
+    旧来のdiscord.Embedを廃止し、Container + TextDisplay + Separatorで同等の情報を表示する。"""
     choices = record["choices"]
     emojis = EMOJIS[:len(choices)]
-    embed = discord.Embed(
-        title=f"[STATS] {record['question']}",
-        color=discord.Color.blurple() if not closed else discord.Color.dark_grey()
-    )
-    for i, choice in enumerate(choices):
-        embed.add_field(name=f"{emojis[i]} {choice}", value="\u200b", inline=False)
+    accent = discord.Color.blurple() if not closed else discord.Color.dark_grey()
+    container = discord.ui.Container(accent_color=accent)
+
+    container.add_item(discord.ui.TextDisplay(f"## [STATS] {record['question']}"))
+    container.add_item(discord.ui.Separator())
+
+    # 従来のembed.add_fieldに相当する各選択肢の表示
+    choice_lines = "\n".join(f"{emojis[i]} {choice}" for i, choice in enumerate(choices))
+    container.add_item(discord.ui.TextDisplay(choice_lines))
+
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
     status = "締め切りました" if closed else "ボタンを押して投票してください"
-    embed.set_footer(text=f"投票者: {record['creator_name']} | {status}")
-    return embed
+    container.add_item(discord.ui.TextDisplay(f"-# 投票者: {record['creator_name']} | {status}"))
+    return container
 
 
-def _build_result_embed(record: dict, *, title: str = "[STATS] 現在の投票結果") -> discord.Embed:
-    """投票データから結果集計用のEmbedを組み立てます。"""
+def _build_result_container(record: dict, *, title: str = "[STATS] 現在の投票結果") -> discord.ui.Container:
+    """投票データから結果集計用のContainer（Components V2）を組み立てます。
+    旧来のdiscord.Embedを廃止し、Container + TextDisplay + Separatorで同等の情報を表示する。"""
     choices = record["choices"]
     emojis = EMOJIS[:len(choices)]
     votes: dict[str, int] = record.get("votes", {})  # {user_id_str: choice_index}
@@ -18060,13 +18069,15 @@ def _build_result_embed(record: dict, *, title: str = "[STATS] 現在の投票�
         adj_text = f"（手動調整: {adj:+d}）" if adj else ""
         lines.append(f"{emoji} **{choice}**\n`{bar}` {count}票 ({pct}%){adj_text}")
 
-    embed = discord.Embed(
-        title=title,
-        description="\n\n".join(lines) if lines else "まだ投票はありません。",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text=f"総投票数: {total}票（実投票者数: {total_voters}人） | 投票ID: {record.get('poll_id', '?')}")
-    return embed
+    container = discord.ui.Container(accent_color=discord.Color.green())
+    container.add_item(discord.ui.TextDisplay(f"## {title}"))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay("\n\n".join(lines) if lines else "まだ投票はありません。"))
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(
+        f"-# 総投票数: {total}票（実投票者数: {total_voters}人） | 投票ID: {record.get('poll_id', '?')}"
+    ))
+    return container
 
 
 @bot.tree.command(name="poll", description="絵文字ボタン付きの投票パネルを作れます（サーバーでもDMでもグループDMでも使えます）")
@@ -18106,10 +18117,9 @@ async def poll(
     cfg.setdefault("polls", {})[str(poll_id)] = record
     save_data(all_data)
 
-    embed = _build_poll_embed(record)
-    view = PollView(guild_id, poll_id, choices)
+    view = PollView(guild_id, poll_id, choices, 質問, str(interaction.user))
     try:
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.response.send_message(view=view)
         sent_message = await interaction.original_response()
     except discord.HTTPException as e:
         # ここに到達した場合、Discord側でメッセージ内容が拒否されている
@@ -18140,47 +18150,81 @@ async def _is_poll_closer(interaction: discord.Interaction, record: dict) -> boo
     return False
 
 
-class PollView(discord.ui.View):
-    """投票パネル用ビュー。各選択肢のボタン押下で票数を集計し、JSONへ永続化します。"""
+class PollResultLayoutView(discord.ui.LayoutView):
+    """結果表示・締め切り後の結果公開用のComponents V2レイアウト（ボタンなし、Container単体）。"""
 
-    def __init__(self, guild_id: int, poll_id: int, choices: list[str]):
+    def __init__(self, record: dict, *, title: str = "[STATS] 現在の投票結果"):
+        super().__init__(timeout=None)
+        self.add_item(_build_result_container(record, title=title))
+
+
+class PollView(discord.ui.LayoutView):
+    """投票パネル用ビュー（Components V2）。
+    Container内に投票内容の表示とボタン（選択肢・結果表示・締め切り）をまとめて配置する。
+    各選択肢のボタン押下で票数を集計し、JSONへ永続化します。"""
+
+    def __init__(self, guild_id: int, poll_id: int, choices: list[str], question: str, creator_name: str, *, closed: bool = False):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.poll_id = poll_id
         self.choices = choices
-        emojis = EMOJIS[:len(choices)]
-        for i, (choice, emoji) in enumerate(zip(choices, emojis)):
+        self.question = question
+        self.creator_name = creator_name
+        self._render(closed=closed)
+
+    def _render(self, *, closed: bool = False):
+        self.clear_items()
+        # 表示用の最小レコード（question/creator_name/choicesのみ使用）
+        display_record = {
+            "question": self.question,
+            "choices": self.choices,
+            "creator_name": self.creator_name,
+        }
+        container = _build_poll_container(display_record, closed=closed)
+
+        # --- 選択肢ボタン（Container内のActionRowとして配置、3つずつ行分け） ---
+        emojis = EMOJIS[:len(self.choices)]
+        buttons = []
+        for i, (choice, emoji) in enumerate(zip(self.choices, emojis)):
             btn = discord.ui.Button(
                 label=choice[:40],
                 emoji=emoji,
                 style=discord.ButtonStyle.primary,
-                custom_id=f"poll_choice_{guild_id}_{poll_id}_{i}",
-                row=i // 3,
+                custom_id=f"poll_choice_{self.guild_id}_{self.poll_id}_{i}",
+                disabled=closed,
             )
             btn.callback = self._make_callback(i)
-            self.add_item(btn)
+            buttons.append(btn)
 
-        # 結果表示ボタン（本人向け・非公開）
+        for start in range(0, len(buttons), 3):
+            row = discord.ui.ActionRow()
+            for btn in buttons[start:start + 3]:
+                row.add_item(btn)
+            container.add_item(row)
+
+        # --- 結果表示ボタン・締め切りボタン（Container内のActionRowとして配置） ---
+        action_row = discord.ui.ActionRow()
         result_btn = discord.ui.Button(
             label="現在の結果を見る",
             style=discord.ButtonStyle.secondary,
             emoji="📊",
-            custom_id=f"poll_result_{guild_id}_{poll_id}",
-            row=2,
+            custom_id=f"poll_result_{self.guild_id}_{self.poll_id}",
         )
         result_btn.callback = self._show_result
-        self.add_item(result_btn)
+        action_row.add_item(result_btn)
 
-        # 締め切りボタン（作成者/Botオーナーのみ）
         close_btn = discord.ui.Button(
             label="締め切る",
             style=discord.ButtonStyle.danger,
             emoji="🔒",
-            custom_id=f"poll_close_{guild_id}_{poll_id}",
-            row=2,
+            custom_id=f"poll_close_{self.guild_id}_{self.poll_id}",
+            disabled=closed,
         )
         close_btn.callback = self._close_poll
-        self.add_item(close_btn)
+        action_row.add_item(close_btn)
+        container.add_item(action_row)
+
+        self.add_item(container)
 
     def _make_callback(self, index: int):
         async def callback(interaction: discord.Interaction):
@@ -18217,8 +18261,7 @@ class PollView(discord.ui.View):
         if record is None:
             await interaction.response.send_message("投票データが見つかりませんでした。", ephemeral=True)
             return
-        embed = _build_result_embed(record)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(view=PollResultLayoutView(record), ephemeral=True)
 
     async def _close_poll(self, interaction: discord.Interaction):
         all_data = load_data()
@@ -18236,24 +18279,22 @@ class PollView(discord.ui.View):
         save_data(all_data)
 
         # パネル本体を「締切済み」表示に更新（ボタン無効化）
-        closed_embed = _build_poll_embed(record, closed=True)
-        for item in self.children:
-            item.disabled = True
+        self._render(closed=True)
         try:
-            await interaction.response.edit_message(embed=closed_embed, view=self)
+            await interaction.response.edit_message(view=self)
         except discord.HTTPException:
             pass
 
-        # 結果を公開（同じチャンネルに結果embedを送信）
-        result_embed = _build_result_embed(record, title="[STATS] 投票結果（締め切りました）")
+        # 結果を公開（同じチャンネルに結果Containerを送信）
+        result_view = PollResultLayoutView(record, title="[STATS] 投票結果（締め切りました）")
         try:
             if interaction.channel is not None:
-                await interaction.channel.send(embed=result_embed)
+                await interaction.channel.send(view=result_view)
             else:
-                await interaction.followup.send(embed=result_embed)
+                await interaction.followup.send(view=result_view)
         except discord.HTTPException:
             try:
-                await interaction.followup.send(embed=result_embed, ephemeral=True)
+                await interaction.followup.send(view=result_view, ephemeral=True)
             except discord.HTTPException:
                 pass
 
