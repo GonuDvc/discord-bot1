@@ -14500,20 +14500,40 @@ async def ai_chat_search_status(interaction: discord.Interaction):
 
 class AIChatSearchToggleView(discord.ui.View):
     """
-    /ai_chat set_search で表示される、Web検索機能のON/OFFをボタン1つで切り替えられるビュー。
+    /ai_chat set_search で表示される、Web検索機能・Playwrightによる記事本文取得機能の
+    ON/OFFをボタンで切り替えられるビュー。
     管理者権限を持つユーザーのみが操作できるよう、ボタン押下時に権限を再チェックする。
+
+    【設計メモ】Playwrightのトグルは当初 /ai_chat set_playwright という別コマンドとして
+    実装していたが、discord.pyのGroupは子要素（コマンド＋サブグループ）を合計25個までしか
+    持てず、ai_chat_groupは既にサブグループ（bot_reply/dm/translate/memory/my_prompt/
+    weekly_summary）だけで6個あるため、コマンドを1つ増やすとその上限を超えて
+    Bot起動時に "ValueError: maximum number of child commands exceeded" で
+    クラッシュしてしまう。そのため新規コマンドは追加せず、既存のset_searchビューに
+    ボタンを1つ追加する形で対応する。
     """
-    def __init__(self, guild_id: int, enabled: bool):
+    def __init__(self, guild_id: int, search_enabled: bool, playwright_enabled: bool):
         super().__init__(timeout=120)
         self.guild_id = guild_id
-        self._update_button_style(enabled)
+        self._update_search_button_style(search_enabled)
+        self._update_playwright_button_style(playwright_enabled)
+        if not _PLAYWRIGHT_AVAILABLE:
+            # Bot環境にplaywright未導入の場合は切り替えても意味がないため、押せないようにする
+            self.playwright_toggle_button.disabled = True
+            self.playwright_toggle_button.label = "🚫 本文取得（未導入のため利用不可）"
 
-    def _update_button_style(self, enabled: bool):
-        self.toggle_button.label = "🔴 検索をOFFにする" if enabled else "🟢 検索をONにする"
-        self.toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+    def _update_search_button_style(self, enabled: bool):
+        self.search_toggle_button.label = "🔴 検索をOFFにする" if enabled else "🟢 検索をONにする"
+        self.search_toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
 
-    @discord.ui.button(label="切り替え", style=discord.ButtonStyle.secondary)
-    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def _update_playwright_button_style(self, enabled: bool):
+        if not _PLAYWRIGHT_AVAILABLE:
+            return
+        self.playwright_toggle_button.label = "🔴 本文取得をOFFにする" if enabled else "🟢 本文取得をONにする"
+        self.playwright_toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
+
+    @discord.ui.button(label="検索: 切り替え", style=discord.ButtonStyle.secondary, row=0)
+    async def search_toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("このボタンは管理者のみ操作できます。", ephemeral=True)
             return
@@ -14525,69 +14545,18 @@ class AIChatSearchToggleView(discord.ui.View):
         guild_config["ai_chat_web_search_enabled"] = new_value
         save_data(all_data)
 
-        self._update_button_style(new_value)
+        self._update_search_button_style(new_value)
+        await interaction.response.edit_message(embed=self._build_embed(all_data), view=self)
 
-        embed = discord.Embed(
-            title="AIチャット Web検索機能",
-            description=(
-                f"このサーバーでの設定を **{'✅ 有効' if new_value else '⏸️ 無効'}** に変更しました。\n\n"
-                + ("AIが必要と判断した質問には自動でWeb検索を使って回答します。"
-                   if new_value else
-                   "AIはWeb検索を使わず、学習データの時点までの知識のみで応答します。")
-            ),
-            color=discord.Color.green() if new_value else discord.Color.orange()
-        )
-        await interaction.response.edit_message(embed=embed, view=self)
-
-
-@ai_chat_group.command(name="set_search", description="【管理者専用】AIチャットのWeb検索機能を、ボタン一つでON/OFFできます")
-async def ai_chat_set_search(interaction: discord.Interaction):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
-        return
-
-    if not WEB_SEARCH_AVAILABLE:
-        await interaction.response.send_message(
-            "❌ Web検索用のAPIキーがBotに1つも設定されていないため、このサーバーでON/OFFを切り替えても"
-            "実際の動作は変わりません（常に検索なしで応答します）。",
-            ephemeral=True
-        )
-        return
-
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, str(interaction.guild.id))
-    search_enabled_for_guild = guild_config.get("ai_chat_web_search_enabled", True)
-
-    embed = discord.Embed(
-        title="AIチャット Web検索機能",
-        description=(
-            f"現在の設定: **{'✅ 有効' if search_enabled_for_guild else '⏸️ 無効'}**\n\n"
-            "下のボタンで切り替えできます。"
-        ),
-        color=discord.Color.green() if search_enabled_for_guild else discord.Color.orange()
-    )
-    view = AIChatSearchToggleView(interaction.guild.id, search_enabled_for_guild)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
-class AIChatPlaywrightToggleView(discord.ui.View):
-    """
-    /ai_chat set_playwright で表示される、Playwrightによる記事本文取得機能のON/OFFを
-    ボタン1つで切り替えられるビュー。AIChatSearchToggleViewと同じ構造。
-    """
-    def __init__(self, guild_id: int, enabled: bool):
-        super().__init__(timeout=120)
-        self.guild_id = guild_id
-        self._update_button_style(enabled)
-
-    def _update_button_style(self, enabled: bool):
-        self.toggle_button.label = "🔴 本文取得をOFFにする" if enabled else "🟢 本文取得をONにする"
-        self.toggle_button.style = discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success
-
-    @discord.ui.button(label="切り替え", style=discord.ButtonStyle.secondary)
-    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="本文取得: 切り替え", style=discord.ButtonStyle.secondary, row=1)
+    async def playwright_toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("このボタンは管理者のみ操作できます。", ephemeral=True)
+            return
+        if not _PLAYWRIGHT_AVAILABLE:
+            await interaction.response.send_message(
+                "PlaywrightがこのBot環境に導入されていないため、切り替えできません。", ephemeral=True
+            )
             return
 
         all_data = load_data()
@@ -14597,53 +14566,55 @@ class AIChatPlaywrightToggleView(discord.ui.View):
         guild_config["ai_chat_playwright_fetch_enabled"] = new_value
         save_data(all_data)
 
-        self._update_button_style(new_value)
+        self._update_playwright_button_style(new_value)
+        await interaction.response.edit_message(embed=self._build_embed(all_data), view=self)
 
-        embed = discord.Embed(
-            title="AIチャット 記事本文取得機能（Playwright）",
-            description=(
-                f"このサーバーでの設定を **{'✅ 有効' if new_value else '⏸️ 無効'}** に変更しました。\n\n"
-                + ("Web検索結果の出典URLを実ブラウザで開き、JavaScriptで描画されるページも含めて"
-                   "本文を取得してからAIに渡します。"
-                   if new_value else
-                   "Web検索結果は各検索APIが返す要約（スニペット）のみで応答します。")
-            ),
-            color=discord.Color.green() if new_value else discord.Color.orange()
+    def _build_embed(self, all_data: dict) -> discord.Embed:
+        guild_config = get_guild_config(all_data, str(self.guild_id))
+        search_enabled = guild_config.get("ai_chat_web_search_enabled", True)
+        playwright_enabled = guild_config.get("ai_chat_playwright_fetch_enabled", True)
+
+        lines = [
+            f"Web検索: **{'✅ 有効' if search_enabled else '⏸️ 無効'}**"
+            + ("（AIが必要と判断した質問には自動でWeb検索を使って回答します）" if search_enabled else "（学習データの時点までの知識のみで応答します）"),
+            "",
+        ]
+        if _PLAYWRIGHT_AVAILABLE:
+            lines.append(
+                f"記事本文の実ブラウザ取得（Playwright）: **{'✅ 有効' if playwright_enabled else '⏸️ 無効'}**"
+                + ("（検索結果の出典URLをJS描画込みで本文取得します）" if playwright_enabled else "（検索APIが返す要約のみで応答します）")
+            )
+        else:
+            lines.append("記事本文の実ブラウザ取得（Playwright）: ❌ 未導入（Bot環境にplaywrightが入っていません）")
+
+        return discord.Embed(
+            title="AIチャット Web検索機能",
+            description="\n".join(lines) + "\n\n下のボタンで切り替えできます。",
+            color=discord.Color.green() if search_enabled else discord.Color.orange()
         )
-        await interaction.response.edit_message(embed=embed, view=self)
 
 
-@ai_chat_group.command(name="set_playwright", description="【管理者専用】Web検索結果の記事本文を実ブラウザで取得する機能を、ボタン一つでON/OFFできます")
-async def ai_chat_set_playwright(interaction: discord.Interaction):
+@ai_chat_group.command(name="set_search", description="【管理者専用】AIチャットのWeb検索・記事本文取得（Playwright）機能を、ボタンでON/OFFできます")
+async def ai_chat_set_search(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドは管理者のみ実行できます。", ephemeral=True)
         return
 
-    if not _PLAYWRIGHT_AVAILABLE:
+    if not WEB_SEARCH_AVAILABLE and not _PLAYWRIGHT_AVAILABLE:
         await interaction.response.send_message(
-            "❌ PlaywrightがこのBot環境に導入されていないため、このサーバーでON/OFFを切り替えても"
-            "実際の動作は変わりません（常に検索APIのスニペットのみで応答します）。\n"
-            "導入するには `requirements.txt` に `playwright` を追加し、デプロイ時に "
-            "`playwright install --with-deps chromium` を実行するよう設定してください。",
+            "❌ Web検索用のAPIキーもPlaywrightもこのBotに設定・導入されていないため、"
+            "このサーバーでON/OFFを切り替えても実際の動作は変わりません（常に検索なしで応答します）。",
             ephemeral=True
         )
         return
 
     all_data = load_data()
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    search_enabled_for_guild = guild_config.get("ai_chat_web_search_enabled", True)
     playwright_enabled_for_guild = guild_config.get("ai_chat_playwright_fetch_enabled", True)
 
-    embed = discord.Embed(
-        title="AIチャット 記事本文取得機能（Playwright）",
-        description=(
-            f"現在の設定: **{'✅ 有効' if playwright_enabled_for_guild else '⏸️ 無効'}**\n\n"
-            "Web検索結果の出典URL上位数件を実ブラウザ（Chromium）で開き、"
-            "JavaScriptで描画されるページも含めて本文を取得し、要約より詳しい情報をAIに渡します。\n\n"
-            "下のボタンで切り替えできます。"
-        ),
-        color=discord.Color.green() if playwright_enabled_for_guild else discord.Color.orange()
-    )
-    view = AIChatPlaywrightToggleView(interaction.guild.id, playwright_enabled_for_guild)
+    view = AIChatSearchToggleView(interaction.guild.id, search_enabled_for_guild, playwright_enabled_for_guild)
+    embed = view._build_embed(all_data)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
