@@ -13031,13 +13031,65 @@ class HelpQuickActionSelect(discord.ui.Select):
                 await interaction.response.send_message("コマンドの実行中にエラーが発生しました。", ephemeral=True)
 
 
-class HelpQuickActionView(discord.ui.View):
-    """helpの選択式コマンド実行メニュー用View。実行できるコマンドが1つも無い場合は何も表示しない。"""
+class HelpLayoutView(discord.ui.LayoutView):
+    """/help 用のComponents V2ページ送りビュー。
+    LayoutView全体で共有されるTextDisplayの文字数上限（4000字）を超えないよう、
+    カテゴリ単位でページ分割し、◀/▶ボタンで切り替える構成にしている。
+    （このメッセージはephemeralなので、ボタン操作もコマンド実行者にしか表示・操作できない）"""
 
-    def __init__(self, actions: list):
+    def __init__(self, pages: list, quick_actions: list):
+        # pages: [(category_title, body_text), ...]
         super().__init__(timeout=180)
-        if actions:
-            self.add_item(HelpQuickActionSelect(actions))
+        self.pages = pages
+        self.quick_actions = quick_actions
+        self.page_index = 0
+        self._render()
+
+    def _render(self):
+        self.clear_items()
+        title, body = self.pages[self.page_index]
+
+        container = discord.ui.Container(accent_color=discord.Color.blue())
+        container.add_item(discord.ui.TextDisplay("## マクマクBOT コマンド一覧"))
+        container.add_item(discord.ui.TextDisplay("あなたがこのサーバーで利用できるスラッシュコマンドの一覧です。"))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(f"**{title}**\n{body}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay(
+            f"-# ページ {self.page_index + 1}/{len(self.pages)}　"
+            "セキュリティのため、このヘルプは実行したあなたにのみ見えています。"
+        ))
+        self.add_item(container)
+
+        nav_row = discord.ui.ActionRow()
+        prev_button = discord.ui.Button(
+            label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(self.page_index == 0)
+        )
+        prev_button.callback = self._go_prev
+        next_button = discord.ui.Button(
+            label="次へ ▶", style=discord.ButtonStyle.secondary,
+            disabled=(self.page_index == len(self.pages) - 1)
+        )
+        next_button.callback = self._go_next
+        nav_row.add_item(prev_button)
+        nav_row.add_item(next_button)
+        self.add_item(nav_row)
+
+        # --- 選択式クイック実行メニュー（権限に応じたコマンドをどのページからでも実行可能） ---
+        if self.quick_actions:
+            action_row = discord.ui.ActionRow()
+            action_row.add_item(HelpQuickActionSelect(self.quick_actions))
+            self.add_item(action_row)
+
+    async def _go_prev(self, interaction: discord.Interaction):
+        self.page_index = max(0, self.page_index - 1)
+        self._render()
+        await interaction.response.edit_message(view=self)
+
+    async def _go_next(self, interaction: discord.Interaction):
+        self.page_index = min(len(self.pages) - 1, self.page_index + 1)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
 
 @bot.tree.command(name="help", description="使えるコマンドをカテゴリごとにまとめて見せてくれます")
@@ -13064,155 +13116,127 @@ async def help_command(interaction: discord.Interaction):
                 if user_role_ids & allowed_role_ids:
                     is_allowed = True
 
-    embed = discord.Embed(
-        title="マクマクBOT コマンド一覧",
-        description="あなたがこのサーバーで利用できるスラッシュコマンドの一覧です。",
-        color=discord.Color.blue()
-    )
-    embed.add_field(
-        name="一般ユーザー向け機能",
-        value=(
-            "`/help` : このコマンド一覧をあなただけに表示します\n"
-            "`/my scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
-            "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
-            "`/calc` : 数式を計算して結果を返します\n"
-            "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
-            "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
-            "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
-            "`/avatar` : イラスト風のランダムアバター画像を生成します（DM・グループDM・サーバー内どこでも利用可能）\n"
-            "`/profile view` : Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します\n"
-            "`/profile background set` : プロフィールカードの背景画像を自分でアップロードした画像に差し替えます\n"
-            "`/giveaway` : プレゼント企画を作成・管理します\n"
-            "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
-            "`/server stats` : サーバーの統計情報を表示します\n"
-            "`/server protect iplogger_check` : URLがIPロガーでないかチェックします\n"
-            "`/server protect ip_ban_check` : ウェブ認証を利用したBAN逃れ（同一IP）対策を設定します\n"
-            "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
-            "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
-            "`/gacha draw` : Mコインを消費してAI生成のオリジナル人格を引きます（`/gacha list`で確認、`/gacha use`で/aiに適用、`/gacha rates`で排出率確認）\n"
-            "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="ボイスチャンネル再生機能",
-        value=(
-            "`/voice join` : あなたのいるボイスチャンネルにBotを参加させます\n"
-            "`/voice leave` : ボイスチャンネルから退出させます\n"
-            "`/voice play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
-            "`/voice_sound list` : 登録済み音源の一覧を表示します\n"
-            "`/voice_sound add` : 音源ファイルを名前付きで登録します（誰でも使用可能）\n"
-            "`/voice_sound remove` : 登録済み音源を削除します（オーナー限定）"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Vibeモニター（空気・緊張度の監視）",
-        value=(
-            "`/vibe setup` : 【モデレーター専用】会話の空気をAIが定期監視する機能を有効化します\n"
-            "`/vibe status` : 現在の設定状況を確認します\n"
-            "`/vibe threshold` : アラートを送る緊張度スコアの閾値(1-10)を変更します\n"
-            "※発言の削除や警告は行わず、険悪な空気を検知した際の通知のみ行います"
-        ),
-        inline=False
-    )
+    pages = []
+
+    pages.append((
+        "一般ユーザー向け機能",
+        "`/help` : このコマンド一覧をあなただけに表示します\n"
+        "`/my scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
+        "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
+        "`/calc` : 数式を計算して結果を返します\n"
+        "`/poll` : 投票パネルを作成します（サーバー・DM・グループDMどこでも利用可能、作成者/Botオーナーが締め切り可能）\n"
+        "`/ai <質問>` : AIに質問します（DM・グループDM・サーバー内どこでも利用可能）\n"
+        "`/image <プロンプト>` : AIに画像を生成させます（DM・グループDM・サーバー内どこでも利用可能）\n"
+        "`/avatar` : イラスト風のランダムアバター画像を生成します（DM・グループDM・サーバー内どこでも利用可能）\n"
+        "`/profile view` : Mコイン残高や招待実績などをまとめたプロフィールカード画像を生成します\n"
+        "`/profile background set` : プロフィールカードの背景画像を自分でアップロードした画像に差し替えます\n"
+        "`/giveaway` : プレゼント企画を作成・管理します\n"
+        "`/moderation warnings` : 指定ユーザーの警告履歴を確認します\n"
+        "`/server stats` : サーバーの統計情報を表示します\n"
+        "`/server protect iplogger_check` : URLがIPロガーでないかチェックします\n"
+        "`/server protect ip_ban_check` : ウェブ認証を利用したBAN逃れ（同一IP）対策を設定します\n"
+        "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
+        "`/economy gift` : 自分のコインを他のユーザーに贈ります\n"
+        "`/gacha draw` : Mコインを消費してAI生成のオリジナル人格を引きます（`/gacha list`で確認、`/gacha use`で/aiに適用、`/gacha rates`で排出率確認）\n"
+        "`/面接` : 面接（応募）を開始します。質問に順番に回答してください"
+    ))
+    pages.append((
+        "ボイスチャンネル再生機能",
+        "`/voice join` : あなたのいるボイスチャンネルにBotを参加させます\n"
+        "`/voice leave` : ボイスチャンネルから退出させます\n"
+        "`/voice play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
+        "`/voice_sound list` : 登録済み音源の一覧を表示します\n"
+        "`/voice_sound add` : 音源ファイルを名前付きで登録します（誰でも使用可能）\n"
+        "`/voice_sound remove` : 登録済み音源を削除します（オーナー限定）"
+    ))
+    pages.append((
+        "Vibeモニター（空気・緊張度の監視）",
+        "`/vibe setup` : 【モデレーター専用】会話の空気をAIが定期監視する機能を有効化します\n"
+        "`/vibe status` : 現在の設定状況を確認します\n"
+        "`/vibe threshold` : アラートを送る緊張度スコアの閾値(1-10)を変更します\n"
+        "※発言の削除や警告は行わず、険悪な空気を検知した際の通知のみ行います"
+    ))
 
     if is_admin or is_allowed or is_owner:
-        embed.add_field(
-            name="管理者・許可ユーザー専用コマンド",
-            value=(
-                "`/my scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
-                "`/my audit_perms` : @everyone の不適切な権限をスキャンします\n"
-                "`/my check_url` : URLの安全性をVirusTotalでチェックします\n"
-                "`/say text` : Botに指定したメッセージを代わりに発言させます\n"
-                "`/owner_dm send` : 指定ユーザーにDMを送信します\n"
-                "`/embed builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
-                "`/moderation warn` : ユーザーに警告を付与します\n"
-                "`/moderation kick` : ユーザーをサーバーからキックします\n"
-                "`/moderation ban` : ユーザーをサーバーからBANします\n"
-                "`/moderation mute` : ユーザーをタイムアウト（ミュート）します\n"
-                "`/moderation purge` : 指定件数のメッセージを一括削除します\n"
-                "`/moderation purge_user` : 指定チャンネル内の指定メンバーのメッセージのみ一括削除します\n"
-                "`/moderation purge_external_apps` : 外部アプリ（他Bot）のコマンド実行によるメッセージを一括削除します（all_channelsで全チャンネル対象も可）\n"
-                "`/moderation slowmode` : チャンネルの低速モードを設定します\n"
-                "`/role_permission add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
-            ),
-            inline=False
-        )
+        pages.append((
+            "管理者・許可ユーザー専用コマンド",
+            "`/my scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
+            "`/my audit_perms` : @everyone の不適切な権限をスキャンします\n"
+            "`/my check_url` : URLの安全性をVirusTotalでチェックします\n"
+            "`/say text` : Botに指定したメッセージを代わりに発言させます\n"
+            "`/owner_dm send` : 指定ユーザーにDMを送信します\n"
+            "`/embed builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
+            "`/moderation warn` : ユーザーに警告を付与します\n"
+            "`/moderation kick` : ユーザーをサーバーからキックします\n"
+            "`/moderation ban` : ユーザーをサーバーからBANします\n"
+            "`/moderation mute` : ユーザーをタイムアウト（ミュート）します\n"
+            "`/moderation purge` : 指定件数のメッセージを一括削除します\n"
+            "`/moderation purge_user` : 指定チャンネル内の指定メンバーのメッセージのみ一括削除します\n"
+            "`/moderation purge_external_apps` : 外部アプリ（他Bot）のコマンド実行によるメッセージを一括削除します（all_channelsで全チャンネル対象も可）\n"
+            "`/moderation slowmode` : チャンネルの低速モードを設定します\n"
+            "`/role_permission add` / `remove` / `list` : このカテゴリのコマンドを使えるロールを設定します"
+        ))
     if is_admin or is_owner:
-        embed.add_field(
-            name="サーバー管理者専用コマンド (1/2)",
-            value=(
-                "`/server status` : 現在の各種機能の設定状況を確認します\n"
-                "`/server list_users` : コマンド使用許可リストの確認・編集を行います\n"
-                "`/server create_channel` : 新しいテキストチャンネルを作成します\n"
-                "`/server config copy` : チャンネルをコピーして複製します\n"
-                "`/server role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
-                "`/server forward setup` / `/server forward reset` : メッセージ自動転送の設定・解除を行います\n"
-                "`/server announce setup` / `/server announce send` : 配信お知らせ機能の設定と送信を行います\n"
-                "`/server verify setup` / `/server verify btn` : メンバー認証用パネルを設置します\n"
-                "`/server mention setup` / `/server mention reset` : 自動返信ロールメンションの設定と解除を行います\n"
-                "`/server stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
-                "`/server config backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server config restore` : バックアップJSONからサーバー構成を復元します\n"
-                "`/ticket setup` : このチャンネルに問い合わせチケットパネルを設置します\n"
-                "`/ticket close` : 現在のチケットチャンネルをクローズします\n"
-                "`/interview setup` : 面接システムの実施方式・結果通知先などを設定します\n"
-                "`/interview panel` : このチャンネルに「面接を受ける」ボタン付きパネルを設置します\n"
-                "`/interview question add` / `remove` / `list` : 面接の質問リストを管理します\n"
-                "`/interview pass_message` : 合格時に追加送信するメッセージ（招待URL等）を設定します"
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="サーバー管理者専用コマンド (2/2)",
-            value=(
-                "`/server protect welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
-                "`/automod modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
-                "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード・画像OCR招待リンク検知）を切り替えます\n"
-                "`/automod ngword_add` / `/automod ngword_remove` : NGワードの追加・削除を行います\n"
-                "`/server protect alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
-                "`/antinuke toggle` : 不審な連続操作の自動検出を有効・無効にします\n"
-                "`/antinuke level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
-                "`/antinuke threshold` : 検出条件の操作回数・時間幅を設定します\n"
-                "`/antinuke notify` : 通知先チャンネルと免除ロールを設定します\n"
-                "`/antinuke status` : 現在の設定状況を確認します"
-            ),
-            inline=False
-        )
+        pages.append((
+            "サーバー管理者専用コマンド (1/2)",
+            "`/server status` : 現在の各種機能の設定状況を確認します\n"
+            "`/server list_users` : コマンド使用許可リストの確認・編集を行います\n"
+            "`/server create_channel` : 新しいテキストチャンネルを作成します\n"
+            "`/server config copy` : チャンネルをコピーして複製します\n"
+            "`/server role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
+            "`/server forward setup` / `/server forward reset` : メッセージ自動転送の設定・解除を行います\n"
+            "`/server announce setup` / `/server announce send` : 配信お知らせ機能の設定と送信を行います\n"
+            "`/server verify setup` / `/server verify btn` : メンバー認証用パネルを設置します\n"
+            "`/server mention setup` / `/server mention reset` : 自動返信ロールメンションの設定と解除を行います\n"
+            "`/server stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
+            "`/server config backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
+            "`/server config restore` : バックアップJSONからサーバー構成を復元します\n"
+            "`/ticket setup` : このチャンネルに問い合わせチケットパネルを設置します\n"
+            "`/ticket close` : 現在のチケットチャンネルをクローズします\n"
+            "`/interview setup` : 面接システムの実施方式・結果通知先などを設定します\n"
+            "`/interview panel` : このチャンネルに「面接を受ける」ボタン付きパネルを設置します\n"
+            "`/interview question add` / `remove` / `list` : 面接の質問リストを管理します\n"
+            "`/interview pass_message` : 合格時に追加送信するメッセージ（招待URL等）を設定します"
+        ))
+        pages.append((
+            "サーバー管理者専用コマンド (2/2)",
+            "`/server protect welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
+            "`/automod modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
+            "`/automod toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード・画像OCR招待リンク検知）を切り替えます\n"
+            "`/automod ngword_add` / `/automod ngword_remove` : NGワードの追加・削除を行います\n"
+            "`/server protect alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
+            "`/antinuke toggle` : 不審な連続操作の自動検出を有効・無効にします\n"
+            "`/antinuke level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
+            "`/antinuke threshold` : 検出条件の操作回数・時間幅を設定します\n"
+            "`/antinuke notify` : 通知先チャンネルと免除ロールを設定します\n"
+            "`/antinuke status` : 現在の設定状況を確認します"
+        ))
     if is_owner:
-        embed.add_field(
-            name="BOT所有者専用コマンド",
-            value=(
-                "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
-                "`/owner status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
-                "`/owner set_avatar` : BOTのプロフィール画像を変更します（画像添付またはURL指定）\n"
-                "`/owner guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
-                "`/owner guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
-                "`/owner broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
-                "`/owner_trust add` / `/owner_trust remove` / `/owner_trust list` : 信頼ユーザーの追加・削除・一覧管理を行います\n"
-                "`/ai_debate start` : 2つの人格を設定し、AI同士の自動会話をこのチャンネルで開始します\n"
-                "`/ai_debate random start` : お題・2人格をAIにランダム生成させて自動会話を開始します\n"
-                "`/ai_debate stop` : 実行中のAIディベートを停止します\n"
-                "`/ai_debate status` : 実行中のAIディベートの状況を確認します\n"
-                "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="BOT所有者専用 - カスタムコマンド機能",
-            value=(
-                "`/customtrigger add` : 特定の単語に自動返信するトリガーを追加します\n"
-                "`/customtrigger remove` : 登録済みトリガーを選択して削除します\n"
-                "`/customtrigger list` : 登録済みトリガー一覧を表示します\n"
-                "`/customcmd_manage add` : 「/customcmd 名前」で動くカスタムコマンドを追加します\n"
-                "`/customcmd_manage remove` : 登録済みカスタムコマンドを選択して削除します\n"
-                "`/customcmd_manage list` : 登録済みカスタムコマンド一覧を表示します\n"
-                "`/customcmd <名前>` : 登録したカスタムコマンドを実行します（誰でも使用可）"
-            ),
-            inline=False
-        )
-    embed.set_footer(text="セキュリティのため、このヘルプは実行したあなたにのみ見えています。下のメニューから一部のコマンドを直接実行できます。")
+        pages.append((
+            "BOT所有者専用コマンド",
+            "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
+            "`/owner status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
+            "`/owner set_avatar` : BOTのプロフィール画像を変更します（画像添付またはURL指定）\n"
+            "`/owner guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
+            "`/owner guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
+            "`/owner broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
+            "`/owner_trust add` / `/owner_trust remove` / `/owner_trust list` : 信頼ユーザーの追加・削除・一覧管理を行います\n"
+            "`/ai_debate start` : 2つの人格を設定し、AI同士の自動会話をこのチャンネルで開始します\n"
+            "`/ai_debate random start` : お題・2人格をAIにランダム生成させて自動会話を開始します\n"
+            "`/ai_debate stop` : 実行中のAIディベートを停止します\n"
+            "`/ai_debate status` : 実行中のAIディベートの状況を確認します\n"
+            "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
+        ))
+        pages.append((
+            "BOT所有者専用 - カスタムコマンド機能",
+            "`/customtrigger add` : 特定の単語に自動返信するトリガーを追加します\n"
+            "`/customtrigger remove` : 登録済みトリガーを選択して削除します\n"
+            "`/customtrigger list` : 登録済みトリガー一覧を表示します\n"
+            "`/customcmd_manage add` : 「/customcmd 名前」で動くカスタムコマンドを追加します\n"
+            "`/customcmd_manage remove` : 登録済みカスタムコマンドを選択して削除します\n"
+            "`/customcmd_manage list` : 登録済みカスタムコマンド一覧を表示します\n"
+            "`/customcmd <名前>` : 登録したカスタムコマンドを実行します（誰でも使用可）"
+        ))
 
     # --- 選択式クイック実行メニュー ---
     # 引数が不要（または全て省略可能）な代表的なコマンドのみを、権限に応じて表示する。
@@ -13240,7 +13264,7 @@ async def help_command(interaction: discord.Interaction):
     if is_owner:
         quick_actions += owner_actions
 
-    await interaction.response.send_message(embed=embed, view=HelpQuickActionView(quick_actions), ephemeral=True)
+    await interaction.response.send_message(view=HelpLayoutView(pages, quick_actions), ephemeral=True)
 
 
 @my_group.command(name="scan", description="サーバーの情報や、指定したユーザーの基本情報をさっと確認できます")
@@ -13617,35 +13641,52 @@ async def server_status(interaction: discord.Interaction):
     g_id_str = str(g.id)
     all_data = load_data()
     cfg = get_guild_config(all_data, g_id_str)
-    embed = discord.Embed(title=f"{g.name} - 設定状況", description="このサーバーで有効化されている設定一覧です。", color=discord.Color.blue())
+
+    container = discord.ui.Container(accent_color=discord.Color.blue())
+
+    header_text = discord.ui.TextDisplay(
+        f"## {g.name} - 設定状況\nこのサーバーで有効化されている設定一覧です。"
+    )
     if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
+        # embed.set_thumbnail相当。Sectionのaccessoryとしてサムネイルを右側に表示する。
+        container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(g.icon.url)))
+    else:
+        container.add_item(header_text)
+    container.add_item(discord.ui.Separator())
 
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
     to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
     forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
-    embed.add_field(name="メッセージ転送設定", value=forward_status, inline=False)
+    container.add_item(discord.ui.TextDisplay(f"**メッセージ転送設定**\n{forward_status}"))
+
     v_ch = g.get_channel(cfg.get("verify_channel")) if cfg.get("verify_channel") else None
     v_role = g.get_role(cfg.get("verify_role")) if cfg.get("verify_role") else None
     verify_status = f"有効\n・設置ch: {v_ch.mention if v_ch else '削除済'}\n・付与ロール: {v_role.mention if v_role else '削除済'}" if (v_ch or v_role) else "未設定"
-    embed.add_field(name="サーバー認証設定", value=verify_status, inline=False)
+    container.add_item(discord.ui.TextDisplay(f"**サーバー認証設定**\n{verify_status}"))
+
     a_ch = g.get_channel(cfg.get("announce_channel")) if cfg.get("announce_channel") else None
     a_role = g.get_role(cfg.get("announce_role")) if cfg.get("announce_role") else None
     announce_status = f"有効\n・お知らせch: {a_ch.mention if a_ch else '削除済'}\n・メンション対象: {a_role.mention if a_role else '削除済'}" if (a_ch or a_role) else "未設定"
-    embed.add_field(name="配信・お知らせ設定", value=announce_status, inline=False)
+    container.add_item(discord.ui.TextDisplay(f"**配信・お知らせ設定**\n{announce_status}"))
+
     m_ch = g.get_channel(cfg.get("mention_trigger_channel")) if cfg.get("mention_trigger_channel") else None
     m_role = g.get_role(cfg.get("mention_target_role")) if cfg.get("mention_target_role") else None
     m_msg = cfg.get("mention_custom_message", "未設定（デフォルト文章）")
     mention_status = f"有効\n・監視ch: {m_ch.mention if m_ch else '削除済'}\n・通知ロール: {m_role.mention if m_role else '削除済'}\n・返信テキスト: `{m_msg}`" if (m_ch or m_role) else "未設定"
-    embed.add_field(name="自動返信ロールメンション設定", value=mention_status, inline=False)
+    container.add_item(discord.ui.TextDisplay(f"**自動返信ロールメンション設定**\n{mention_status}"))
+
     panel_roles_ids = cfg.get("panel_roles", [])
     valid_panel_roles = [g.get_role(rid).name for rid in panel_roles_ids if g.get_role(rid)]
     panel_status = f"紐付け済み ({len(valid_panel_roles)}個)\n`{', '.join(valid_panel_roles)}`" if valid_panel_roles else "パネル未登録"
-    embed.add_field(name="ロールパネル対象", value=panel_status, inline=False)
+    container.add_item(discord.ui.TextDisplay(f"**ロールパネル対象**\n{panel_status}"))
+
     allowed_users = cfg.get("allowed_users", [])
     allowed_status = ", ".join([f"<@{uid}>" for uid in allowed_users]) if allowed_users else "なし（管理者のみ使用可能）"
-    embed.add_field(name="コマンド使用許可ユーザー", value=allowed_status, inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    container.add_item(discord.ui.TextDisplay(f"**コマンド使用許可ユーザー**\n{allowed_status}"))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 @server_group.command(name="list_users", description="使用を許可しているユーザーのリストを見たり編集したりできます")
