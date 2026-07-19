@@ -13059,8 +13059,9 @@ class HelpLayoutView(discord.ui.LayoutView):
             f"-# ページ {self.page_index + 1}/{len(self.pages)}　"
             "セキュリティのため、このヘルプは実行したあなたにのみ見えています。"
         ))
-        self.add_item(container)
 
+        # --- ページ送りボタン（Container内のActionRowとして配置） ---
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
         nav_row = discord.ui.ActionRow()
         prev_button = discord.ui.Button(
             label="◀ 前へ", style=discord.ButtonStyle.secondary, disabled=(self.page_index == 0)
@@ -13073,13 +13074,16 @@ class HelpLayoutView(discord.ui.LayoutView):
         next_button.callback = self._go_next
         nav_row.add_item(prev_button)
         nav_row.add_item(next_button)
-        self.add_item(nav_row)
+        container.add_item(nav_row)
 
         # --- 選択式クイック実行メニュー（権限に応じたコマンドをどのページからでも実行可能） ---
+        # こちらもContainer内のActionRowとして配置する。
         if self.quick_actions:
             action_row = discord.ui.ActionRow()
             action_row.add_item(HelpQuickActionSelect(self.quick_actions))
-            self.add_item(action_row)
+            container.add_item(action_row)
+
+        self.add_item(container)
 
     async def _go_prev(self, interaction: discord.Interaction):
         self.page_index = max(0, self.page_index - 1)
