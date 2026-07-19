@@ -555,6 +555,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "automod_invite_enabled": False,
             "automod_ng_words_enabled": False,
             "automod_image_ocr_invite_enabled": False,
+            "automod_nsfw_image_enabled": False,
             "ng_words": [],
             "mod_log_channel_id": None,
             "custom_triggers": [],
@@ -596,6 +597,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # OCR結果は誤読が多いため、正規表現での一次検知に加えてAIによる誤検知抑制判定を行う
         # （OCR_SPACE_API_KEY未設定の場合は機能自体が動作しない）。
         ("automod_image_ocr_invite_enabled", False),
+        # True: 画像添付をVision対応AIモデルで解析し、NSFW（性的・過度に暴力的な）画像を検知した場合に
+        # 自動削除する。GROQ_VISION_MODEL未設定の場合は機能自体が動作しない。
+        ("automod_nsfw_image_enabled", False),
         ("ip_ban_check_enabled", False),   # True: ウェブ認証時にBAN済みIPと照合してブロック
         ("ip_ban_action", "ban"),          # "notify" / "kick" / "ban"
         ("ip_hashes", {}),                 # {user_id_str: ip_hash} 認証時に記録した直近IPのハッシュ
@@ -4851,6 +4855,138 @@ async def _check_image_invite_link(message: discord.Message) -> bool:
     return True
 
 
+_AI_NSFW_IMAGE_JUDGE_SYSTEM_PROMPT = (
+    "あなたはDiscordの自動モデレーションシステムの一部です。"
+    "ユーザーがサーバーに投稿した添付画像が渡されます。"
+    "この画像がNSFW（性的な内容・過度な暴力表現・グロテスク表現）に該当するかを判定してください。\n\n"
+    "次のようなケースはflaggedをtrueにしてください:\n"
+    "- 性器・胸部・臀部の露骨な露出や、性行為を連想させる内容\n"
+    "- 過度な流血・死体・拷問等、閲覧者に強い不快感を与えるグロテスクな表現\n\n"
+    "次のような場合はflaggedをfalseにしてください（安全側に倒してください）:\n"
+    "- 水着・下着姿など、露出はあるが性的意図が明確でない通常の写真やイラスト\n"
+    "- アニメ・イラスト調で性的表現を含まないもの\n"
+    "- ミーム画像、スクリーンショット、風景、食べ物など通常のコンテンツ\n"
+    "- 判定に迷う場合\n\n"
+    "必ず以下のJSON形式のみで出力してください（前後に説明文やコードブロック記号は不要）:\n"
+    '{"flagged": true または false, "reason": "判定理由を一文で"}'
+)
+
+
+async def _ai_judge_nsfw_image(image_url: str) -> Tuple[bool, str]:
+    """
+    Vision対応モデル（GROQ_VISION_MODEL）に画像を渡し、NSFW（性的・グロテスク）表現を
+    含むかどうかを判定します。GROQ_VISION_MODEL未設定、またはAI呼び出しに失敗した場合は
+    安全側（flagged=False、誤検知で削除しない）にフォールバックします。
+    """
+    if not GROQ_VISION_MODEL:
+        return False, "GROQ_VISION_MODELが未設定のため判定を見送りました"
+
+    messages = [
+        {"role": "system", "content": _AI_NSFW_IMAGE_JUDGE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "この画像を判定してください。"},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+    try:
+        raw = await _ai_chat_call_groq(messages, model=GROQ_VISION_MODEL)
+    except Exception as e:
+        print(f"[画像NSFW検知] AI判定の呼び出しに失敗（安全側でflagged=False）: {e}")
+        return False, "AI判定を利用できなかったため見送りました"
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        flagged = bool(parsed.get("flagged", False))
+        reason = str(parsed.get("reason", "")).strip() or "AIがNSFW画像と判定しました"
+        return flagged, reason
+    except (json.JSONDecodeError, AttributeError, ValueError) as e:
+        print(f"[画像NSFW検知] AI判定結果の解析に失敗（安全側でflagged=False）: {e} / raw={cleaned[:200]}")
+        return False, "AI判定結果の解析に失敗したため見送りました"
+
+
+async def _check_nsfw_image(message: discord.Message) -> bool:
+    """
+    メッセージに添付された画像をVision対応AIモデルで解析し、NSFW（性的・グロテスク）表現を
+    検知した場合にメッセージを削除・通知します。True を返すと呼び出し元でメッセージ処理を中断します。
+    NSFWチャンネル（channel.is_nsfw()がTrue）は対象外とし、それ以外のチャンネルのみ判定します。
+    GROQ_VISION_MODEL未設定の場合は何もせず False を返します。
+    Discordのネイティブ「転送」機能で送られたメッセージは、画像添付が message.attachments
+    ではなく message.message_snapshots[].attachments 側に入るため、そちらも走査します。
+    1メッセージに複数枚の画像が添付されている場合、NSFWと判定されるまで順に確認します
+    （最大 _NSFW_MAX_IMAGES_PER_MESSAGE 枚まで。無制限に確認するとAI呼び出しコストが
+    青天井になるため上限を設けています）。
+    """
+    if not GROQ_VISION_MODEL:
+        return False
+
+    channel = message.channel
+    if isinstance(channel, (discord.TextChannel, discord.Thread)) and getattr(channel, "is_nsfw", None):
+        try:
+            if channel.is_nsfw():
+                return False
+        except Exception:
+            pass
+
+    _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+    _NSFW_MAX_IMAGES_PER_MESSAGE = 3
+
+    def _image_urls(attachments) -> list:
+        urls = []
+        for attachment in attachments or []:
+            filename_lower = (getattr(attachment, "filename", "") or "").lower()
+            if filename_lower.endswith(_IMAGE_EXTENSIONS):
+                urls.append(attachment.url)
+        return urls
+
+    image_urls = _image_urls(message.attachments)
+    if not image_urls:
+        for snapshot in getattr(message, "message_snapshots", None) or []:
+            image_urls = _image_urls(getattr(snapshot, "attachments", None))
+            if image_urls:
+                break
+
+    if not image_urls:
+        return False
+
+    for image_url in image_urls[:_NSFW_MAX_IMAGES_PER_MESSAGE]:
+        flagged, reason = await _ai_judge_nsfw_image(image_url)
+        if flagged:
+            break
+    else:
+        return False
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    warn_embed = discord.Embed(
+        title=" NSFW画像を検知・削除しました",
+        color=discord.Color.red()
+    )
+    warn_embed.add_field(name="送信者", value=message.author.mention, inline=True)
+    warn_embed.add_field(name="検知理由", value=reason, inline=False)
+    warn_embed.set_footer(text="画像NSFW検知（AI判定）による自動削除")
+
+    try:
+        await message.channel.send(
+            f"[!] {message.author.mention} NSFWと判定された画像を検知したため削除しました。",
+            delete_after=10
+        )
+    except Exception:
+        pass
+
+    await _send_mod_log(message.guild, warn_embed)
+    return True
+
+
 def _collect_automod_scan_texts(message: discord.Message) -> list:
     """
     自動モデレーションの文字列チェック（招待リンク・NGワード等）の対象となるテキストを
@@ -4954,6 +5090,11 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict, all_
     # こちらも招待リンク対策のため、招待リンク削除と同様に管理者権限があっても対象に含める）
     if guild_config.get("automod_image_ocr_invite_enabled", False) and _is_invite_automod_target(message.author, guild_config, all_data):
         if await _check_image_invite_link(message):
+            return True
+
+    # 画像NSFW検知（Vision対応AIモデルによる判定。管理者権限を持つユーザーは対象外）
+    if guild_config.get("automod_nsfw_image_enabled", False) and _is_automod_target(message.author, guild_config, all_data):
+        if await _check_nsfw_image(message):
             return True
 
     return False
@@ -17245,6 +17386,7 @@ async def purge_external_apps(
     discord.app_commands.Choice(name="NGワード検知", value="ngword"),
     discord.app_commands.Choice(name="AI自動モデレーション（言い換え・遠回しな迷惑発言を検知）", value="ai"),
     discord.app_commands.Choice(name="画像OCR招待リンク検知（AI補助判定）", value="image_ocr_invite"),
+    discord.app_commands.Choice(name="画像NSFW検知（AI判定）", value="nsfw_image"),
 ])
 async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_commands.Choice[str], 有効化: bool):
     if not await is_moderator(interaction): return
@@ -17268,6 +17410,13 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
         )
         return
 
+    if 機能.value == "nsfw_image" and 有効化 and not GROQ_VISION_MODEL:
+        await interaction.response.send_message(
+            "GROQ_VISION_MODEL が設定されていないため、画像NSFW検知を有効化できません。Botの環境変数を確認してください。",
+            ephemeral=True
+        )
+        return
+
     cfg[key] = 有効化
     save_data(all_data)
     status = "ON" if 有効化 else "OFF"
@@ -17276,6 +17425,8 @@ async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_c
         extra_note = f"\n（判定は{AI_AUTOMOD_BATCH_INTERVAL_SECONDS}秒間隔でまとめて実行されるため、削除まで多少のタイムラグがあります）"
     if 機能.value == "image_ocr_invite" and 有効化:
         extra_note = "\n（テキスト本文の招待リンク削除とは独立した設定です。画像添付があるメッセージのみOCR解析を行います）"
+    if 機能.value == "nsfw_image" and 有効化:
+        extra_note = "\n（NSFWチャンネルとして設定済みのチャンネルは対象外です。管理者権限を持つユーザーは自動モデレーションの対象外です）"
     await interaction.response.send_message(
         f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。{extra_note}",
         ephemeral=True
@@ -20074,6 +20225,78 @@ async def _railway_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.
         print(f"[Railway Webhook] 処理中にエラーが発生しました: {e}")
 
     return aiohttp.web.Response(status=200, text="ok")
+
+
+# ====================================================================
+# /ai_health - 各AIプロバイダの生存確認（フォールバック順に対応）
+# ====================================================================
+
+ai_health_group = app_commands.Group(name="ai_health", description="【オーナー限定】AIチャットで使う各プロバイダの生存確認")
+
+# (表示名, APIキーが設定されているか, 実際に疎通確認する非同期関数 or None（キー未設定時はNoneでよい）)
+_AI_HEALTH_PROVIDERS = [
+    ("Groq（メイン）", lambda: bool(GROQ_API_KEY), lambda: _ai_chat_call_groq(
+        [{"role": "user", "content": "OK とだけ返してください。"}], model=GROQ_MODEL
+    )),
+    ("Cerebras（第1フォールバック）", lambda: bool(CEREBRAS_API_KEY), lambda: _ai_chat_call_cerebras(
+        [{"role": "user", "content": "OK とだけ返してください。"}], model=CEREBRAS_MODEL
+    )),
+    ("Mistral（第2フォールバック）", lambda: bool(MISTRAL_API_KEY), lambda: _ai_chat_call_mistral(
+        [{"role": "user", "content": "OK とだけ返してください。"}], model=MISTRAL_MODEL
+    )),
+    ("OpenRouter（第3フォールバック）", lambda: bool(OPENROUTER_API_KEY), lambda: _ai_chat_call_openrouter(
+        [{"role": "user", "content": "OK とだけ返してください。"}], model=OPENROUTER_MODEL
+    )),
+    ("Gemini（最終フォールバック）", lambda: bool(GEMINI_API_KEY), lambda: _ai_chat_call_gemini(
+        [{"role": "user", "content": "OK とだけ返してください。"}], model=GEMINI_MODEL
+    )),
+]
+
+
+@ai_health_group.command(name="status", description="【オーナー限定】AIチャットで使う各プロバイダ（Groq/Cerebras/Mistral/OpenRouter/Gemini）に実際に疎通確認を行います")
+async def ai_health_status_command(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    lines = []
+    any_configured = False
+    for name, is_configured, call_fn in _AI_HEALTH_PROVIDERS:
+        if not is_configured():
+            lines.append(f"⬜ **{name}**: 未設定（APIキー未登録のためスキップ）")
+            continue
+        any_configured = True
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(call_fn(), timeout=20)
+            elapsed = time.monotonic() - start
+            lines.append(f"✅ **{name}**: 正常応答（{elapsed:.1f}秒）")
+        except asyncio.TimeoutError:
+            lines.append(f"❌ **{name}**: タイムアウト（20秒以内に応答なし）")
+        except Exception as e:
+            # トークン日次上限（TPD）やレート制限を他の例外と区別できるよう、エラー文言はそのまま短く表示する
+            err_text = str(e)[:150]
+            lines.append(f"❌ **{name}**: エラー — {err_text}")
+
+    if not any_configured:
+        description = "いずれのAIプロバイダのAPIキーも設定されていません。Botの環境変数を確認してください。"
+        color = discord.Color.red()
+    else:
+        description = "\n".join(lines)
+        all_ok = all(line.startswith("✅") or line.startswith("⬜") for line in lines)
+        color = discord.Color.green() if all_ok else discord.Color.orange()
+
+    embed = discord.Embed(
+        title="[AIプロバイダ 生存確認]",
+        description=description,
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="Groq → Cerebras → Mistral → OpenRouter → Gemini の順にフォールバックします")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(ai_health_group)
 
 
 railway_group = app_commands.Group(name="railway", description="【オーナー限定】RailwayのCPU/メモリ/ストレージ/料金状況の確認")
@@ -25113,6 +25336,7 @@ DASHBOARD_TOGGLE_KEYS = {
     "automod_invite_enabled":   "AutoMod（招待リンクブロック）",
     "automod_ng_words_enabled": "AutoMod（NGワード）",
     "automod_image_ocr_invite_enabled": "AutoMod（画像OCR招待リンク検知）",
+    "automod_nsfw_image_enabled": "AutoMod（画像NSFW検知）",
     "server_blacklist_enabled": "サーバーブラックリスト自動BAN",
     "troll_autoban_enabled":    "荒らしリスト自動BAN",
     "economy_enabled":          "経済システム（コイン）",
@@ -25210,6 +25434,7 @@ class GuildDashboardView(discord.ui.View):
             ("automod_invite_enabled", " 招待リンク", discord.ButtonStyle.secondary),
             ("automod_ng_words_enabled", " NGワード", discord.ButtonStyle.secondary),
             ("automod_image_ocr_invite_enabled", " 画像OCR招待リンク", discord.ButtonStyle.secondary),
+            ("automod_nsfw_image_enabled", " 画像NSFW検知", discord.ButtonStyle.secondary),
             ("server_blacklist_enabled", " 鯖ブラックリスト", discord.ButtonStyle.secondary),
             ("troll_autoban_enabled", " 荒らし自動BAN", discord.ButtonStyle.secondary),
             ("economy_enabled", " 経済システム", discord.ButtonStyle.secondary),
