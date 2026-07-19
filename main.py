@@ -20279,9 +20279,6 @@ async def context_translate_message(interaction: discord.Interaction, message: d
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-bot.tree.add_command(context_translate_message)
-
-
 class _QuickModReasonModal(discord.ui.Modal):
     """クイックモデレーション（BAN/Kick/Mute）の理由入力モーダルです。"""
     def __init__(self, action: str, member: discord.Member, default_minutes: int = 10):
@@ -20418,9 +20415,6 @@ async def context_quick_moderation(interaction: discord.Interaction, member: dis
         view=view,
         ephemeral=True,
     )
-
-
-bot.tree.add_command(context_quick_moderation)
 
 
 # ====================================================================
