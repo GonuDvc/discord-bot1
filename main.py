@@ -20,6 +20,7 @@ import secrets
 import unicodedata
 # import requests  # 削除: aiohttpで代替（同期ライブラリは非同期Botでブロッキングを起こすため）
 import io
+import shutil
 import datetime
 import collections
 import time
@@ -4430,6 +4431,16 @@ async def on_guild_remove(guild: discord.Guild):
     if current_custom_status:
         await update_bot_status(bot)
     _invite_uses_cache.pop(guild.id, None)
+
+    # そのサーバー専用に登録されていた音声ファイル（/voice_sound add）を削除し、
+    # ストレージ（Railwayボリューム等）が使われなくなったサーバー分だけ肥大化し続けるのを防ぐ。
+    try:
+        guild_sounds_dir = os.path.join(SOUNDS_DIR, str(guild.id))
+        if os.path.isdir(guild_sounds_dir):
+            shutil.rmtree(guild_sounds_dir, ignore_errors=True)
+            print(f"[サーバー脱退] 音声フォルダを削除しました: {guild_sounds_dir}")
+    except Exception as e:
+        print(f"[警告] サーバー脱退時の音声フォルダ削除に失敗しました（guild_id={guild.id}）: {e}")
 
 
 @bot.event
@@ -18506,6 +18517,103 @@ async def voice_sound_list(interaction: discord.Interaction):
         embed.description = "\n".join([f"・`{name}`" for name in sounds.keys()])
         embed.set_footer(text=f"登録数: {len(sounds)}件 | /voice play 登録名:<名前> で再生できます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _format_bytes_human(num_bytes: int) -> str:
+    """バイト数を読みやすい単位（KB/MB/GB）の文字列に変換します。"""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0:
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TB"
+
+
+def _get_dir_size_bytes(path: str) -> int:
+    """指定ディレクトリ配下の合計サイズ（バイト）を再帰的に計算します。"""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
+@voice_sound_group.command(
+    name="cleanup_orphaned",
+    description="【Botオーナー限定】既にBotが在籍していないサーバーの音声ファイルを検出・削除し、ストレージを解放します"
+)
+@app_commands.describe(実行="falseの場合は削除対象を一覧表示するだけで、実際には削除しません（既定）")
+async def voice_sound_cleanup_orphaned(interaction: discord.Interaction, 実行: Optional[bool] = False):
+    if not await is_owner_check(interaction):
+        return
+
+    if not os.path.isdir(SOUNDS_DIR):
+        await interaction.response.send_message("音声保存ディレクトリが存在しないため、対象はありません。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    current_guild_ids = {str(g.id) for g in bot.guilds}
+    orphaned = []
+    for entry in os.listdir(SOUNDS_DIR):
+        full_path = os.path.join(SOUNDS_DIR, entry)
+        if not os.path.isdir(full_path):
+            continue
+        # フォルダ名はサーバーID（get_guild_sounds_dirで str(guild_id) を使って作成される）のはず。
+        # 想定外の名前のフォルダは誤削除防止のため対象外とする。
+        if not entry.isdigit():
+            continue
+        if entry in current_guild_ids:
+            continue
+        size = _get_dir_size_bytes(full_path)
+        orphaned.append((entry, full_path, size))
+
+    if not orphaned:
+        await interaction.followup.send("在籍していないサーバーの残留音声ファイルは見つかりませんでした。", ephemeral=True)
+        return
+
+    orphaned.sort(key=lambda x: x[2], reverse=True)
+    total_size = sum(s for _, _, s in orphaned)
+
+    lines = [f"・サーバーID `{gid}` : {_format_bytes_human(size)}" for gid, _, size in orphaned[:25]]
+    if len(orphaned) > 25:
+        lines.append(f"...ほか{len(orphaned) - 25}件")
+
+    if not 実行:
+        embed = discord.Embed(
+            title="残留音声ファイルの検出結果（未削除）",
+            description="\n".join(lines),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text=f"合計: {len(orphaned)}サーバー分 / {_format_bytes_human(total_size)}　実際に削除するには 実行:true を指定してください。")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    deleted_count = 0
+    deleted_size = 0
+    failed = []
+    for gid, full_path, size in orphaned:
+        try:
+            shutil.rmtree(full_path, ignore_errors=False)
+            deleted_count += 1
+            deleted_size += size
+        except Exception as e:
+            failed.append(f"{gid}: {e}")
+
+    embed = discord.Embed(
+        title="残留音声ファイルを削除しました",
+        description="\n".join(lines),
+        color=discord.Color.green()
+    )
+    footer_text = f"削除: {deleted_count}サーバー分 / {_format_bytes_human(deleted_size)} を解放しました。"
+    if failed:
+        footer_text += f"（{len(failed)}件失敗）"
+    embed.set_footer(text=footer_text)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def voice_sound_name_autocomplete(interaction: discord.Interaction, current: str):
