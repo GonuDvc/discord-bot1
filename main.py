@@ -177,6 +177,19 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 IMAGE_GEN_PRIMARY_AVAILABLE = bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)
 
+# --- ストレージ自動監視・自動クリーンアップ（Railwayボリューム対策） ---
+# /voice_sound add で登録された音声ファイルは、Botがそのサーバーから抜けても
+# on_guild_remove で削除される（新規発生分）が、ボリューム使用率が既に高い場合に備えて、
+# 定期的に使用率を監視し、閾値を超えたら在籍していないサーバーの残留フォルダを自動削除する。
+# 対象は /app/data（Railwayボリュームのマウント先）。ローカル開発環境（/app/dataが存在しない）では
+# 監視ループ自体を起動しない。
+STORAGE_MONITOR_ENABLED = os.path.exists("/app/data")
+# ボリューム使用率がこの割合（%）を超えたら自動クリーンアップを実行する。
+STORAGE_CLEANUP_THRESHOLD_PERCENT = float(os.getenv("STORAGE_CLEANUP_THRESHOLD_PERCENT", "80"))
+# 使用率チェックの間隔（秒）。デフォルト6時間ごと。
+STORAGE_MONITOR_INTERVAL_SECONDS = int(os.getenv("STORAGE_MONITOR_INTERVAL_SECONDS", str(6 * 3600)))
+STORAGE_MONITOR_PATH = "/app/data"
+
 
 # --------------------------------------------------------------------
 # ボイスチャンネル再生（/voice play 等）用の FFmpeg オプション
@@ -371,6 +384,7 @@ _status_rotation_task = None          # ローテーション表示を行うバ�
 _status_rotation_interval = 15        # ステータスを切り替える間隔（秒）
 _status_data_updating_count = 0       # 0より大きい間はローテーションに「更新中」を挟む（複数ギルド同時実行に対応するためカウンタ方式）
 _uptime_periodic_save_task = None     # 稼働時間を定期的に永続化するバックグラウンドタスク
+_storage_monitor_loop_task = None     # ストレージ使用率を定期監視・自動クリーンアップするバックグラウンドタスク
 
 
 # ====================================================================
@@ -4404,6 +4418,12 @@ async def on_ready():
     if _vibe_monitor_loop_task is None or _vibe_monitor_loop_task.done():
         _vibe_monitor_loop_task = asyncio.create_task(_vibe_monitor_loop())
         print("  > Vibeモニターループ: 起動しました")
+
+    # ストレージ自動監視ループを起動（/app/data が存在する本番環境のみ。再接続時の重複起動を防止）
+    global _storage_monitor_loop_task
+    if STORAGE_MONITOR_ENABLED and (_storage_monitor_loop_task is None or _storage_monitor_loop_task.done()):
+        _storage_monitor_loop_task = asyncio.create_task(_storage_monitor_loop())
+        print(f"  > ストレージ自動監視ループ: 起動しました（閾値{STORAGE_CLEANUP_THRESHOLD_PERCENT:.0f}% / {STORAGE_MONITOR_INTERVAL_SECONDS // 3600}時間ごと）")
 
     # 起動時にスラッシュコマンドを自動同期（コマンド候補欄に表示されない問題の対策）
     try:
@@ -18557,26 +18577,12 @@ async def voice_sound_cleanup_orphaned(interaction: discord.Interaction, 実行:
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    current_guild_ids = {str(g.id) for g in bot.guilds}
-    orphaned = []
-    for entry in os.listdir(SOUNDS_DIR):
-        full_path = os.path.join(SOUNDS_DIR, entry)
-        if not os.path.isdir(full_path):
-            continue
-        # フォルダ名はサーバーID（get_guild_sounds_dirで str(guild_id) を使って作成される）のはず。
-        # 想定外の名前のフォルダは誤削除防止のため対象外とする。
-        if not entry.isdigit():
-            continue
-        if entry in current_guild_ids:
-            continue
-        size = _get_dir_size_bytes(full_path)
-        orphaned.append((entry, full_path, size))
+    orphaned = _find_orphaned_sound_dirs()
 
     if not orphaned:
         await interaction.followup.send("在籍していないサーバーの残留音声ファイルは見つかりませんでした。", ephemeral=True)
         return
 
-    orphaned.sort(key=lambda x: x[2], reverse=True)
     total_size = sum(s for _, _, s in orphaned)
 
     lines = [f"・サーバーID `{gid}` : {_format_bytes_human(size)}" for gid, _, size in orphaned[:25]]
@@ -18593,16 +18599,7 @@ async def voice_sound_cleanup_orphaned(interaction: discord.Interaction, 実行:
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    deleted_count = 0
-    deleted_size = 0
-    failed = []
-    for gid, full_path, size in orphaned:
-        try:
-            shutil.rmtree(full_path, ignore_errors=False)
-            deleted_count += 1
-            deleted_size += size
-        except Exception as e:
-            failed.append(f"{gid}: {e}")
+    deleted_count, deleted_size, failed = _delete_orphaned_sound_dirs(orphaned)
 
     embed = discord.Embed(
         title="残留音声ファイルを削除しました",
@@ -18614,6 +18611,193 @@ async def voice_sound_cleanup_orphaned(interaction: discord.Interaction, 実行:
         footer_text += f"（{len(failed)}件失敗）"
     embed.set_footer(text=footer_text)
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+def _find_orphaned_sound_dirs() -> list:
+    """
+    SOUNDS_DIR配下で、現在Botが在籍していないサーバーIDのフォルダ一覧を返します。
+    戻り値は [(guild_id_str, full_path, size_bytes), ...]（サイズの大きい順）。
+    /voice_sound cleanup_orphaned コマンドと、ストレージ自動監視ループの両方から使う共通ロジック。
+    """
+    if not os.path.isdir(SOUNDS_DIR):
+        return []
+    current_guild_ids = {str(g.id) for g in bot.guilds}
+    orphaned = []
+    for entry in os.listdir(SOUNDS_DIR):
+        full_path = os.path.join(SOUNDS_DIR, entry)
+        if not os.path.isdir(full_path):
+            continue
+        if not entry.isdigit():
+            continue
+        if entry in current_guild_ids:
+            continue
+        size = _get_dir_size_bytes(full_path)
+        orphaned.append((entry, full_path, size))
+    orphaned.sort(key=lambda x: x[2], reverse=True)
+    return orphaned
+
+
+def _delete_orphaned_sound_dirs(orphaned: list) -> Tuple[int, int, list]:
+    """
+    _find_orphaned_sound_dirs() の戻り値を受け取り、実際にフォルダを削除します。
+    戻り値: (削除成功数, 解放バイト数, 失敗メッセージのリスト)
+    """
+    deleted_count = 0
+    deleted_size = 0
+    failed = []
+    for gid, full_path, size in orphaned:
+        try:
+            shutil.rmtree(full_path, ignore_errors=False)
+            deleted_count += 1
+            deleted_size += size
+        except Exception as e:
+            failed.append(f"{gid}: {e}")
+    return deleted_count, deleted_size, failed
+
+
+async def _gemini_summarize_storage_cleanup(
+    usage_percent: float,
+    total_bytes: int,
+    used_bytes: int,
+    deleted_count: int,
+    deleted_size: int,
+    remaining_percent: float,
+) -> Optional[str]:
+    """
+    自動ストレージクリーンアップの結果を、Gemini（テキスト生成）で
+    Botオーナー向けの短い日本語要約コメントにします。
+    GEMINI_API_KEY未設定時、またはAPI呼び出し失敗時はNoneを返し、
+    呼び出し元は定型文にフォールバックします（この処理自体は必須ではないため）。
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt = (
+        "あなたはDiscord Botの運用ログを要約するアシスタントです。"
+        "以下のストレージ自動クリーンアップの実行結果を踏まえて、"
+        "Bot運営者（オーナー）向けに2〜3文程度の短い日本語コメントを書いてください。"
+        "事実（数値）を正確に伝えつつ、必要であれば軽い注意喚起や次のアクション案を添えてください。"
+        "絵文字や過度な装飾は不要です。\n\n"
+        f"・実行前のボリューム使用率: {usage_percent:.1f}%\n"
+        f"・ボリューム合計サイズ: {_format_bytes_human(total_bytes)}\n"
+        f"・実行前の使用量: {_format_bytes_human(used_bytes)}\n"
+        f"・削除した在籍外サーバーのフォルダ数: {deleted_count}件\n"
+        f"・解放した容量: {_format_bytes_human(deleted_size)}\n"
+        f"・実行後の推定使用率: {remaining_percent:.1f}%\n"
+    )
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 300},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or None
+    except Exception as e:
+        print(f"[ストレージ監視] Gemini要約コメント生成に失敗しました（フォールバック定型文を使用します）: {e}")
+        return None
+
+
+async def _storage_monitor_check_and_cleanup_once():
+    """
+    ボリューム（/app/data）の使用率を1回チェックし、閾値超過時のみ
+    在籍していないサーバーの音声フォルダを自動削除してBotオーナーへ通知します。
+    閾値未満の場合は何もしません（サイレント）。
+    """
+    try:
+        total_bytes, used_bytes, free_bytes = shutil.disk_usage(STORAGE_MONITOR_PATH)
+    except Exception as e:
+        print(f"[ストレージ監視] ディスク使用量の取得に失敗しました: {e}")
+        return
+
+    if total_bytes <= 0:
+        return
+    usage_percent = used_bytes / total_bytes * 100
+
+    if usage_percent < STORAGE_CLEANUP_THRESHOLD_PERCENT:
+        return  # 閾値未満のため何もしない
+
+    print(f"[ストレージ監視] 使用率が閾値を超過しました（{usage_percent:.1f}% >= {STORAGE_CLEANUP_THRESHOLD_PERCENT:.1f}%）。自動クリーンアップを開始します。")
+
+    orphaned = _find_orphaned_sound_dirs()
+    if not orphaned:
+        print("[ストレージ監視] 使用率は高いですが、削除可能な残留データ（在籍外サーバーの音声フォルダ）は見つかりませんでした。")
+        deleted_count, deleted_size, failed = 0, 0, []
+    else:
+        deleted_count, deleted_size, failed = _delete_orphaned_sound_dirs(orphaned)
+        print(f"[ストレージ監視] 自動クリーンアップ完了: {deleted_count}件削除、{_format_bytes_human(deleted_size)}解放。")
+
+    remaining_percent = (used_bytes - deleted_size) / total_bytes * 100 if total_bytes else usage_percent
+
+    # Botオーナーへ結果を通知（DM）。要約コメントはGeminiで生成し、失敗時は定型文にフォールバック。
+    try:
+        owner_id = await resolve_owner_id(bot)
+        if owner_id is None:
+            return
+        owner = await bot.fetch_user(owner_id)
+
+        summary_comment = await _gemini_summarize_storage_cleanup(
+            usage_percent, total_bytes, used_bytes, deleted_count, deleted_size, remaining_percent
+        )
+        if not summary_comment:
+            if deleted_count > 0:
+                summary_comment = (
+                    f"ボリューム使用率が{STORAGE_CLEANUP_THRESHOLD_PERCENT:.0f}%を超えたため、"
+                    f"在籍していないサーバーの音声データを自動削除し、容量を解放しました。"
+                )
+            else:
+                summary_comment = (
+                    f"ボリューム使用率が{STORAGE_CLEANUP_THRESHOLD_PERCENT:.0f}%を超えていますが、"
+                    f"自動削除できる対象（在籍外サーバーの音声データ）が見つかりませんでした。手動での確認をおすすめします。"
+                )
+
+        embed = discord.Embed(
+            title="[ストレージ自動監視] クリーンアップを実行しました" if deleted_count > 0 else "[ストレージ自動監視] 使用率が高くなっています",
+            description=summary_comment,
+            color=discord.Color.orange() if deleted_count == 0 else discord.Color.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="実行前の使用率", value=f"{usage_percent:.1f}%", inline=True)
+        embed.add_field(name="実行後の推定使用率", value=f"{remaining_percent:.1f}%", inline=True)
+        embed.add_field(name="ボリューム合計", value=_format_bytes_human(total_bytes), inline=True)
+        embed.add_field(name="削除件数", value=f"{deleted_count}サーバー分", inline=True)
+        embed.add_field(name="解放容量", value=_format_bytes_human(deleted_size), inline=True)
+        if failed:
+            embed.add_field(name="削除失敗", value=f"{len(failed)}件（ログを確認してください）", inline=True)
+        embed.set_footer(text="/voice_sound cleanup_orphaned で手動確認・削除も可能です。")
+
+        await owner.send(embed=embed)
+    except Exception as e:
+        print(f"[警告] ストレージ自動監視の結果通知（オーナーDM）に失敗しました: {e}")
+
+
+async def _storage_monitor_loop():
+    """
+    STORAGE_MONITOR_INTERVAL_SECONDSごとにボリューム使用率をチェックし、
+    閾値超過時のみ自動クリーンアップ・オーナー通知を行うバックグラウンドタスクです。
+    /app/data（Railwayボリューム想定）が存在する環境でのみ起動されます。
+    """
+    await bot.wait_until_ready()
+    try:
+        while True:
+            try:
+                await _storage_monitor_check_and_cleanup_once()
+            except Exception as e:
+                print(f"[警告] ストレージ監視チェック中にエラーが発生しました: {e}")
+            await asyncio.sleep(STORAGE_MONITOR_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        raise
 
 
 async def voice_sound_name_autocomplete(interaction: discord.Interaction, current: str):
