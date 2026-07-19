@@ -4081,43 +4081,61 @@ def _is_exempt(member: discord.Member, guild: discord.Guild, cfg: dict, owner_id
     return False
 
 
-def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"{guild.name} - antinuke 設定状況",
-        color=discord.Color.blue() if cfg["enabled"] else discord.Color.greyple()
-    )
-    embed.add_field(name="状態", value="有効" if cfg["enabled"] else "無効", inline=True)
-    embed.add_field(
-        name="対応レベル",
-        value="BANも試行" if cfg["action"] == "ban" else "ロール剥奪のみ",
-        inline=True
-    )
-    embed.add_field(
-        name="検出条件",
-        value=f"{cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回以上",
-        inline=True
-    )
-    log_ch_id = cfg.get("log_channel")
-    log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
-    embed.add_field(
-        name="通知先チャンネル",
-        value=log_ch.mention if log_ch else "未設定（オーナーDMのみ）",
-        inline=False
-    )
-    exempt_role_ids = cfg.get("exempt_roles", [])
-    exempt_roles = [guild.get_role(rid) for rid in exempt_role_ids]
-    exempt_roles = [r for r in exempt_roles if r]
-    embed.add_field(
-        name="免除ロール",
-        value=", ".join(r.mention for r in exempt_roles) if exempt_roles else "なし",
-        inline=False
-    )
-    embed.add_field(
-        name="監視対象の操作",
-        value="メンバーBAN / チャンネル削除 / ロール削除 / Webhook作成",
-        inline=False
-    )
-    return embed
+class AntinukeStatusView(discord.ui.LayoutView):
+    """/antinuke status 用のComponents V2レイアウト。
+    旧来のdiscord.Embedを廃止し、Container + TextDisplay + Separatorで同等の情報を表示する。
+    Components V2はdiscord.py 2.6以降で利用可能（本Botのボイス機能・DAVEプロトコル対応と同じバージョン系列のため、
+    ボイス機能との併用に技術的な制約はない）。"""
+
+    def __init__(self, guild: discord.Guild, cfg: dict, footer_text: Optional[str] = None):
+        super().__init__(timeout=None)
+
+        enabled = cfg["enabled"]
+        accent = discord.Color.blue() if enabled else discord.Color.greyple()
+        container = discord.ui.Container(accent_color=accent)
+
+        container.add_item(discord.ui.TextDisplay(f"## {guild.name} - antinuke 設定状況"))
+        container.add_item(discord.ui.Separator())
+
+        status_text = "有効" if enabled else "無効"
+        level_text = "BANも試行" if cfg["action"] == "ban" else "ロール剥奪のみ"
+        threshold_text = f"{cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回以上"
+        # 従来の3つのinline fieldは、Components V2にはinline field相当の要素が無いため
+        # 1行のTextDisplayにまとめて視認性を保つ。
+        container.add_item(discord.ui.TextDisplay(
+            f"**状態**：{status_text}\u3000|\u3000**対応レベル**：{level_text}\u3000|\u3000**検出条件**：{threshold_text}"
+        ))
+
+        log_ch_id = cfg.get("log_channel")
+        log_ch = guild.get_channel(log_ch_id) if log_ch_id else None
+        container.add_item(discord.ui.TextDisplay(
+            f"**通知先チャンネル**\n{log_ch.mention if log_ch else '未設定（オーナーDMのみ）'}"
+        ))
+
+        exempt_role_ids = cfg.get("exempt_roles", [])
+        exempt_roles = [guild.get_role(rid) for rid in exempt_role_ids]
+        exempt_roles = [r for r in exempt_roles if r]
+        container.add_item(discord.ui.TextDisplay(
+            f"**免除ロール**\n{', '.join(r.mention for r in exempt_roles) if exempt_roles else 'なし'}"
+        ))
+
+        container.add_item(discord.ui.TextDisplay(
+            "**監視対象の操作**\nメンバーBAN / チャンネル削除 / ロール削除 / Webhook作成"
+        ))
+
+        if footer_text:
+            # embed.set_footer相当。"-# " は小さいサブテキスト表示のMarkdown記法。
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            container.add_item(discord.ui.TextDisplay(f"-# {footer_text}"))
+
+        self.add_item(container)
+
+
+def _build_antinuke_status_view(
+    guild: discord.Guild, cfg: dict, footer_text: Optional[str] = None
+) -> "AntinukeStatusView":
+    """/antinuke status のComponents V2レイアウトビューを構築します。（旧: _build_antinuke_status_embed）"""
+    return AntinukeStatusView(guild, cfg, footer_text=footer_text)
 
 
 # ====================================================================
@@ -16856,9 +16874,12 @@ async def antinuke_status(interaction: discord.Interaction):
         return
     all_data = load_data()
     cfg = get_antinuke_config(all_data, str(interaction.guild.id))
-    embed = _build_antinuke_status_embed(interaction.guild, cfg)
-    embed.set_footer(text="設定変更: /antinuke toggle /antinuke level /antinuke threshold /antinuke notify")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    view = _build_antinuke_status_view(
+        interaction.guild,
+        cfg,
+        footer_text="設定変更: /antinuke toggle /antinuke level /antinuke threshold /antinuke notify"
+    )
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 @server_protect_group.command(name="role_channel_mute", description="【管理者専用】指定したロールの発言・スレッド作成権限を、複数チャンネルまとめてOFFにできます")
