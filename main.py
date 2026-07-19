@@ -17477,8 +17477,17 @@ async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
         if text.lower() == "reset":
-            global current_custom_status
+            global current_custom_status, _railway_deploy_status_override, _railway_deploy_status_clear_task
             current_custom_status = None
+
+            # Railwayのデプロイ状態表示（Webhook経由の一時オーバーライド）が残っていると
+            # ローテーションループ側で最優先表示され続け、reset後も「デプロイ中」等の表示が
+            # 残ってしまうため、こちらも明示的にクリアする。
+            if _railway_deploy_status_clear_task is not None and not _railway_deploy_status_clear_task.done():
+                _railway_deploy_status_clear_task.cancel()
+                _railway_deploy_status_clear_task = None
+            _railway_deploy_status_override = None
+
             await update_bot_status(bot)
             await interaction.response.send_message(
                 "カスタムステータスを解除しました。サーバー数・コマンド数・稼働時間などのローテーション表示に戻ります。",
