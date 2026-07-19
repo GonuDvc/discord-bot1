@@ -20231,7 +20231,7 @@ async def _railway_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.
 # /ai_health - 各AIプロバイダの生存確認（フォールバック順に対応）
 # ====================================================================
 
-ai_health_group = app_commands.Group(name="ai_health", description="【オーナー限定】AIチャットで使う各プロバイダの生存確認")
+ai_health_group = app_commands.Group(name="ai_health", description="【オーナー限定】AIチャットで使う各AIプロバイダの生存確認")
 
 # (表示名, APIキーが設定されているか, 実際に疎通確認する非同期関数 or None（キー未設定時はNoneでよい）)
 _AI_HEALTH_PROVIDERS = [
@@ -20253,7 +20253,7 @@ _AI_HEALTH_PROVIDERS = [
 ]
 
 
-@ai_health_group.command(name="status", description="【オーナー限定】AIチャットで使う各プロバイダ（Groq/Cerebras/Mistral/OpenRouter/Gemini）に実際に疎通確認を行います")
+@ai_health_group.command(name="status", description="【オーナー限定】AIチャットで使う各AIプロバイダに実際に疎通確認を行います")
 async def ai_health_status_command(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
