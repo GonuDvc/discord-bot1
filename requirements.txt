@@ -6,3 +6,4 @@ PyNaCl
 davey
 Pillow
 mem0ai
+playwright
