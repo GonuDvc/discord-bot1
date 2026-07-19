@@ -4462,6 +4462,22 @@ async def on_guild_remove(guild: discord.Guild):
     except Exception as e:
         print(f"[警告] サーバー脱退時の音声フォルダ削除に失敗しました（guild_id={guild.id}）: {e}")
 
+    # そのサーバーの面接記録（/interview）も削除する。応募のたびに増え、
+    # 従来は削除処理がなかったため、使われなくなったサーバー分だけ allowed_users.json が
+    # 肥大化し続けるのを防ぐ（面接記録以外のサーバー設定は残す）。
+    try:
+        all_data = load_data()
+        guild_id_str = str(guild.id)
+        if guild_id_str in all_data and isinstance(all_data[guild_id_str], dict):
+            records = all_data[guild_id_str].get("interview_records")
+            if records:
+                record_count = len(records)
+                all_data[guild_id_str]["interview_records"] = {}
+                save_data(all_data)
+                print(f"[サーバー脱退] 面接記録を削除しました: {record_count}件（guild_id={guild.id}）")
+    except Exception as e:
+        print(f"[警告] サーバー脱退時の面接記録削除に失敗しました（guild_id={guild.id}）: {e}")
+
 
 @bot.event
 async def on_invite_create(invite: discord.Invite):
@@ -18564,49 +18580,66 @@ def _get_dir_size_bytes(path: str) -> int:
 
 @voice_sound_group.command(
     name="cleanup_orphaned",
-    description="【Botオーナー限定】既にBotが在籍していないサーバーの音声ファイルを検出・削除し、ストレージを解放します"
+    description="【Botオーナー限定】既にBotが在籍していないサーバーの残留データ（音声ファイル・面接記録）を検出・削除します"
 )
 @app_commands.describe(実行="falseの場合は削除対象を一覧表示するだけで、実際には削除しません（既定）")
 async def voice_sound_cleanup_orphaned(interaction: discord.Interaction, 実行: Optional[bool] = False):
     if not await is_owner_check(interaction):
         return
 
-    if not os.path.isdir(SOUNDS_DIR):
-        await interaction.response.send_message("音声保存ディレクトリが存在しないため、対象はありません。", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    orphaned = _find_orphaned_sound_dirs()
+    orphaned_sounds = _find_orphaned_sound_dirs() if os.path.isdir(SOUNDS_DIR) else []
+    orphaned_interviews = _find_orphaned_interview_records()
 
-    if not orphaned:
-        await interaction.followup.send("在籍していないサーバーの残留音声ファイルは見つかりませんでした。", ephemeral=True)
+    if not orphaned_sounds and not orphaned_interviews:
+        await interaction.followup.send("在籍していないサーバーの残留データ（音声ファイル・面接記録）は見つかりませんでした。", ephemeral=True)
         return
 
-    total_size = sum(s for _, _, s in orphaned)
+    total_size = sum(s for _, _, s in orphaned_sounds)
+    total_interview_records = sum(c for _, c in orphaned_interviews)
 
-    lines = [f"・サーバーID `{gid}` : {_format_bytes_human(size)}" for gid, _, size in orphaned[:25]]
-    if len(orphaned) > 25:
-        lines.append(f"...ほか{len(orphaned) - 25}件")
+    lines = []
+    if orphaned_sounds:
+        lines.append("**音声ファイル:**")
+        lines.extend(f"・サーバーID `{gid}` : {_format_bytes_human(size)}" for gid, _, size in orphaned_sounds[:15])
+        if len(orphaned_sounds) > 15:
+            lines.append(f"...ほか{len(orphaned_sounds) - 15}件")
+    if orphaned_interviews:
+        lines.append("**面接記録:**")
+        lines.extend(f"・サーバーID `{gid}` : {count}件" for gid, count in orphaned_interviews[:15])
+        if len(orphaned_interviews) > 15:
+            lines.append(f"...ほか{len(orphaned_interviews) - 15}件")
 
     if not 実行:
         embed = discord.Embed(
-            title="残留音声ファイルの検出結果（未削除）",
+            title="残留データの検出結果（未削除）",
             description="\n".join(lines),
             color=discord.Color.orange()
         )
-        embed.set_footer(text=f"合計: {len(orphaned)}サーバー分 / {_format_bytes_human(total_size)}　実際に削除するには 実行:true を指定してください。")
+        embed.set_footer(
+            text=(
+                f"音声: {len(orphaned_sounds)}サーバー分 / {_format_bytes_human(total_size)}　"
+                f"面接記録: {len(orphaned_interviews)}サーバー分 / {total_interview_records}件　"
+                f"実際に削除するには 実行:true を指定してください。"
+            )
+        )
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    deleted_count, deleted_size, failed = _delete_orphaned_sound_dirs(orphaned)
+    deleted_sound_count, deleted_sound_size, sound_failed = _delete_orphaned_sound_dirs(orphaned_sounds)
+    deleted_interview_guild_count, deleted_interview_record_count, interview_failed = _delete_orphaned_interview_records(orphaned_interviews)
+    failed = sound_failed + interview_failed
 
     embed = discord.Embed(
-        title="残留音声ファイルを削除しました",
+        title="残留データを削除しました",
         description="\n".join(lines),
         color=discord.Color.green()
     )
-    footer_text = f"削除: {deleted_count}サーバー分 / {_format_bytes_human(deleted_size)} を解放しました。"
+    footer_text = (
+        f"音声: {deleted_sound_count}サーバー分 / {_format_bytes_human(deleted_sound_size)} を解放　"
+        f"面接記録: {deleted_interview_guild_count}サーバー分 / {deleted_interview_record_count}件 を削除"
+    )
     if failed:
         footer_text += f"（{len(failed)}件失敗）"
     embed.set_footer(text=footer_text)
@@ -18653,6 +18686,56 @@ def _delete_orphaned_sound_dirs(orphaned: list) -> Tuple[int, int, list]:
         except Exception as e:
             failed.append(f"{gid}: {e}")
     return deleted_count, deleted_size, failed
+
+
+def _find_orphaned_interview_records() -> list:
+    """
+    現在Botが在籍していないサーバーのうち、面接記録（interview_records）が
+    残っているものを検出します。戻り値は [(guild_id_str, record_count), ...]。
+    on_guild_remove で本来は削除されるが、それより前にBotが導入されていた
+    サーバー分（過去分）を拾うためのバックフィル用。
+    """
+    all_data = load_data()
+    current_guild_ids = {str(g.id) for g in bot.guilds}
+    orphaned = []
+    for key, cfg in all_data.items():
+        if not isinstance(cfg, dict):
+            continue
+        if not key.isdigit():
+            continue  # allowed_users.json のトップレベルキーはギルドIDのみを対象にする
+        if key in current_guild_ids:
+            continue
+        records = cfg.get("interview_records")
+        if records:
+            orphaned.append((key, len(records)))
+    orphaned.sort(key=lambda x: x[1], reverse=True)
+    return orphaned
+
+
+def _delete_orphaned_interview_records(orphaned: list) -> Tuple[int, int, list]:
+    """
+    _find_orphaned_interview_records() の戻り値を受け取り、対象サーバーの
+    interview_records のみを空にして保存します（他のサーバー設定は残す）。
+    戻り値: (対象サーバー数, 削除した記録の合計件数, 失敗メッセージのリスト)
+    """
+    if not orphaned:
+        return 0, 0, []
+    all_data = load_data()
+    deleted_guild_count = 0
+    deleted_record_count = 0
+    failed = []
+    for guild_id_str, _record_count in orphaned:
+        try:
+            cfg = all_data.get(guild_id_str)
+            if isinstance(cfg, dict) and cfg.get("interview_records"):
+                deleted_record_count += len(cfg["interview_records"])
+                cfg["interview_records"] = {}
+                deleted_guild_count += 1
+        except Exception as e:
+            failed.append(f"{guild_id_str}: {e}")
+    if deleted_guild_count > 0:
+        save_data(all_data)
+    return deleted_guild_count, deleted_record_count, failed
 
 
 async def _gemini_summarize_storage_cleanup(
