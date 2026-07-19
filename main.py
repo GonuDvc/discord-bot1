@@ -20245,7 +20245,7 @@ async def context_translate_message(interaction: discord.Interaction, message: d
     """
     メッセージを右クリック→アプリから実行できるコンテキストメニューコマンドです。
     対象メッセージの言語を自動判定し、日本語なら英語へ、それ以外の言語なら日本語へ翻訳して
-    実行者にのみ見える形（ephemeral）で返します。既存の自動翻訳機能（ai_chat_translate_group）
+    チャンネルに全員へ見える形で返します。既存の自動翻訳機能（ai_chat_translate_group）
     とは独立しており、チャンネル設定に関わらずどのメッセージにも単発で使えます。
     """
     content = message.content
@@ -20266,7 +20266,7 @@ async def context_translate_message(interaction: discord.Interaction, message: d
         await interaction.response.send_message("AI機能が利用できないため翻訳できません（Bot管理者にお問い合わせください）。", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=False)
 
     # 日本語なら英語へ、それ以外の言語なら日本語へ、を自動判定して翻訳する（既存の自動翻訳と同じロジック）
     result = await _translate_message_text(content, secondary_lang="en", guild_id=interaction.guild.id if interaction.guild else None)
@@ -20284,8 +20284,71 @@ async def context_translate_message(interaction: discord.Interaction, message: d
         name=f"{message.author.display_name} の投稿を翻訳（検出言語: {detected_lang or '不明'}）",
         icon_url=message.author.display_avatar.url if message.author.display_avatar else None
     )
-    embed.set_footer(text="AIによる自動翻訳のため、誤訳を含む場合があります")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    embed.set_footer(text=f"{interaction.user.display_name} が翻訳を実行しました ／ AIによる自動翻訳のため誤訳を含む場合があります")
+    await interaction.followup.send(embed=embed)
+
+
+_AI_MESSAGE_SUMMARY_SYSTEM_PROMPT = (
+    "あなたはDiscordのメッセージを要約するアシスタントです。"
+    "これから渡される1件のメッセージ本文を、日本語で3〜5行程度に簡潔に要約してください。\n"
+    "・元の文章の要点・結論・重要な数値や固有名詞は漏らさず残してください。\n"
+    "・前置きや「この文章は〜」といった説明文は付けず、要約本文のみを出力してください。\n"
+    "・箇条書きが適切な内容であれば箇条書きを使っても構いません。\n"
+    "・既に十分短い文章（要約する意味がないもの）の場合は、そのまま「この文章は既に短いため要約の必要がありません」とだけ返してください。"
+)
+
+
+@bot.tree.context_menu(name="AIに要約させる")
+async def context_summarize_message(interaction: discord.Interaction, message: discord.Message):
+    """
+    メッセージを右クリック→アプリから実行できるコンテキストメニューコマンドです。
+    長文メッセージの内容をAIに3〜5行程度で要約させ、チャンネルに全員へ見える形で返します。
+    """
+    content = message.content
+    # Discordのネイティブ「転送」機能で送られたメッセージは本文が空になり、
+    # 実際の内容は message_snapshots 側に入るため、そちらもフォールバックで見る。
+    if not content or not content.strip():
+        for snapshot in getattr(message, "message_snapshots", None) or []:
+            snap_content = getattr(snapshot, "content", None)
+            if snap_content and snap_content.strip():
+                content = snap_content
+                break
+
+    if not content or not content.strip():
+        await interaction.response.send_message("要約できるテキストが見つかりませんでした（画像のみのメッセージ等には対応していません）。", ephemeral=True)
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message("AI機能が利用できないため要約できません（Bot管理者にお問い合わせください）。", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    messages = [
+        {"role": "system", "content": _AI_MESSAGE_SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": content[:6000]},
+    ]
+    try:
+        provider_override = await _ai_get_provider_override(interaction.guild.id if interaction.guild else None)
+        summary_text, _provider = await _ai_call_llm_with_fallback(messages, provider_override=provider_override)
+    except Exception as e:
+        print(f"[メッセージ要約] AI呼び出しに失敗: {e}")
+        await interaction.followup.send("要約に失敗しました。しばらく経ってから再度お試しください。", ephemeral=True)
+        return
+
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        await interaction.followup.send("要約結果を取得できませんでした。", ephemeral=True)
+        return
+
+    embed = discord.Embed(description=summary_text[:4000], color=discord.Color.green())
+    embed.set_author(
+        name=f"{message.author.display_name} の投稿を要約",
+        icon_url=message.author.display_avatar.url if message.author.display_avatar else None
+    )
+    embed.add_field(name="元のメッセージ", value=f"[こちらから確認]({message.jump_url})", inline=False)
+    embed.set_footer(text=f"{interaction.user.display_name} が要約を実行しました ／ AIによる自動要約のため誤りを含む場合があります")
+    await interaction.followup.send(embed=embed)
 
 
 class _QuickModReasonModal(discord.ui.Modal):
