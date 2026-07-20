@@ -4268,7 +4268,6 @@ async def on_ready():
 
     bot.add_view(VerifyButtonView())
     bot.add_view(VerifyBlacklistButtonView())  # サーバーブラックリスト認証ボタンの永続化
-    bot.add_view(GiveawayJoinView())  # プレゼント参加ボタンの永続化
     bot.add_view(TicketPanelView())  # チケット作成パネルの永続化（custom_idが固定のため全ギルド共通で1回登録すればよい）
     bot.add_view(TicketCloseView())  # チケットクローズボタンの永続化
     bot.add_view(InterviewPanelView())  # 面接パネル（面接を受けるボタン）の永続化
@@ -4408,6 +4407,36 @@ async def on_ready():
                 bot.add_view(view)
             except Exception as e:
                 print(f"[警告] 投票パネルの再登録に失敗しました（guild={guild_id_str}, poll={poll_id_str}）: {e}")
+
+    # プレゼント参加パネルの永続化View再登録
+    # custom_idにmessage_idを埋め込んでいるため、giveawayごとに個別のViewインスタンスが必要。
+    for guild_id_str, config in all_data.items():
+        if guild_id_str in ("user_apps", "global_config"):
+            continue
+        if not isinstance(config, dict):
+            continue
+        giveaways = config.get("giveaways", {})
+        for msg_id_str, gw in giveaways.items():
+            if not isinstance(gw, dict):
+                continue
+            try:
+                guild_id_int = int(guild_id_str)
+                msg_id_int = int(msg_id_str)
+                host_id = gw.get("host_id")
+                host_display = f"<@{host_id}>" if host_id else "不明"
+                end_dt = datetime.datetime.fromisoformat(gw["end_at"])
+                view = GiveawayJoinView(
+                    msg_id_int,
+                    gw.get("prize", "景品"),
+                    host_id,
+                    host_display,
+                    end_dt,
+                    gw.get("winners", 1),
+                    len(gw.get("participants", [])),
+                )
+                bot.add_view(view)
+            except Exception as e:
+                print(f"[警告] プレゼント企画パネルの再登録に失敗しました（guild={guild_id_str}, message={msg_id_str}）: {e}")
 
     try:
         if current_custom_status:
@@ -21222,10 +21251,71 @@ async def calc(interaction: discord.Interaction, 数式: str):
 _giveaway_tasks: dict[int, asyncio.Task] = {}
 
 
-class GiveawayJoinView(discord.ui.View):
-    """プレゼント参加ボタンビュー。カスタムIDで永続化対応。"""
-    def __init__(self):
+class GiveawayJoinView(discord.ui.LayoutView):
+    """プレゼント参加ボタンビュー（Components V2）。
+    custom_idにメッセージIDを埋め込むことで、Bot再起動後も各メッセージ固有のボタンとして永続化する。
+    景品名・参加者数などの表示情報もContainer内に含める。"""
+
+    def __init__(
+        self,
+        message_id: int,
+        prize: str,
+        host_id: int,
+        host_display: str,
+        end_dt: datetime.datetime,
+        winners: int,
+        participants: int,
+        *,
+        closed: bool = False,
+    ):
         super().__init__(timeout=None)
+        self.message_id = message_id
+        self.prize = prize
+        self.host_id = host_id
+        self.host_display = host_display
+        self.end_dt = end_dt
+        self.winners = winners
+        self.participants = participants
+        self.closed = closed
+        self._render()
+
+    def _render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_color=discord.Color.gold() if not self.closed else discord.Color.greyple())
+        title = f"## [*] プレゼント企画: {self.prize}" if not self.closed else f"## [*] 終了（参加受付終了）: {self.prize}"
+        container.add_item(discord.ui.TextDisplay(title))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"**景品**：{self.prize}\u3000|\u3000**当選人数**：{self.winners}人\u3000|\u3000**参加者数**：{self.participants}人"
+        ))
+        container.add_item(discord.ui.TextDisplay(f"**主催者**\n{self.host_display}"))
+        container.add_item(discord.ui.TextDisplay(
+            f"**終了日時**\n{discord.utils.format_dt(self.end_dt, style='F')}"
+        ))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        if not self.closed:
+            container.add_item(discord.ui.TextDisplay("-# [*] ボタンを押して参加！もう一度押すと取り消せます"))
+            row = discord.ui.ActionRow()
+            join_btn = discord.ui.Button(
+                label="[*] 参加する",
+                style=discord.ButtonStyle.success,
+                custom_id=f"giveaway_join_{self.message_id}",
+            )
+            join_btn.callback = self._on_join
+            row.add_item(join_btn)
+            container.add_item(row)
+        else:
+            container.add_item(discord.ui.TextDisplay("-# 参加受付は終了しました"))
+            row = discord.ui.ActionRow()
+            disabled_btn = discord.ui.Button(
+                label="[*] 終了（参加受付終了）",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+            row.add_item(disabled_btn)
+            container.add_item(row)
+
+        self.add_item(container)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         # [修正] View内のコールバックで想定外の例外が発生した場合の最終防御ライン。
@@ -21240,12 +21330,7 @@ class GiveawayJoinView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    @discord.ui.button(
-        label="[*] 参加する",
-        style=discord.ButtonStyle.success,
-        custom_id="giveaway_join"
-    )
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_join(self, interaction: discord.Interaction):
         # [修正] 以前はこの関数全体が try/except で保護されておらず、
         # 予期しない例外（KeyError, discord.NotFound 等）が発生すると
         # interaction への応答が一切返らないまま終了し、Discord側で
@@ -21316,32 +21401,13 @@ class GiveawayJoinView(discord.ui.View):
         else:
             await interaction.response.send_message("プレゼント企画への参加を取り消しました。", ephemeral=True)
 
-        # Embed の参加者数を更新（失敗してもユーザーへの応答自体は既に完了しているので致命的ではない）
+        # Container内の参加者数表示を更新（失敗してもユーザーへの応答自体は既に完了しているので致命的ではない）
         try:
-            if interaction.message.embeds:
-                embed = interaction.message.embeds[0]
-                for i, field in enumerate(embed.fields):
-                    if field.name and "参加者" in field.name:
-                        embed.set_field_at(i, name="参加者数", value=f"{len(participants)}人", inline=True)
-                        break
-                await interaction.message.edit(embed=embed)
+            self.participants = len(participants)
+            self._render()
+            await interaction.message.edit(view=self)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-
-
-def _build_giveaway_embed(prize: str, host: discord.Member, end_dt: datetime.datetime, winners: int, participants: int) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"[*] プレゼント企画: {prize}",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="景品", value=prize, inline=True)
-    embed.add_field(name="当選人数", value=f"{winners}人", inline=True)
-    embed.add_field(name="参加者数", value=f"{participants}人", inline=True)
-    embed.add_field(name="主催者", value=host.mention, inline=True)
-    embed.add_field(name="終了日時", value=discord.utils.format_dt(end_dt, style="F"), inline=True)
-    embed.set_footer(text="[*] ボタンを押して参加！もう一度押すと取り消せます")
-    embed.timestamp = end_dt
-    return embed
 
 
 def _cancel_giveaway_task(message_id: int):
@@ -21377,43 +21443,47 @@ async def _run_giveaway(channel: discord.TextChannel, message_id: int, guild_id:
         participants = gw.get("participants", [])
         winner_count = gw.get("winners", 1)
         prize = gw.get("prize", "景品")
+        host_id = gw.get("host_id")
+        host_display = f"<@{host_id}>" if host_id else "不明"
 
         if not participants:
-            result_embed = discord.Embed(
-                title="[*] プレゼント企画 終了",
-                description=f"**{prize}**\n\n参加者がいなかったため、当選者なしで終了しました。",
-                color=discord.Color.greyple()
-            )
+            result_container = discord.ui.Container(accent_color=discord.Color.greyple())
+            result_container.add_item(discord.ui.TextDisplay(
+                f"## [*] プレゼント企画 終了\n**{prize}**\n\n参加者がいなかったため、当選者なしで終了しました。"
+            ))
         else:
             actual_winners = min(winner_count, len(participants))
             chosen = random.sample(participants, actual_winners)
             mentions = " ".join(f"<@{uid}>" for uid in chosen)
-            result_embed = discord.Embed(
-                title="[*] プレゼント企画 終了！",
-                description=f"**景品: {prize}**\n\n[WIN] 当選者: {mentions}\nおめでとうございます！",
-                color=discord.Color.gold()
-            )
-            result_embed.add_field(name="参加者数", value=f"{len(participants)}人", inline=True)
-            result_embed.add_field(name="当選人数", value=f"{actual_winners}人", inline=True)
+            result_container = discord.ui.Container(accent_color=discord.Color.gold())
+            result_container.add_item(discord.ui.TextDisplay(
+                f"## [*] プレゼント企画 終了！\n**景品: {prize}**\n\n[WIN] 当選者: {mentions}\nおめでとうございます！"
+            ))
+            result_container.add_item(discord.ui.Separator())
+            result_container.add_item(discord.ui.TextDisplay(
+                f"**参加者数**：{len(participants)}人\u3000|\u3000**当選人数**：{actual_winners}人"
+            ))
 
-        result_embed.timestamp = discord.utils.utcnow()
+        result_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        result_container.add_item(discord.ui.TextDisplay(
+            f"-# {discord.utils.format_dt(discord.utils.utcnow(), style='f')}"
+        ))
+        result_view = discord.ui.LayoutView(timeout=None)
+        result_view.add_item(result_container)
 
         # 元メッセージを更新してボタンを無効化
         try:
             msg = await channel.fetch_message(message_id)
-            disabled_view = discord.ui.View()
-            disabled_btn = discord.ui.Button(
-                label="[*] 終了（参加受付終了）",
-                style=discord.ButtonStyle.secondary,
-                disabled=True
+            closed_view = GiveawayJoinView(
+                message_id, prize, host_id, host_display, end_dt, winner_count,
+                len(participants), closed=True,
             )
-            disabled_view.add_item(disabled_btn)
-            await msg.edit(view=disabled_view)
+            await msg.edit(view=closed_view)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
         try:
-            await channel.send(embed=result_embed)
+            await channel.send(view=result_view)
         except (discord.Forbidden, discord.HTTPException):
             pass
 
@@ -21510,11 +21580,14 @@ async def giveaway(
     await interaction.response.defer(ephemeral=True)
 
     end_dt = discord.utils.utcnow() + datetime.timedelta(minutes=時間_分)
-    embed = _build_giveaway_embed(景品, interaction.user, end_dt, 当選人数, 0)
-    view = GiveawayJoinView()
 
     try:
-        msg = await interaction.channel.send(embed=embed, view=view)
+        # message_idがcustom_idに必要なため、まず仮のViewで送信し、その後正しいIDのViewに差し替える。
+        placeholder_view = GiveawayJoinView(0, 景品, interaction.user.id, interaction.user.mention, end_dt, 当選人数, 0)
+        msg = await interaction.channel.send(view=placeholder_view)
+        final_view = GiveawayJoinView(msg.id, 景品, interaction.user.id, interaction.user.mention, end_dt, 当選人数, 0)
+        await msg.edit(view=final_view)
+        bot.add_view(final_view, message_id=msg.id)
     except (discord.Forbidden, discord.HTTPException) as e:
         await interaction.followup.send(f"プレゼント企画の投稿に失敗しました: {e}", ephemeral=True)
         return
