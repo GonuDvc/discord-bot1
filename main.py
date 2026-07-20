@@ -22778,23 +22778,25 @@ async def economy_setup(
 
     save_data(all_data)
 
-    embed = discord.Embed(title="経済システム設定", color=discord.Color.green())
-    embed.add_field(name="有効化", value="[OK] 有効" if cfg.get("economy_enabled") else "[NG] 無効", inline=True)
-    embed.add_field(name="通貨名", value=cfg.get("economy_currency_name", "コイン"), inline=True)
-    embed.add_field(
-        name="報酬額（1メッセージ）",
-        value=f"{cfg.get('economy_reward_min', 1)} 〜 {cfg.get('economy_reward_max', 5)}",
-        inline=True
-    )
-    embed.add_field(name="クールダウン（メッセージ）", value=f"{cfg.get('economy_cooldown_seconds', 60)}秒", inline=True)
-    embed.add_field(
-        name="報酬額（/work）",
-        value=f"{cfg.get('economy_work_reward_min', 10)} 〜 {cfg.get('economy_work_reward_max', 50)}",
-        inline=True
-    )
+    container = discord.ui.Container(accent_color=discord.Color.green())
+    container.add_item(discord.ui.TextDisplay("## 経済システム設定"))
+    container.add_item(discord.ui.Separator())
+    enabled_text = "[OK] 有効" if cfg.get("economy_enabled") else "[NG] 無効"
+    container.add_item(discord.ui.TextDisplay(
+        f"**有効化**：{enabled_text}\u3000|\u3000**通貨名**：{cfg.get('economy_currency_name', 'コイン')}"
+    ))
+    container.add_item(discord.ui.TextDisplay(
+        f"**報酬額（1メッセージ）**：{cfg.get('economy_reward_min', 1)} 〜 {cfg.get('economy_reward_max', 5)}\u3000|\u3000"
+        f"**クールダウン（メッセージ）**：{cfg.get('economy_cooldown_seconds', 60)}秒"
+    ))
     work_cd = cfg.get('economy_work_cooldown_seconds', 7200)
-    embed.add_field(name="クールダウン（/work）", value=f"{work_cd}秒（{work_cd // 3600}時間）", inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    container.add_item(discord.ui.TextDisplay(
+        f"**報酬額（/work）**：{cfg.get('economy_work_reward_min', 10)} 〜 {cfg.get('economy_work_reward_max', 50)}\u3000|\u3000"
+        f"**クールダウン（/work）**：{work_cd}秒（{work_cd // 3600}時間）"
+    ))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -22809,16 +22811,19 @@ async def balance(interaction: discord.Interaction, ユーザー: discord.Member
     bank = get_global_bank(all_data, target.id)
     coin_label = format_mcoin(all_data, 0).split(" ", 1)[1]  # 通貨名だけ取得
 
-    embed = discord.Embed(
-        title=f" {target.display_name} の{coin_label}残高",
-        color=discord.Color.gold()
-    )
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name=" 財布", value=f"**{wallet:,} {coin_label}**", inline=True)
-    embed.add_field(name=" 銀行", value=f"**{bank:,} {coin_label}**", inline=True)
-    embed.add_field(name="合計", value=f"**{wallet + bank:,} {coin_label}**", inline=True)
-    embed.set_footer(text="全サーバー共通のMコインです")
-    await interaction.response.send_message(embed=embed, ephemeral=(ユーザー is None))
+    container = discord.ui.Container(accent_color=discord.Color.gold())
+    header_text = discord.ui.TextDisplay(f"## {target.display_name} の{coin_label}残高")
+    container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(target.display_avatar.url)))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"**財布**：{wallet:,} {coin_label}\u3000|\u3000**銀行**：{bank:,} {coin_label}\u3000|\u3000"
+        f"**合計**：{wallet + bank:,} {coin_label}"
+    ))
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay("-# 全サーバー共通のMコインです"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=(ユーザー is None))
 
 
 # --------------------------------------------------------------------
@@ -22881,17 +22886,18 @@ async def work(interaction: discord.Interaction):
 
     wallet = get_global_balance(all_data, interaction.user.id)
     coin_name = global_cfg.get("global_coin_name", "Mコイン")
-    embed = discord.Embed(
-        title=" 労働完了",
-        description=(
-            f"働いて **{reward:,} {coin_name}** を獲得しました！\n"
-            f" 財布の残高: **{wallet:,} {coin_name}**"
-        ),
-        color=discord.Color.green()
-    )
+    container = discord.ui.Container(accent_color=discord.Color.green())
+    container.add_item(discord.ui.TextDisplay(
+        f"## 労働完了\n"
+        f"働いて **{reward:,} {coin_name}** を獲得しました！\n"
+        f"財布の残高: **{wallet:,} {coin_name}**"
+    ))
     cd_h = cooldown // 3600
-    embed.set_footer(text=f"次に働けるのは{cd_h}時間後です（全サーバー共通クールダウン）")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(f"-# 次に働けるのは{cd_h}時間後です（全サーバー共通クールダウン）"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -22915,17 +22921,18 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
 
     new_balance = get_global_balance(all_data, ユーザー.id)
     coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
-    embed = discord.Embed(
-        title=" Mコインを変更しました",
-        description=(
-            f"対象: {ユーザー.mention}\n"
-            f"変更額: {'+' if 金額 >= 0 else ''}{金額} {coin_name}\n"
-            f"現在の財布残高: **{new_balance:,} {coin_name}**"
-        ),
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text=f"実行者: {interaction.user}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    container = discord.ui.Container(accent_color=discord.Color.blue())
+    container.add_item(discord.ui.TextDisplay(
+        f"## Mコインを変更しました\n"
+        f"対象: {ユーザー.mention}\n"
+        f"変更額: {'+' if 金額 >= 0 else ''}{金額} {coin_name}\n"
+        f"現在の財布残高: **{new_balance:,} {coin_name}**"
+    ))
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(f"-# 実行者: {interaction.user}"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -22985,44 +22992,45 @@ async def gift(
 
     # ギフト受取通知を受取人にDMで送る（失敗しても握り潰す）
     try:
-        dm_embed = discord.Embed(
-            title=" Mコインを受け取りました！",
-            description=(
-                f"**{interaction.guild.name}** で {interaction.user.mention} から "
-                f"**{金額:,} {coin_name}** 受け取りました！"
-            ),
-            color=discord.Color.gold()
+        dm_container = discord.ui.Container(accent_color=discord.Color.gold())
+        dm_text = (
+            f"## Mコインを受け取りました！\n"
+            f"**{interaction.guild.name}** で {interaction.user.mention} から "
+            f"**{金額:,} {coin_name}** 受け取りました！"
         )
+        dm_container.add_item(discord.ui.TextDisplay(dm_text))
         if メッセージ:
-            dm_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
-        dm_embed.add_field(
-            name="あなたの財布残高",
-            value=f"{get_global_balance(all_data, ユーザー.id):,} {coin_name}",
-            inline=True
-        )
-        dm_embed.set_footer(text=interaction.guild.name)
-        await ユーザー.send(embed=dm_embed)
+            dm_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            dm_container.add_item(discord.ui.TextDisplay(f"**メッセージ**\n{メッセージ}"))
+        dm_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        dm_container.add_item(discord.ui.TextDisplay(
+            f"**あなたの財布残高**：{get_global_balance(all_data, ユーザー.id):,} {coin_name}"
+        ))
+        dm_container.add_item(discord.ui.TextDisplay(f"-# {interaction.guild.name}"))
+        dm_view = discord.ui.LayoutView(timeout=None)
+        dm_view.add_item(dm_container)
+        await ユーザー.send(view=dm_view)
     except Exception:
         pass
 
-    # 実行チャンネルに公開Embedで通知
-    result_embed = discord.Embed(
-        title=" ギフト完了！",
-        description=(
-            f"{interaction.user.mention} → {ユーザー.mention}\n"
-            f"**{金額:,} {coin_name}** を贈りました！"
-        ),
-        color=discord.Color.gold()
-    )
+    # 実行チャンネルに公開Containerで通知
+    result_container = discord.ui.Container(accent_color=discord.Color.gold())
+    result_container.add_item(discord.ui.TextDisplay(
+        f"## ギフト完了！\n"
+        f"{interaction.user.mention} → {ユーザー.mention}\n"
+        f"**{金額:,} {coin_name}** を贈りました！"
+    ))
     if メッセージ:
-        result_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
-    result_embed.add_field(
-        name="あなたの残り財布残高",
-        value=f"{get_global_balance(all_data, interaction.user.id):,} {coin_name}",
-        inline=True
-    )
-    result_embed.set_footer(text=f"送信者: {interaction.user}")
-    await interaction.response.send_message(embed=result_embed)
+        result_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        result_container.add_item(discord.ui.TextDisplay(f"**メッセージ**\n{メッセージ}"))
+    result_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    result_container.add_item(discord.ui.TextDisplay(
+        f"**あなたの残り財布残高**：{get_global_balance(all_data, interaction.user.id):,} {coin_name}"
+    ))
+    result_container.add_item(discord.ui.TextDisplay(f"-# 送信者: {interaction.user}"))
+    result_view = discord.ui.LayoutView(timeout=None)
+    result_view.add_item(result_container)
+    await interaction.response.send_message(view=result_view)
 
 
 # --------------------------------------------------------------------
@@ -25682,16 +25690,19 @@ async def bank(
     bank_bal = get_global_bank(all_data, user_id)
 
     if 操作.value == "balance":
-        embed = discord.Embed(
-            title=f" {interaction.user.display_name} の口座情報",
-            color=discord.Color.blue()
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(name=" 財布", value=f"**{wallet:,} {coin_name}**", inline=True)
-        embed.add_field(name=" 銀行", value=f"**{bank_bal:,} {coin_name}**", inline=True)
-        embed.add_field(name="合計資産", value=f"**{wallet + bank_bal:,} {coin_name}**", inline=True)
-        embed.set_footer(text="全サーバー共通のグローバル口座です")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        container = discord.ui.Container(accent_color=discord.Color.blue())
+        header_text = discord.ui.TextDisplay(f"## {interaction.user.display_name} の口座情報")
+        container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(interaction.user.display_avatar.url)))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"**財布**：{wallet:,} {coin_name}\u3000|\u3000**銀行**：{bank_bal:,} {coin_name}\u3000|\u3000"
+            f"**合計資産**：{wallet + bank_bal:,} {coin_name}"
+        ))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay("-# 全サーバー共通のグローバル口座です"))
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        await interaction.response.send_message(view=view, ephemeral=True)
         return
 
     if 金額 is None or 金額 <= 0:
@@ -25709,14 +25720,17 @@ async def bank(
         global_cfg["global_balances"][uid] = max(0, wallet - 金額)
         global_cfg["global_bank"][uid] = bank_bal + 金額
         save_data(all_data)
-        embed = discord.Embed(
-            title=" 預け入れ完了",
-            description=f"**{金額:,} {coin_name}** を銀行に預け入れました。",
-            color=discord.Color.green()
-        )
-        embed.add_field(name=" 財布", value=f"{max(0, wallet - 金額):,} {coin_name}", inline=True)
-        embed.add_field(name=" 銀行", value=f"{bank_bal + 金額:,} {coin_name}", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        container = discord.ui.Container(accent_color=discord.Color.green())
+        container.add_item(discord.ui.TextDisplay(
+            f"## 預け入れ完了\n**{金額:,} {coin_name}** を銀行に預け入れました。"
+        ))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"**財布**：{max(0, wallet - 金額):,} {coin_name}\u3000|\u3000**銀行**：{bank_bal + 金額:,} {coin_name}"
+        ))
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        await interaction.response.send_message(view=view, ephemeral=True)
 
     elif 操作.value == "withdraw":
         if bank_bal < 金額:
@@ -25729,14 +25743,17 @@ async def bank(
         global_cfg["global_bank"][uid] = max(0, bank_bal - 金額)
         global_cfg["global_balances"][uid] = wallet + 金額
         save_data(all_data)
-        embed = discord.Embed(
-            title=" 引き出し完了",
-            description=f"**{金額:,} {coin_name}** を銀行から引き出しました。",
-            color=discord.Color.green()
-        )
-        embed.add_field(name=" 財布", value=f"{wallet + 金額:,} {coin_name}", inline=True)
-        embed.add_field(name=" 銀行", value=f"{max(0, bank_bal - 金額):,} {coin_name}", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        container = discord.ui.Container(accent_color=discord.Color.green())
+        container.add_item(discord.ui.TextDisplay(
+            f"## 引き出し完了\n**{金額:,} {coin_name}** を銀行から引き出しました。"
+        ))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"**財布**：{wallet + 金額:,} {coin_name}\u3000|\u3000**銀行**：{max(0, bank_bal - 金額):,} {coin_name}"
+        ))
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -25791,27 +25808,24 @@ async def owner_mcoin_setup(
 
     coin = global_cfg.get("global_coin_name", "Mコイン")
     work_cd = global_cfg.get("global_work_cooldown_seconds", 7200)
-    embed = discord.Embed(title=" グローバルMコイン設定", color=discord.Color.gold())
-    embed.add_field(name="コイン名", value=coin, inline=True)
-    embed.add_field(
-        name="work報酬",
-        value=f"{global_cfg.get('global_work_reward_min', 10)} 〜 {global_cfg.get('global_work_reward_max', 50)} {coin}",
-        inline=True
-    )
-    embed.add_field(
-        name="workクールダウン",
-        value=f"{work_cd}秒（{work_cd // 3600}時間）【全サーバー共通】",
-        inline=False
-    )
     msg_cd = global_cfg.get("global_msg_cooldown_seconds", 60)
-    embed.add_field(
-        name="メッセージ報酬",
-        value=f"{global_cfg.get('global_msg_reward_min', 1)} 〜 {global_cfg.get('global_msg_reward_max', 5)} {coin}",
-        inline=True
-    )
-    embed.add_field(name="メッセージクールダウン", value=f"{msg_cd}秒【全サーバー共通】", inline=True)
-    embed.set_footer(text="この設定は全サーバーに即時反映されます")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    container = discord.ui.Container(accent_color=discord.Color.gold())
+    container.add_item(discord.ui.TextDisplay("## グローバルMコイン設定"))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(f"**コイン名**：{coin}"))
+    container.add_item(discord.ui.TextDisplay(
+        f"**work報酬**：{global_cfg.get('global_work_reward_min', 10)} 〜 {global_cfg.get('global_work_reward_max', 50)} {coin}\u3000|\u3000"
+        f"**workクールダウン**：{work_cd}秒（{work_cd // 3600}時間）【全サーバー共通】"
+    ))
+    container.add_item(discord.ui.TextDisplay(
+        f"**メッセージ報酬**：{global_cfg.get('global_msg_reward_min', 1)} 〜 {global_cfg.get('global_msg_reward_max', 5)} {coin}\u3000|\u3000"
+        f"**メッセージクールダウン**：{msg_cd}秒【全サーバー共通】"
+    ))
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay("-# この設定は全サーバーに即時反映されます"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -26143,17 +26157,18 @@ async def sell(interaction: discord.Interaction, amount: int):
     save_data(all_data)
 
     new_balance = get_global_balance(all_data, interaction.user.id)
-    embed = discord.Embed(
-        title="💰 売却完了",
-        description=(
-            f"{amount:,} {coin_name} を売りました！\n"
-            f"ボーナス報酬: **+{bonus:,} {coin_name}**\n"
-            f"残り所持{coin_name}: **{new_balance:,} {coin_name}**"
-        ),
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text="次回の売却は7日後に解放されます。")
-    await interaction.response.send_message(embed=embed)
+    container = discord.ui.Container(accent_color=discord.Color.gold())
+    container.add_item(discord.ui.TextDisplay(
+        f"## 💰 売却完了\n"
+        f"{amount:,} {coin_name} を売りました！\n"
+        f"ボーナス報酬: **+{bonus:,} {coin_name}**\n"
+        f"残り所持{coin_name}: **{new_balance:,} {coin_name}**"
+    ))
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay("-# 次回の売却は7日後に解放されます。"))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await interaction.response.send_message(view=view)
 
 
 # --------------------------------------------------------------------
