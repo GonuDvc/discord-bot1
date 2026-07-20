@@ -27877,29 +27877,28 @@ class TicketCreateButton(discord.ui.Button):
         }
         save_data(all_data)
 
-        embed = discord.Embed(
-            title=f"[TICKET] お問い合わせ #{ticket_id:04d}",
-            description=(
-                f"{interaction.user.mention} さんの問い合わせチャンネルです。\n"
-                f"内容をこちらにご記入ください。対応完了後は下のボタン、または `/ticket close` でクローズできます。"
-            ),
-            color=discord.Color.blurple()
-        )
         await ticket_channel.send(
-            content=f"{interaction.user.mention}" + (f" {staff_role.mention}" if staff_role else ""),
-            embed=embed,
-            view=TicketCloseView()
+            view=TicketCloseView(ticket_id, interaction.user.mention, staff_role.mention if staff_role else None),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True)
         )
 
         await interaction.followup.send(f"[OK] チケットを作成しました: {ticket_channel.mention}", ephemeral=True)
 
 
-class TicketPanelView(discord.ui.View):
-    """チケットパネル（作成ボタン付き）。custom_idが固定なのでBot起動時に1回登録すれば全パネルで動作する。"""
+class TicketPanelView(discord.ui.LayoutView):
+    """チケットパネル（作成ボタン付き、Components V2）。
+    custom_idが固定なのでBot起動時に1回登録すれば全パネルで動作する。
+    タイトル・説明文はContainer内のTextDisplayとして表示する。"""
 
-    def __init__(self):
+    def __init__(self, title: str = "お問い合わせ", description: str = "下のボタンから問い合わせを作成できます。"):
         super().__init__(timeout=None)
-        self.add_item(TicketCreateButton())
+        container = discord.ui.Container(accent_color=discord.Color.blurple())
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n{description}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        row.add_item(TicketCreateButton())
+        container.add_item(row)
+        self.add_item(container)
 
 
 class TicketCloseButton(discord.ui.Button):
@@ -27916,10 +27915,27 @@ class TicketCloseButton(discord.ui.Button):
         await _close_ticket_channel(interaction)
 
 
-class TicketCloseView(discord.ui.View):
-    def __init__(self):
+class TicketCloseView(discord.ui.LayoutView):
+    """チケットチャンネル内に表示するパネル（Components V2）。
+    タイトル・説明文とクローズボタンを1つのContainerにまとめる。
+    custom_idが固定なのでBot起動時に1回登録すれば全チケットチャンネルで動作する。"""
+
+    def __init__(self, ticket_id: int = None, user_mention: str = None, staff_role_mention: str = None):
         super().__init__(timeout=None)
-        self.add_item(TicketCloseButton())
+        container = discord.ui.Container(accent_color=discord.Color.blurple())
+        if ticket_id is not None and user_mention is not None:
+            mention_line = f"{user_mention}" + (f" {staff_role_mention}" if staff_role_mention else "")
+            container.add_item(discord.ui.TextDisplay(mention_line))
+            container.add_item(discord.ui.TextDisplay(
+                f"## [TICKET] お問い合わせ #{ticket_id:04d}\n"
+                f"{user_mention} さんの問い合わせチャンネルです。\n"
+                "内容をこちらにご記入ください。対応完了後は下のボタン、または `/ticket close` でクローズできます。"
+            ))
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        row.add_item(TicketCloseButton())
+        container.add_item(row)
+        self.add_item(container)
 
 
 async def _close_ticket_channel(interaction: discord.Interaction):
@@ -27958,18 +27974,21 @@ async def _close_ticket_channel(interaction: discord.Interaction):
         log_channel = guild.get_channel(log_channel_id)
         if log_channel:
             ticket_user = guild.get_member(info.get("user_id"))
-            log_embed = discord.Embed(
-                title=f"[TICKET] チケット #{info.get('ticket_id', 0):04d} クローズ",
-                description=(
-                    f"作成者: {ticket_user.mention if ticket_user else info.get('user_id')}\n"
-                    f"クローズ実行者: {interaction.user.mention}\n"
-                    f"チャンネル名: {channel.name}"
-                ),
-                color=discord.Color.red(),
-                timestamp=discord.utils.utcnow()
-            )
+            log_container = discord.ui.Container(accent_color=discord.Color.red())
+            log_container.add_item(discord.ui.TextDisplay(
+                f"## [TICKET] チケット #{info.get('ticket_id', 0):04d} クローズ\n"
+                f"作成者: {ticket_user.mention if ticket_user else info.get('user_id')}\n"
+                f"クローズ実行者: {interaction.user.mention}\n"
+                f"チャンネル名: {channel.name}"
+            ))
+            log_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            log_container.add_item(discord.ui.TextDisplay(
+                f"-# {discord.utils.format_dt(discord.utils.utcnow(), style='f')}"
+            ))
+            log_view = discord.ui.LayoutView(timeout=None)
+            log_view.add_item(log_container)
             try:
-                await log_channel.send(embed=log_embed)
+                await log_channel.send(view=log_view, allowed_mentions=discord.AllowedMentions(users=True))
             except discord.HTTPException:
                 pass
 
@@ -28005,11 +28024,10 @@ async def ticket_setup(
         await interaction.response.send_message("このコマンドはサーバーのテキストチャンネルでのみ使用できます。", ephemeral=True)
         return
 
-    embed = discord.Embed(title=タイトル, description=説明, color=discord.Color.blurple())
-    view = TicketPanelView()
+    view = TicketPanelView(タイトル, 説明)
 
     try:
-        message = await interaction.channel.send(embed=embed, view=view)
+        message = await interaction.channel.send(view=view)
     except discord.Forbidden:
         await interaction.response.send_message("このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True)
         return
@@ -28018,6 +28036,8 @@ async def ticket_setup(
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg["ticket_panel_channel_id"] = interaction.channel.id
     cfg["ticket_panel_message_id"] = message.id
+    cfg["ticket_panel_title"] = タイトル
+    cfg["ticket_panel_description"] = 説明
     cfg["ticket_staff_role_id"] = スタッフロール.id
     cfg["ticket_category_id"] = チケット作成先カテゴリ.id if チケット作成先カテゴリ else None
     cfg["ticket_log_channel_id"] = ログチャンネル.id if ログチャンネル else None
