@@ -1370,54 +1370,57 @@ async def is_guild_admin(interaction: discord.Interaction) -> bool:
 # セクション 3: 共有 Embed / 表示用ヘルパー関数
 # ====================================================================
 
-def create_user_list_embed(allowed_users: list) -> discord.Embed:
-    """コマンド使用を許可されたユーザー一覧の Embed を作成します。"""
-    embed = discord.Embed(
-        title="コマンド使用許可ユーザー一覧", 
-        description="現在、以下のユーザーに権限が与えられています。\n※サーバー管理者は登録なしですべてのコマンドを使用できます。",
-        color=discord.Color.blue()
-    )
+def create_user_list_container(allowed_users: list) -> discord.ui.Container:
+    """コマンド使用を許可されたユーザー一覧のContainer（Components V2）を作成します。"""
+    container = discord.ui.Container(accent_color=discord.Color.blue())
+    container.add_item(discord.ui.TextDisplay(
+        "## コマンド使用許可ユーザー一覧\n"
+        "現在、以下のユーザーに権限が与えられています。\n"
+        "※サーバー管理者は登録なしですべてのコマンドを使用できます。"
+    ))
+    container.add_item(discord.ui.Separator())
     if not allowed_users:
-        embed.add_field(name="登録ユーザー", value="開示できるユーザーはいません。", inline=False)
-        embed.set_footer(text="登録者数: 0名")
+        container.add_item(discord.ui.TextDisplay("**登録ユーザー**\n開示できるユーザーはいません。"))
+        footer = "登録者数: 0名"
     else:
         user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
-        embed.add_field(name="登録ユーザー", value="\n".join(user_mentions), inline=False)
-        embed.set_footer(text=f"登録者数: {len(allowed_users)}名")
-    return embed
+        container.add_item(discord.ui.TextDisplay(f"**登録ユーザー**\n" + "\n".join(user_mentions)))
+        footer = f"登録者数: {len(allowed_users)}名"
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+    return container
 
 
 
 
 GUILDS_PER_PAGE = 5
 
-def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
-    """導入中サーバーの一覧 Embed を改ページ対応で作成します。"""
+def build_guild_list_container(guilds: list, page: int) -> discord.ui.Container:
+    """導入中サーバーの一覧Container（Components V2）を改ページ対応で作成します。"""
     total_pages = max(1, (len(guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
     start = page * GUILDS_PER_PAGE
     end = start + GUILDS_PER_PAGE
     page_guilds = guilds[start:end]
 
-    embed = discord.Embed(
-        title="導入中サーバー一覧",
-        description=f"現在 **{len(guilds)}個** のサーバーに導入されています。",
-        color=discord.Color.blurple()
-    )
+    container = discord.ui.Container(accent_color=discord.Color.blurple())
+    container.add_item(discord.ui.TextDisplay(
+        f"## 導入中サーバー一覧\n現在 **{len(guilds)}個** のサーバーに導入されています。"
+    ))
+    container.add_item(discord.ui.Separator())
 
+    lines = []
     for i, g in enumerate(page_guilds, start=start + 1):
         owner_text = f"<@{g.owner_id}>" if g.owner_id else "不明"
-        embed.add_field(
-            name=f"{i}. {g.name}",
-            value=(
-                f"ID: `{g.id}`\n"
-                f"メンバー: **{g.member_count}人** | "
-                f"オーナー: {owner_text}"
-            ),
-            inline=False
+        lines.append(
+            f"**{i}. {g.name}**\n"
+            f"ID: `{g.id}`\n"
+            f"メンバー: **{g.member_count}人** | オーナー: {owner_text}"
         )
+    container.add_item(discord.ui.TextDisplay("\n\n".join(lines) if lines else "サーバーがありません。"))
 
-    embed.set_footer(text=f"ページ {page + 1} / {total_pages}")
-    return embed
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(f"-# ページ {page + 1} / {total_pages}"))
+    return container
 
 
 async def update_bot_status(client, text=None):
@@ -1766,40 +1769,58 @@ async def _handle_afk_logic_dm(message: discord.Message):
 
 
 
-class GuildLeaveConfirmView(discord.ui.View):
-    """オーナーが指定サーバーから脱退する際の最終確認用ボタンビューです。"""
+class GuildLeaveConfirmView(discord.ui.LayoutView):
+    """オーナーが指定サーバーから脱退する際の最終確認用ビューです（Components V2）。"""
     def __init__(self, guild: discord.Guild, original_view: "GuildListView"):
         super().__init__(timeout=60)
         self.guild = guild
         self.original_view = original_view
+        container = discord.ui.Container(accent_color=discord.Color.red())
+        header_text = discord.ui.TextDisplay(
+            f"## サーバー脱退の確認\n"
+            f"以下のサーバーから本当に脱退しますか？\n\n"
+            f"**サーバー名:** {guild.name}\n"
+            f"**サーバーID:** `{guild.id}`\n"
+            f"**メンバー数:** {guild.member_count}人\n\n"
+            "この操作は **取り消せません。**"
+        )
+        if guild.icon:
+            container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(guild.icon.url)))
+        else:
+            container.add_item(header_text)
+        row = discord.ui.ActionRow()
+        confirm_btn = discord.ui.Button(label="本当に脱退する", style=discord.ButtonStyle.danger)
+        confirm_btn.callback = self._on_confirm_leave
+        row.add_item(confirm_btn)
+        cancel_btn = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.secondary)
+        cancel_btn.callback = self._on_cancel_leave
+        row.add_item(cancel_btn)
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(row)
+        self.add_item(container)
 
-    @discord.ui.button(label="本当に脱退する", style=discord.ButtonStyle.danger)
-    async def confirm_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_confirm_leave(self, interaction: discord.Interaction):
         guild_name = self.guild.name
         try:
             await self.guild.leave()
-            await interaction.response.edit_message(
-                content=f"**{guild_name}** から脱退しました。",
-                embed=None,
-                view=None
-            )
+            notice_container = discord.ui.Container(accent_color=discord.Color.greyple())
+            notice_container.add_item(discord.ui.TextDisplay(f"**{guild_name}** から脱退しました。"))
+            notice_view = discord.ui.LayoutView(timeout=None)
+            notice_view.add_item(notice_container)
+            await interaction.response.edit_message(view=notice_view)
         except discord.HTTPException as e:
-            await interaction.response.edit_message(
-                content=f"脱退に失敗しました: `{e}`",
-                embed=None,
-                view=None
-            )
+            notice_container = discord.ui.Container(accent_color=discord.Color.red())
+            notice_container.add_item(discord.ui.TextDisplay(f"脱退に失敗しました: `{e}`"))
+            notice_view = discord.ui.LayoutView(timeout=None)
+            notice_view.add_item(notice_container)
+            await interaction.response.edit_message(view=notice_view)
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
-    async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_cancel_leave(self, interaction: discord.Interaction):
         guilds = list(interaction.client.guilds)
-        embed = build_guild_list_embed(guilds, self.original_view.page)
+        container = build_guild_list_container(guilds, self.original_view.page)
         self.original_view.update_buttons(guilds)
-        await interaction.response.edit_message(
-            content=None,
-            embed=embed,
-            view=self.original_view
-        )
+        self.original_view._render(container)
+        await interaction.response.edit_message(view=self.original_view)
 
 
 class GuildSelectForLeave(discord.ui.Select):
@@ -1832,73 +1853,73 @@ class GuildSelectForLeave(discord.ui.Select):
             await interaction.response.send_message("サーバーが見つかりませんでした。", ephemeral=True)
             return
 
-        confirm_embed = discord.Embed(
-            title="サーバー脱退の確認",
-            description=(
-                f"以下のサーバーから本当に脱退しますか？\n\n"
-                f"**サーバー名:** {guild.name}\n"
-                f"**サーバーID:** `{guild.id}`\n"
-                f"**メンバー数:** {guild.member_count}人\n\n"
-                "この操作は **取り消せません。**"
-            ),
-            color=discord.Color.red()
-        )
-        if guild.icon:
-            confirm_embed.set_thumbnail(url=guild.icon.url)
-
         parent_view = self.view
-        await interaction.response.edit_message(
-            embed=confirm_embed,
-            view=GuildLeaveConfirmView(guild, parent_view)
-        )
+        await interaction.response.edit_message(view=GuildLeaveConfirmView(guild, parent_view))
 
 
-class GuildListView(discord.ui.View):
-    """導入サーバー一覧と脱退選択機能をまとめた管理用ビューです。"""
+class GuildListView(discord.ui.LayoutView):
+    """導入サーバー一覧と脱退選択機能をまとめた管理用ビューです（Components V2）。"""
     def __init__(self, guilds: list, page: int = 0):
         super().__init__(timeout=300)
         self.page = page
         self.guilds = guilds
-        self._rebuild_select()
-        self.update_buttons(guilds)
+        container = build_guild_list_container(guilds, page)
+        self._render(container)
 
-    def _rebuild_select(self):
-        items_to_remove = [item for item in self.children if isinstance(item, GuildSelectForLeave)]
-        for item in items_to_remove:
-            self.remove_item(item)
+    def _render(self, container: discord.ui.Container):
+        self.clear_items()
+        total_pages = max(1, (len(self.guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
+
+        nav_row = discord.ui.ActionRow()
+        prev_btn = discord.ui.Button(
+            label="前へ", style=discord.ButtonStyle.secondary, disabled=(self.page <= 0)
+        )
+        prev_btn.callback = self._on_prev
+        nav_row.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(
+            label="次へ", style=discord.ButtonStyle.secondary, disabled=(self.page >= total_pages - 1)
+        )
+        next_btn.callback = self._on_next
+        nav_row.add_item(next_btn)
+
+        refresh_btn = discord.ui.Button(label="更新", style=discord.ButtonStyle.primary)
+        refresh_btn.callback = self._on_refresh
+        nav_row.add_item(refresh_btn)
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(nav_row)
+
         if self.guilds:
-            self.add_item(GuildSelectForLeave(self.guilds, self.page))
+            select_row = discord.ui.ActionRow()
+            select_row.add_item(GuildSelectForLeave(self.guilds, self.page))
+            container.add_item(select_row)
+
+        self.add_item(container)
 
     def update_buttons(self, guilds: list):
-        total_pages = max(1, (len(guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
-        self.prev_button.disabled = (self.page <= 0)
-        self.next_button.disabled = (self.page >= total_pages - 1)
+        # _renderが毎回total_pages/disabledを再計算するため、ここでは互換用に guilds のみ更新する。
+        self.guilds = guilds
 
-    @discord.ui.button(label="前へ", style=discord.ButtonStyle.secondary, row=1)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_prev(self, interaction: discord.Interaction):
         self.page -= 1
         self.guilds = list(interaction.client.guilds)
-        self._rebuild_select()
-        self.update_buttons(self.guilds)
-        embed = build_guild_list_embed(self.guilds, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        container = build_guild_list_container(self.guilds, self.page)
+        self._render(container)
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="次へ", style=discord.ButtonStyle.secondary, row=1)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_next(self, interaction: discord.Interaction):
         self.page += 1
         self.guilds = list(interaction.client.guilds)
-        self._rebuild_select()
-        self.update_buttons(self.guilds)
-        embed = build_guild_list_embed(self.guilds, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        container = build_guild_list_container(self.guilds, self.page)
+        self._render(container)
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="更新", style=discord.ButtonStyle.primary, row=1)
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_refresh(self, interaction: discord.Interaction):
         self.guilds = list(interaction.client.guilds)
-        self._rebuild_select()
-        self.update_buttons(self.guilds)
-        embed = build_guild_list_embed(self.guilds, self.page)
-        await interaction.response.edit_message(embed=embed, view=self)
+        container = build_guild_list_container(self.guilds, self.page)
+        self._render(container)
+        await interaction.response.edit_message(view=self)
 
 
 class CustomTriggerDeleteSelect(discord.ui.Select):
@@ -2010,17 +2031,16 @@ class MemoDeleteView(discord.ui.View):
         self.add_item(MemoDeleteSelect(memos))
 
 
-class UserManageView(discord.ui.View):
-    """コマンド許可ユーザーを追加・削除するためのユーザー選択メニュービューです。"""
-    def __init__(self):
-        super().__init__(timeout=300)
+class ManageAddUserSelect(discord.ui.UserSelect):
+    def __init__(self, parent_view: "UserManageView"):
+        self.parent_view = parent_view
+        super().__init__(placeholder="許可ユーザーを追加...", custom_id="manage_add_user")
 
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="許可ユーザーを追加...", custom_id="manage_add_user")
-    async def add_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.guild: return
         if not interaction.user.guild_permissions.administrator: return
 
-        target_user = select.values[0]
+        target_user = self.values[0]
         guild_id_str = str(interaction.guild.id)
         all_data = load_data()
         guild_config = get_guild_config(all_data, guild_id_str)
@@ -2028,19 +2048,24 @@ class UserManageView(discord.ui.View):
         if target_user.id not in guild_config["allowed_users"]:
             guild_config["allowed_users"].append(target_user.id)
             save_data(all_data)
-            
-            updated_embed = create_user_list_embed(guild_config["allowed_users"])
-            await interaction.response.edit_message(embed=updated_embed, view=self)
+
+            self.parent_view._render(guild_config["allowed_users"])
+            await interaction.response.edit_message(view=self.parent_view)
             await interaction.followup.send(f"{target_user.mention} を許可リストに追加しました。", ephemeral=True)
         else:
             await interaction.response.send_message(f"{target_user.mention} は既に登録されています。", ephemeral=True)
 
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="許可ユーザーを削除...", custom_id="manage_remove_user")
-    async def remove_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+
+class ManageRemoveUserSelect(discord.ui.UserSelect):
+    def __init__(self, parent_view: "UserManageView"):
+        self.parent_view = parent_view
+        super().__init__(placeholder="許可ユーザーを削除...", custom_id="manage_remove_user")
+
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.guild: return
         if not interaction.user.guild_permissions.administrator: return
 
-        target_user = select.values[0]
+        target_user = self.values[0]
         guild_id_str = str(interaction.guild.id)
         all_data = load_data()
         guild_config = get_guild_config(all_data, guild_id_str)
@@ -2048,12 +2073,34 @@ class UserManageView(discord.ui.View):
         if target_user.id in guild_config["allowed_users"]:
             guild_config["allowed_users"].remove(target_user.id)
             save_data(all_data)
-            
-            updated_embed = create_user_list_embed(guild_config["allowed_users"])
-            await interaction.response.edit_message(embed=updated_embed, view=self)
+
+            self.parent_view._render(guild_config["allowed_users"])
+            await interaction.response.edit_message(view=self.parent_view)
             await interaction.followup.send(f"{target_user.mention} を許可リストから削除しました。", ephemeral=True)
         else:
             await interaction.response.send_message(f"{target_user.mention} は登録されていません。", ephemeral=True)
+
+
+class UserManageView(discord.ui.LayoutView):
+    """コマンド許可ユーザーを追加・削除するためのユーザー選択メニュービューです（Components V2）。"""
+    def __init__(self, allowed_users: list = None):
+        super().__init__(timeout=300)
+        self._render(allowed_users or [])
+
+    def _render(self, allowed_users: list):
+        self.clear_items()
+        container = create_user_list_container(allowed_users)
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        add_row = discord.ui.ActionRow()
+        add_row.add_item(ManageAddUserSelect(self))
+        container.add_item(add_row)
+
+        remove_row = discord.ui.ActionRow()
+        remove_row.add_item(ManageRemoveUserSelect(self))
+        container.add_item(remove_row)
+
+        self.add_item(container)
 
 
 class DynamicRoleSelect(discord.ui.Select):
@@ -13841,8 +13888,8 @@ async def server_list_users(interaction: discord.Interaction):
     g_id = str(interaction.guild.id)
     all_data = load_data()
     config = get_guild_config(all_data, g_id)
-    embed = create_user_list_embed(config.get("allowed_users", []))
-    await interaction.response.send_message(embed=embed, view=UserManageView(), ephemeral=True)
+    view = UserManageView(config.get("allowed_users", []))
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -17832,9 +17879,8 @@ async def owner_guilds(interaction: discord.Interaction):
     if not guilds:
         await interaction.response.send_message("現在、どのサーバーにも導入されていません。", ephemeral=True)
         return
-    embed = build_guild_list_embed(guilds, page=0)
     view = GuildListView(guilds, page=0)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 @owner_group.command(name="guild_detail", description="【オーナー限定】サーバーの詳しい情報と招待リンクを取得できます")
@@ -28685,10 +28731,20 @@ class InterviewStartButton(discord.ui.Button):
         await _start_interview(interaction)
 
 
-class InterviewPanelView(discord.ui.View):
-    def __init__(self):
+class InterviewPanelView(discord.ui.LayoutView):
+    """面接パネル（Components V2）。
+    タイトル・説明文・「面接を受ける」ボタンを1つのContainerにまとめる。
+    custom_idが固定（interview_start_button）なのでBot起動時に1回登録すれば全パネルで動作する。"""
+
+    def __init__(self, title: str = "面接（応募）受付", description: str = "下のボタンを押すと面接を開始します。質問に順番にお答えください。"):
         super().__init__(timeout=None)
-        self.add_item(InterviewStartButton())
+        container = discord.ui.Container(accent_color=discord.Color.blurple())
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n{description}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        row.add_item(InterviewStartButton())
+        container.add_item(row)
+        self.add_item(container)
 
 
 @interview_group.command(name="panel", description="【管理者専用】このチャンネルに「面接を受ける」ボタン付きのパネルを設置できます")
@@ -28716,21 +28772,20 @@ async def interview_panel(interaction: discord.Interaction, タイトル: str = 
         )
         return
 
-    embed = discord.Embed(
-        title=タイトル or "面接（応募）受付",
-        description=説明 or "下のボタンを押すと面接を開始します。質問に順番にお答えください。",
-        color=discord.Color.blurple()
-    )
-    view = InterviewPanelView()
+    panel_title = タイトル or "面接（応募）受付"
+    panel_description = 説明 or "下のボタンを押すと面接を開始します。質問に順番にお答えください。"
+    view = InterviewPanelView(panel_title, panel_description)
 
     try:
-        message = await interaction.channel.send(embed=embed, view=view)
+        message = await interaction.channel.send(view=view)
     except discord.Forbidden:
         await interaction.response.send_message("このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True)
         return
 
     cfg["interview_panel_channel_id"] = interaction.channel.id
     cfg["interview_panel_message_id"] = message.id
+    cfg["interview_panel_title"] = panel_title
+    cfg["interview_panel_description"] = panel_description
     save_data(all_data)
 
     await interaction.response.send_message("[OK] 面接パネルを設置しました。", ephemeral=True)
