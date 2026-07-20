@@ -4291,7 +4291,12 @@ async def on_ready():
             continue
         try:
             shop_items = config.get("role_shop", [])
-            view = RoleShopView(shop_items) if shop_items else discord.ui.View(timeout=None)
+            if shop_items:
+                view = RoleShopView(shop_items)
+            else:
+                empty_container = discord.ui.Container(accent_color=discord.Color.purple())
+                view = discord.ui.LayoutView(timeout=None)
+                view.add_item(empty_container)
             bot.add_view(view, message_id=panel_message_id)
         except Exception as e:
             print(f"[警告] ロールショップパネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
@@ -4308,7 +4313,12 @@ async def on_ready():
             continue
         try:
             items = config.get("vending_items", [])
-            view = VendingMachineView(items) if items else discord.ui.View(timeout=None)
+            if items:
+                view = VendingMachineView(items)
+            else:
+                empty_container = discord.ui.Container(accent_color=discord.Color.teal())
+                view = discord.ui.LayoutView(timeout=None)
+                view.add_item(empty_container)
             bot.add_view(view, message_id=panel_message_id)
         except Exception as e:
             print(f"[警告] 自販機パネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
@@ -21905,7 +21915,9 @@ class EmbedMentionRoleSelect(discord.ui.RoleSelect):
 
 
 class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal）の設定"):
-    """Embedに添える「回答する」ボタン＆回答用Modalの文言を設定するモーダル。"""
+    """Embedに添える「回答する」ボタン＆回答用Modalの文言を設定するモーダル。
+    回答フォームの入力欄自体は、EmbedBuilderView側の「入力欄を追加/削除」ボタンで管理する
+    （Discordの仕様上Modalの構成は送信時に固定されるため、可変長には対応できないため）。"""
     button_label = discord.ui.TextInput(
         label="ボタンのラベル",
         placeholder="例: 回答する",
@@ -21920,26 +21932,11 @@ class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal�
         max_length=45,
         required=True
     )
-    title_field_label = discord.ui.TextInput(
-        label="入力欄1のラベル（タイトル）",
-        placeholder="例: お名前",
-        default="タイトル",
-        max_length=45,
-        required=True
-    )
-    body_field_label = discord.ui.TextInput(
-        label="入力欄2のラベル（本文）",
-        placeholder="例: お問い合わせ内容",
-        default="本文",
-        max_length=45,
-        required=True
-    )
-    allow_attachment_input = discord.ui.TextInput(
-        label="ファイル添付を許可（yes / no）",
-        placeholder="yes または no",
-        default="no",
-        max_length=3,
-        required=False
+    # ファイル添付の可否はチェックボックス1個（Label内に配置する必要がある、discord.py 2.7〜）。
+    allow_attachment_checkbox = discord.ui.Label(
+        text="ファイル添付を許可する",
+        description="ONの場合、回答送信後にファイル（画像・PDF等）の送信を促します。",
+        component=discord.ui.Checkbox(default=False),
     )
 
     def __init__(self, parent_view: "EmbedBuilderView"):
@@ -21950,43 +21947,70 @@ class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal�
         pv = self.parent_view
         pv.modal_config["button_label"] = self.button_label.value or "回答する"
         pv.modal_config["modal_title"] = self.modal_title.value or "回答フォーム"
-        pv.modal_config["title_field_label"] = self.title_field_label.value or "タイトル"
-        pv.modal_config["body_field_label"] = self.body_field_label.value or "本文"
-        pv.modal_config["allow_attachment"] = self.allow_attachment_input.value.strip().lower() in ("yes", "y", "true", "1")
+        pv.modal_config["allow_attachment"] = bool(self.allow_attachment_checkbox.component.value)
+        pv._render()
+        await interaction.response.edit_message(view=pv)
+
+
+class EmbedFieldLabelModal(discord.ui.Modal, title="回答フォームの入力欄を追加"):
+    """回答フォーム（Modal）に入力欄を1つ追加するための簡易モーダル。
+    Discordの仕様上、Modal全体は最大5つの入力欄までしか持てないため、
+    既に5個ある場合はEmbedBuilderView側でこのModalを開かせないようにする。"""
+    field_label = discord.ui.TextInput(
+        label="入力欄のラベル",
+        placeholder="例: メールアドレス",
+        max_length=45,
+        required=True
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pv = self.parent_view
+        fields = pv.modal_config.setdefault("fields", [])
+        if len(fields) >= 5:
+            await interaction.response.send_message("入力欄は最大5個までです。", ephemeral=True)
+            return
+        fields.append({"label": self.field_label.value.strip() or f"入力欄{len(fields) + 1}"})
         pv._render()
         await interaction.response.edit_message(view=pv)
 
 
 class EmbedResponseSubmitModal(discord.ui.Modal):
-    """ユーザーが「回答する」ボタンを押した際に開く、固定2項目（タイトル・本文）の回答フォーム。"""
+    """ユーザーが「回答する」ボタンを押した際に開く、可変個数（最大5個）の回答フォーム。"""
 
-    def __init__(self, guild_id: int, panel_id: int, modal_title: str, title_label: str, body_label: str, allow_attachment: bool = False):
+    def __init__(self, guild_id: int, panel_id: int, modal_title: str, fields: list, allow_attachment: bool = False):
         super().__init__(title=modal_title[:45] or "回答フォーム")
         self.guild_id = guild_id
         self.panel_id = panel_id
         self.allow_attachment = allow_attachment
-        self.title_input = discord.ui.TextInput(
-            label=title_label[:45] or "タイトル",
-            max_length=256,
-            required=True
-        )
-        self.body_input = discord.ui.TextInput(
-            label=body_label[:45] or "本文",
-            style=discord.TextStyle.paragraph,
-            max_length=4000,
-            required=True
-        )
-        self.add_item(self.title_input)
-        self.add_item(self.body_input)
+        self.field_inputs: list[discord.ui.TextInput] = []
+        # fieldsが空、または不正な場合のフォールバック（従来のタイトル・本文2項目）
+        if not fields:
+            fields = [{"label": "タイトル"}, {"label": "本文"}]
+        for i, f in enumerate(fields[:5]):
+            # 2個目以降は複数行入力にして、従来の「本文」欄と同等の使い勝手を維持する
+            style = discord.TextStyle.short if i == 0 else discord.TextStyle.paragraph
+            max_len = 256 if i == 0 else 4000
+            text_input = discord.ui.TextInput(
+                label=(f.get("label") or f"入力欄{i + 1}")[:45],
+                style=style,
+                max_length=max_len,
+                required=True
+            )
+            self.field_inputs.append(text_input)
+            self.add_item(text_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        values = [ti.value for ti in self.field_inputs]
         # Discordの仕様上、Modal自体にファイル添付欄は置けないため、
         # 「ファイル添付を許可」しているパネルではModal送信後にチャンネルへ
         # ファイルを送ってもらい、Botがそれを拾って回答Embedに添付する。
         if not self.allow_attachment:
             await _handle_embed_response_submit(
-                interaction, self.guild_id, self.panel_id,
-                self.title_input.value, self.body_input.value
+                interaction, self.guild_id, self.panel_id, values
             )
             return
 
@@ -22027,8 +22051,7 @@ class EmbedResponseSubmitModal(discord.ui.Modal):
             )
 
         await _handle_embed_response_submit(
-            interaction, self.guild_id, self.panel_id,
-            self.title_input.value, self.body_input.value,
+            interaction, self.guild_id, self.panel_id, values,
             file_to_send=file_to_send, is_image=is_image, use_followup=True
         )
 
@@ -22057,8 +22080,7 @@ class EmbedResponseButton(discord.ui.Button):
         modal = EmbedResponseSubmitModal(
             self.guild_id, self.panel_id,
             panel.get("modal_title", "回答フォーム"),
-            panel.get("title_field_label", "タイトル"),
-            panel.get("body_field_label", "本文"),
+            panel.get("fields") or [{"label": panel.get("title_field_label", "タイトル")}, {"label": panel.get("body_field_label", "本文")}],
             allow_attachment=panel.get("allow_attachment", False),
         )
         await interaction.response.send_modal(modal)
@@ -22076,14 +22098,14 @@ async def _handle_embed_response_submit(
     interaction: discord.Interaction,
     guild_id: int,
     panel_id: int,
-    title_value: str,
-    body_value: str,
+    values: list,
     file_to_send: discord.File = None,
     is_image: bool = False,
     use_followup: bool = False,
 ):
-    """回答Modal送信時の処理。回答送信先チャンネルへEmbed形式で内容を送信する。
-    file_to_send が指定されている場合は、回答Embedにファイルを添付して送信する。
+    """回答Modal送信時の処理。回答送信先チャンネルへContainer形式で内容を送信する。
+    values は回答フォームの各入力欄の値（順番はpanelのfields順）。
+    file_to_send が指定されている場合は、回答Containerにファイルを添付して送信する。
     （呼び出し側で元メッセージ削除前にダウンロード済みのファイルを渡す想定）
     use_followup=True の場合、既にinteractionへ応答済み（ファイル添付待ちの案内を送信済み）
     のため、以降のメッセージは interaction.followup 経由で送る。"""
@@ -22113,12 +22135,24 @@ async def _handle_embed_response_submit(
         await _reply("回答送信先チャンネルが見つかりませんでした。管理者にお問い合わせください。")
         return
 
+    fields_meta = panel.get("fields") or [{"label": panel.get("title_field_label", "タイトル")}, {"label": panel.get("body_field_label", "本文")}]
+
     container = discord.ui.Container(accent_color=discord.Color.blurple())
     mention_role_id = panel.get("mention_role_id")
     if mention_role_id:
         container.add_item(discord.ui.TextDisplay(f"<@&{mention_role_id}>"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-    container.add_item(discord.ui.TextDisplay(f"## {title_value[:256]}\n{body_value[:4000]}"))
+
+    # 1つ目の入力欄を見出し、残りを本文相当として表示する
+    first_label = fields_meta[0].get("label", "タイトル") if fields_meta else "タイトル"
+    first_value = values[0][:256] if values else ""
+    body_lines = []
+    for meta, val in zip(fields_meta[1:], values[1:]):
+        body_lines.append(f"**{meta.get('label', '入力欄')}**\n{val[:4000]}")
+    header_text = f"## {first_value}"
+    if body_lines:
+        header_text += "\n\n" + "\n\n".join(body_lines)
+    container.add_item(discord.ui.TextDisplay(header_text))
 
     # 添付ファイルは呼び出し側で（元メッセージ削除前に）ダウンロード済みのものを受け取る。
     # 画像であればMediaGalleryにも表示する。
@@ -22182,8 +22216,7 @@ class EmbedBuilderView(discord.ui.LayoutView):
             "response_channel_id": None,
             "button_label": "回答する",
             "modal_title": "回答フォーム",
-            "title_field_label": "タイトル",
-            "body_field_label": "本文",
+            "fields": [{"label": "タイトル"}, {"label": "本文"}],  # 最大5個。回答フォームの入力欄ラベル一覧
             "mention_role_id": None,  # Modal送信時にメンションするロール（1つのみ、任意）
             "allow_attachment": False,  # Modal送信後にファイル添付を受け付けるかどうか
         }
@@ -22248,12 +22281,13 @@ class EmbedBuilderView(discord.ui.LayoutView):
             mention_role_id = mc.get("mention_role_id")
             mention_line = f"\nメンションロール: <@&{mention_role_id}>" if mention_role_id else ""
             attachment_line = "\nファイル添付: 許可（送信後にファイルを送ってもらう案内を表示）" if mc.get("allow_attachment") else ""
+            fields_text = "、".join(f"「{f['label']}」" for f in mc.get("fields", []))
             container.add_item(discord.ui.Separator())
             container.add_item(discord.ui.TextDisplay(
                 "**[Modal設定：この項目は実際の送信時には含まれません]**\n"
                 f"ボタン: 「{mc['button_label']}」\n"
                 f"Modalタイトル: {mc['modal_title']}\n"
-                f"入力欄: 「{mc['title_field_label']}」「{mc['body_field_label']}」\n"
+                f"入力欄（{len(mc.get('fields', []))}/5）: {fields_text}\n"
                 f"回答送信先: <#{mc['response_channel_id']}>"
                 f"{mention_line}"
                 f"{attachment_line}"
@@ -22311,6 +22345,23 @@ class EmbedBuilderView(discord.ui.LayoutView):
             disable_modal_btn = discord.ui.Button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary)
             disable_modal_btn.callback = self._on_disable_modal
             row4.add_item(disable_modal_btn)
+
+            field_count = len(self.modal_config.get("fields", []))
+            add_field_input_btn = discord.ui.Button(
+                label=f"[Modal] 入力欄を追加 ({field_count}/5)",
+                style=discord.ButtonStyle.secondary,
+                disabled=field_count >= 5,
+            )
+            add_field_input_btn.callback = self._on_add_modal_field
+            row4.add_item(add_field_input_btn)
+
+            remove_field_input_btn = discord.ui.Button(
+                label="[Modal] 入力欄を削除",
+                style=discord.ButtonStyle.secondary,
+                disabled=field_count <= 1,
+            )
+            remove_field_input_btn.callback = self._on_remove_modal_field
+            row4.add_item(remove_field_input_btn)
             container.add_item(row4)
 
             row5 = discord.ui.ActionRow()
@@ -22375,11 +22426,32 @@ class EmbedBuilderView(discord.ui.LayoutView):
         modal = EmbedModalConfigModal(self)
         modal.button_label.default = self.modal_config.get("button_label", "回答する")
         modal.modal_title.default = self.modal_config.get("modal_title", "回答フォーム")
-        modal.title_field_label.default = self.modal_config.get("title_field_label", "タイトル")
-        modal.body_field_label.default = self.modal_config.get("body_field_label", "本文")
-        modal.allow_attachment_input.default = "yes" if self.modal_config.get("allow_attachment") else "no"
+        modal.allow_attachment_checkbox.component.default = bool(self.modal_config.get("allow_attachment"))
         self.modal_config["enabled"] = True
         await interaction.response.send_modal(modal)
+
+    async def _on_add_modal_field(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if len(self.modal_config.get("fields", [])) >= 5:
+            await interaction.response.send_message("入力欄は最大5個までです。", ephemeral=True)
+            return
+        self.modal_config["enabled"] = True
+        await interaction.response.send_modal(EmbedFieldLabelModal(self))
+
+    async def _on_remove_modal_field(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        fields = self.modal_config.setdefault("fields", [])
+        if len(fields) <= 1:
+            await interaction.response.send_message("入力欄は最低1個は必要です。", ephemeral=True)
+            return
+        removed = fields.pop()
+        self._render()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"入力欄「{removed['label']}」を削除しました。", ephemeral=True)
 
     async def _on_disable_modal(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
@@ -22409,8 +22481,7 @@ class EmbedBuilderView(discord.ui.LayoutView):
             panels[str(panel_id)] = {
                 "button_label": self.modal_config["button_label"],
                 "modal_title": self.modal_config["modal_title"],
-                "title_field_label": self.modal_config["title_field_label"],
-                "body_field_label": self.modal_config["body_field_label"],
+                "fields": self.modal_config.get("fields") or [{"label": "タイトル"}, {"label": "本文"}],
                 "response_channel_id": self.modal_config["response_channel_id"],
                 "mention_role_id": self.modal_config.get("mention_role_id"),
                 "allow_attachment": self.modal_config.get("allow_attachment", False),
@@ -22932,36 +23003,51 @@ class RoleShopBuyButton(discord.ui.Button):
         )
 
 
-class RoleShopView(discord.ui.View):
-    """ロールショップの商品一覧パネル（購入ボタン付き）。"""
-
-    def __init__(self, shop_items: list):
-        super().__init__(timeout=None)
-        # Discordの制約上、1ビューに置けるボタンは最大25個
-        for item in shop_items[:25]:
-            self.add_item(RoleShopBuyButton(item))
-
-
-def _build_role_shop_embed(guild_config: dict, guild: discord.Guild, all_data: dict = None) -> discord.Embed:
+def _build_role_shop_container(guild_config: dict, guild: discord.Guild, all_data: dict = None) -> discord.ui.Container:
     shop_items = guild_config.get("role_shop", [])
     if all_data is None:
         all_data = load_data()
     global_cfg = get_global_config(all_data)
     coin_name = global_cfg.get("global_coin_name", "Mコイン")
-    embed = discord.Embed(
-        title="[SHOP] ロールショップ",
-        description=f"ボタンを押すとロールを購入できます（支払い: {coin_name}）。" if shop_items else "現在、販売中のロールはありません。",
-        color=discord.Color.purple()
-    )
-    for item in shop_items:
-        role = guild.get_role(item["role_id"])
-        role_text = role.mention if role else "（ロール削除済み）"
-        embed.add_field(
-            name=f"{item['name']}（ID: {item['id']}）",
-            value=f"{role_text}\n価格: {item['price']:,} {coin_name}",
-            inline=True
-        )
-    return embed
+
+    container = discord.ui.Container(accent_color=discord.Color.purple())
+    header = "ボタンを押すとロールを購入できます" if shop_items else "現在、販売中のロールはありません。"
+    container.add_item(discord.ui.TextDisplay(f"## [SHOP] ロールショップ\n{header}（支払い: {coin_name}）"))
+
+    if shop_items:
+        container.add_item(discord.ui.Separator())
+        lines = []
+        for item in shop_items:
+            role = guild.get_role(item["role_id"])
+            role_text = role.mention if role else "（ロール削除済み）"
+            lines.append(f"**{item['name']}**（ID: {item['id']}）\n{role_text}\n価格: {item['price']:,} {coin_name}")
+        container.add_item(discord.ui.TextDisplay("\n\n".join(lines)))
+
+    return container
+
+
+class RoleShopView(discord.ui.LayoutView):
+    """ロールショップの商品一覧パネル（Components V2、購入ボタン付き）。
+    商品一覧の表示と購入ボタンを1つのContainerにまとめる。"""
+
+    def __init__(self, shop_items: list, guild_config: dict = None, guild: discord.Guild = None, all_data: dict = None):
+        super().__init__(timeout=None)
+        if guild_config is not None and guild is not None:
+            container = _build_role_shop_container(guild_config, guild, all_data)
+        else:
+            # 起動時の再登録などguild情報が渡せない場合の簡易フォールバック（ボタン応答のリッスン用途のみ）
+            container = discord.ui.Container(accent_color=discord.Color.purple())
+            container.add_item(discord.ui.TextDisplay("## [SHOP] ロールショップ"))
+
+        # Discordの制約上、1メッセージに置けるボタンは最大25個（ActionRow5つ×5個）
+        buttons = [RoleShopBuyButton(item) for item in shop_items[:25]]
+        for start in range(0, len(buttons), 5):
+            row = discord.ui.ActionRow()
+            for btn in buttons[start:start + 5]:
+                row.add_item(btn)
+            container.add_item(row)
+
+        self.add_item(container)
 
 
 async def _refresh_role_shop_panel(guild: discord.Guild, guild_config: dict):
@@ -22985,11 +23071,16 @@ async def _refresh_role_shop_panel(guild: discord.Guild, guild_config: dict):
         return
 
     shop_items = guild_config.get("role_shop", [])
-    new_embed = _build_role_shop_embed(guild_config, guild)
-    new_view = RoleShopView(shop_items) if shop_items else None
+    if shop_items:
+        new_view = RoleShopView(shop_items, guild_config, guild)
+    else:
+        empty_container = discord.ui.Container(accent_color=discord.Color.purple())
+        empty_container.add_item(discord.ui.TextDisplay("## [SHOP] ロールショップ\n現在、販売中のロールはありません。"))
+        new_view = discord.ui.LayoutView(timeout=None)
+        new_view.add_item(empty_container)
 
     try:
-        await message.edit(embed=new_embed, view=new_view)
+        await message.edit(view=new_view)
     except discord.HTTPException:
         pass
 
@@ -23075,19 +23166,26 @@ async def roleshop(interaction: discord.Interaction):
         if old_channel:
             try:
                 old_message = await old_channel.fetch_message(old_message_id)
-                await old_message.edit(
-                    content="[!] このロールショップパネルは新しいパネルに置き換えられたため無効です。",
-                    embed=None,
-                    view=None
-                )
+                notice_container = discord.ui.Container(accent_color=discord.Color.greyple())
+                notice_container.add_item(discord.ui.TextDisplay(
+                    "[!] このロールショップパネルは新しいパネルに置き換えられたため無効です。"
+                ))
+                notice_view = discord.ui.LayoutView(timeout=None)
+                notice_view.add_item(notice_container)
+                await old_message.edit(view=notice_view)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
     shop_items = cfg.get("role_shop", [])
-    embed = _build_role_shop_embed(cfg, interaction.guild)
-    view = RoleShopView(shop_items) if shop_items else None
+    if shop_items:
+        view = RoleShopView(shop_items, cfg, interaction.guild, all_data)
+    else:
+        empty_container = discord.ui.Container(accent_color=discord.Color.purple())
+        empty_container.add_item(discord.ui.TextDisplay("## [SHOP] ロールショップ\n現在、販売中のロールはありません。"))
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(empty_container)
 
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(view=view)
     panel_message = await interaction.original_response()
 
     cfg["role_shop_panel_channel_id"] = interaction.channel.id
@@ -23199,42 +23297,64 @@ class VendingBuyButton(discord.ui.Button):
 
         # パネルの在庫表示を更新
         try:
-            new_view = VendingMachineView(cfg.get("vending_items", []))
-            new_embed = _build_vending_embed(cfg)
-            await interaction.message.edit(embed=new_embed, view=new_view)
+            new_view = VendingMachineView(cfg.get("vending_items", []), cfg, all_data)
+            await interaction.message.edit(view=new_view)
         except Exception:
             pass
 
 
-class VendingMachineView(discord.ui.View):
-    """自販機の商品一覧パネル（購入ボタン付き）。"""
+class VendingMachineView(discord.ui.LayoutView):
+    """自販機の商品一覧パネル（Components V2、購入ボタン付き）。
+    商品一覧の表示と購入ボタンを1つのContainerにまとめる。"""
 
-    def __init__(self, items: list):
+    def __init__(self, items: list, guild_config: dict = None, all_data: dict = None):
         super().__init__(timeout=None)
-        for item in items[:25]:
-            self.add_item(VendingBuyButton(item))
+        if guild_config is not None:
+            container = _build_vending_container(guild_config, all_data)
+        else:
+            # 起動時の再登録などguild_configが渡せない場合の簡易フォールバック（ボタン応答のリッスン用途のみ）
+            container = discord.ui.Container(accent_color=discord.Color.teal())
+            container.add_item(discord.ui.TextDisplay("## [VEND] 自販機"))
+
+        # Discordの制約上、1メッセージに置けるボタンは最大25個（ActionRow5つ×5個）
+        buttons = [VendingBuyButton(item) for item in items[:25]]
+        for start in range(0, len(buttons), 5):
+            row = discord.ui.ActionRow()
+            for btn in buttons[start:start + 5]:
+                row.add_item(btn)
+            container.add_item(row)
+
+        self.add_item(container)
 
 
-def _build_vending_embed(guild_config: dict, all_data: dict = None) -> discord.Embed:
+def _build_vending_container(guild_config: dict, all_data: dict = None) -> discord.ui.Container:
     items = guild_config.get("vending_items", [])
     if all_data is None:
         all_data = load_data()
     global_cfg = get_global_config(all_data)
     coin_name = global_cfg.get("global_coin_name", "Mコイン")
-    embed = discord.Embed(
-        title="[VEND] 自販機",
-        description=f"ボタンを押すと商品を購入できます（支払い: {coin_name}）。内容（テキスト／ファイル）はDMで送付されます。" if items else "現在、販売中の商品はありません。",
-        color=discord.Color.teal()
+
+    container = discord.ui.Container(accent_color=discord.Color.teal())
+    header = (
+        f"ボタンを押すと商品を購入できます（支払い: {coin_name}）。内容（テキスト／ファイル）はDMで送付されます。"
+        if items else "現在、販売中の商品はありません。"
     )
-    for item in items:
-        stock = item.get("stock", 0)
-        type_label = "ファイル" if item.get("type") == "file" else "テキスト"
-        embed.add_field(
-            name=f"{item['name']}（ID: {item['id']}）",
-            value=f"価格: {item['price']:,} {coin_name}\n在庫: {stock if stock > 0 else '売り切れ'}\n種別: {type_label}",
-            inline=True
-        )
-    return embed
+    container.add_item(discord.ui.TextDisplay(f"## [VEND] 自販機\n{header}"))
+
+    if items:
+        container.add_item(discord.ui.Separator())
+        lines = []
+        for item in items:
+            stock = item.get("stock", 0)
+            type_label = "ファイル" if item.get("type") == "file" else "テキスト"
+            lines.append(
+                f"**{item['name']}**（ID: {item['id']}）\n"
+                f"価格: {item['price']:,} {coin_name}\u3000|\u3000"
+                f"在庫: {stock if stock > 0 else '売り切れ'}\u3000|\u3000種別: {type_label}"
+            )
+        container.add_item(discord.ui.TextDisplay("\n\n".join(lines)))
+
+    return container
 
 
 async def _refresh_vending_panel(guild: discord.Guild, guild_config: dict):
@@ -23258,11 +23378,16 @@ async def _refresh_vending_panel(guild: discord.Guild, guild_config: dict):
         return
 
     items = guild_config.get("vending_items", [])
-    new_embed = _build_vending_embed(guild_config)
-    new_view = VendingMachineView(items) if items else None
+    if items:
+        new_view = VendingMachineView(items, guild_config)
+    else:
+        empty_container = discord.ui.Container(accent_color=discord.Color.teal())
+        empty_container.add_item(discord.ui.TextDisplay("## [VEND] 自販機\n現在、販売中の商品はありません。"))
+        new_view = discord.ui.LayoutView(timeout=None)
+        new_view.add_item(empty_container)
 
     try:
-        await message.edit(embed=new_embed, view=new_view)
+        await message.edit(view=new_view)
     except discord.HTTPException:
         pass
 
@@ -23494,19 +23619,26 @@ async def vendingmachine(interaction: discord.Interaction):
         if old_channel:
             try:
                 old_message = await old_channel.fetch_message(old_message_id)
-                await old_message.edit(
-                    content="[!] この自販機パネルは新しいパネルに置き換えられたため無効です。",
-                    embed=None,
-                    view=None
-                )
+                notice_container = discord.ui.Container(accent_color=discord.Color.greyple())
+                notice_container.add_item(discord.ui.TextDisplay(
+                    "[!] この自販機パネルは新しいパネルに置き換えられたため無効です。"
+                ))
+                notice_view = discord.ui.LayoutView(timeout=None)
+                notice_view.add_item(notice_container)
+                await old_message.edit(view=notice_view)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
     items = cfg.get("vending_items", [])
-    embed = _build_vending_embed(cfg)
-    view = VendingMachineView(items) if items else None
+    if items:
+        view = VendingMachineView(items, cfg, all_data)
+    else:
+        empty_container = discord.ui.Container(accent_color=discord.Color.teal())
+        empty_container.add_item(discord.ui.TextDisplay("## [VEND] 自販機\n現在、販売中の商品はありません。"))
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(empty_container)
 
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(view=view)
     panel_message = await interaction.original_response()
 
     cfg["vending_panel_channel_id"] = interaction.channel.id
