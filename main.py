@@ -19088,7 +19088,7 @@ class VoicePlayApprovalView(discord.ui.View):
                         pass
 
         self.voice_client.play(volume_source, after=_after_play)
-        await self.interaction.followup.send(embed=control_view.build_status_embed(), view=control_view)
+        await self.interaction.followup.send(view=control_view)
 
     @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -19163,7 +19163,6 @@ class VoiceNextSelect(discord.ui.Select):
         view.audio_path = audio_path
         view.is_temp_file = False
         view.paused = False
-        view._update_pause_button_label()
 
         def _after_play(error):
             if error:
@@ -19173,18 +19172,18 @@ class VoiceNextSelect(discord.ui.Select):
 
         view.voice_client.play(volume_source, after=_after_play)
 
-        # セレクトを除いたビューに戻す（行4を削除）
-        for item in list(view.children):
-            if isinstance(item, VoiceNextSelect):
-                view.remove_item(item)
+        # セレクトを閉じた状態のViewに戻す
+        view._show_next_select = False
+        view._render()
 
-        await interaction.response.edit_message(embed=view.build_status_embed(), view=view)
+        await interaction.response.edit_message(view=view)
 
 
-class VoiceControlView(discord.ui.View):
+class VoiceControlView(discord.ui.LayoutView):
     """
-    再生中にチャンネルへ表示するコントロールパネルです。
+    再生中にチャンネルへ表示するコントロールパネルです（Components V2）。
     一時停止/再開・音量調整・ループ・曲切り替え・停止（切断）に対応します。
+    ボタン・セレクトメニューはすべてContainer内に配置されます。
     """
     def __init__(
         self,
@@ -19204,32 +19203,84 @@ class VoiceControlView(discord.ui.View):
         self.is_temp_file = is_temp_file
         self.paused = False
         self.loop = False
-        self._update_pause_button_label()
-        self._update_loop_button_label()
+        self._show_next_select = False
+        self._stopped = False
+        self._stopped_notice: Optional[str] = None
+        self._render()
 
-    def _update_pause_button_label(self):
-        self.pause_button.label = "再開" if self.paused else "一時停止"
-        self.pause_button.style = discord.ButtonStyle.success if self.paused else discord.ButtonStyle.secondary
-
-    def _update_loop_button_label(self):
-        self.loop_button.label = "ループ: ON" if self.loop else "ループ: OFF"
-        self.loop_button.style = discord.ButtonStyle.success if self.loop else discord.ButtonStyle.secondary
-
-    def build_status_embed(self) -> discord.Embed:
+    def _render(self):
+        self.clear_items()
         vol_percent = int(self.source.volume * 100)
         status_label = "一時停止中" if self.paused else "再生中"
         loop_label = "ON" if self.loop else "OFF"
-        embed = discord.Embed(
-            title="ボイス再生コントロール",
-            description=f"再生ファイル: `{self.source_label}`",
-            color=discord.Color.green() if not self.paused else discord.Color.greyple()
-        )
-        embed.add_field(name="状態", value=status_label, inline=True)
-        embed.add_field(name="音量", value=f"{vol_percent}%", inline=True)
-        embed.add_field(name="ループ", value=loop_label, inline=True)
-        embed.add_field(name="再生先チャンネル", value=self.voice_client.channel.mention, inline=False)
-        embed.set_footer(text=f"リクエスト: {self.requester}")
-        return embed
+        accent = discord.Color.green() if not self.paused else discord.Color.greyple()
+        title = "ボイス再生コントロール"
+
+        if self._stopped:
+            accent = discord.Color.greyple()
+            title = "ボイス再生を停止しました"
+
+        container = discord.ui.Container(accent_color=accent)
+        container.add_item(discord.ui.TextDisplay(f"## {title}"))
+        container.add_item(discord.ui.TextDisplay(f"再生ファイル: `{self.source_label}`"))
+        container.add_item(discord.ui.Separator())
+        # 従来のembed.add_field（3つのinline field）に相当する1行表示
+        container.add_item(discord.ui.TextDisplay(
+            f"**状態**：{status_label}\u3000|\u3000**音量**：{vol_percent}%\u3000|\u3000**ループ**：{loop_label}"
+        ))
+        container.add_item(discord.ui.TextDisplay(
+            f"**再生先チャンネル**\n{self.voice_client.channel.mention}"
+        ))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay(f"-# リクエスト: {self.requester}"))
+        if self._stopped_notice:
+            container.add_item(discord.ui.TextDisplay(f"-# {self._stopped_notice}"))
+
+        if not self._stopped:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+            row0 = discord.ui.ActionRow()
+            pause_btn = discord.ui.Button(
+                label="再開" if self.paused else "一時停止",
+                style=discord.ButtonStyle.success if self.paused else discord.ButtonStyle.secondary,
+            )
+            pause_btn.callback = self._on_pause
+            row0.add_item(pause_btn)
+
+            vol_down_btn = discord.ui.Button(label="音量 -10%", style=discord.ButtonStyle.primary)
+            vol_down_btn.callback = self._on_volume_down
+            row0.add_item(vol_down_btn)
+
+            vol_up_btn = discord.ui.Button(label="音量 +10%", style=discord.ButtonStyle.primary)
+            vol_up_btn.callback = self._on_volume_up
+            row0.add_item(vol_up_btn)
+            container.add_item(row0)
+
+            row1 = discord.ui.ActionRow()
+            loop_btn = discord.ui.Button(
+                label="ループ: ON" if self.loop else "ループ: OFF",
+                style=discord.ButtonStyle.success if self.loop else discord.ButtonStyle.secondary,
+            )
+            loop_btn.callback = self._on_loop
+            row1.add_item(loop_btn)
+
+            next_btn = discord.ui.Button(label="曲を切り替え", style=discord.ButtonStyle.primary)
+            next_btn.callback = self._on_next
+            row1.add_item(next_btn)
+            container.add_item(row1)
+
+            row2 = discord.ui.ActionRow()
+            stop_btn = discord.ui.Button(label="停止して切断", style=discord.ButtonStyle.danger)
+            stop_btn.callback = self._on_stop
+            row2.add_item(stop_btn)
+            container.add_item(row2)
+
+            if self._show_next_select:
+                select_row = discord.ui.ActionRow()
+                select_row.add_item(VoiceNextSelect(self.voice_client.guild, self))
+                container.add_item(select_row)
+
+        self.add_item(container)
 
     async def _replay(self):
         """ループ再生時に同じファイルを再再生します。"""
@@ -19256,18 +19307,14 @@ class VoiceControlView(discord.ui.View):
 
     async def _check_still_connected(self, interaction: discord.Interaction) -> bool:
         if not self.voice_client.is_connected():
-            for item in self.children:
-                item.disabled = True
-            await interaction.response.edit_message(
-                content="Botはすでにボイスチャンネルから切断されています。",
-                embed=None,
-                view=self
-            )
+            self._stopped = True
+            self._stopped_notice = "Botはすでにボイスチャンネルから切断されています。"
+            self._render()
+            await interaction.response.edit_message(view=self)
             return False
         return True
 
-    @discord.ui.button(label="一時停止", style=discord.ButtonStyle.secondary, row=0)
-    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_pause(self, interaction: discord.Interaction):
         if not await self._check_still_connected(interaction):
             return
         if self.paused:
@@ -19278,59 +19325,49 @@ class VoiceControlView(discord.ui.View):
             if self.voice_client.is_playing():
                 self.voice_client.pause()
             self.paused = True
-        self._update_pause_button_label()
-        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="音量 -10%", style=discord.ButtonStyle.primary, row=0)
-    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_volume_down(self, interaction: discord.Interaction):
         if not await self._check_still_connected(interaction):
             return
         self.source.volume = max(0.0, round(self.source.volume - 0.1, 2))
-        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="音量 +10%", style=discord.ButtonStyle.primary, row=0)
-    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_volume_up(self, interaction: discord.Interaction):
         if not await self._check_still_connected(interaction):
             return
         self.source.volume = min(VOICE_VOLUME_MAX, round(self.source.volume + 0.1, 2))
-        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="ループ: OFF", style=discord.ButtonStyle.secondary, row=1)
-    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_loop(self, interaction: discord.Interaction):
         if not await self._check_still_connected(interaction):
             return
         self.loop = not self.loop
-        self._update_loop_button_label()
-        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="曲を切り替え", style=discord.ButtonStyle.primary, row=1)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_next(self, interaction: discord.Interaction):
         if not await self._check_still_connected(interaction):
             return
         if not interaction.guild:
             return
-        # 既にセレクトが表示されている場合は削除
-        for item in list(self.children):
-            if isinstance(item, VoiceNextSelect):
-                self.remove_item(item)
-        # 登録済み音源セレクトを row=3 に追加
-        select = VoiceNextSelect(interaction.guild, self)
-        select.row = 3
-        self.add_item(select)
-        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+        # セレクトメニューをContainer内に表示（トグル）
+        self._show_next_select = True
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="停止して切断", style=discord.ButtonStyle.danger, row=2)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_stop(self, interaction: discord.Interaction):
         self.loop = False
         if self.voice_client.is_connected():
             self.voice_client.stop()
             await self.voice_client.disconnect()
-        for item in self.children:
-            item.disabled = True
-        embed = self.build_status_embed()
-        embed.title = "ボイス再生を停止しました"
-        embed.color = discord.Color.greyple()
-        await interaction.response.edit_message(embed=embed, view=self)
+        self._stopped = True
+        self._stopped_notice = None
+        self._render()
+        await interaction.response.edit_message(view=self)
 
 
 async def _ensure_voice_connected(interaction: discord.Interaction) -> discord.VoiceClient | None:
@@ -21719,7 +21756,8 @@ class EmbedBuilderModal(discord.ui.Modal, title="Embed内容を入力"):
         pv.embed_data["footer"]        = self.embed_footer.value or None
         pv.embed_data["image_url"]     = self.embed_image_url.value or None
         pv.embed_data["thumbnail_url"] = self.embed_thumbnail_url.value or None
-        await interaction.response.edit_message(embed=pv.build_preview(), view=pv)
+        pv._render()
+        await interaction.response.edit_message(view=pv)
 
 
 EMBED_COLOR_OPTIONS = {
@@ -21740,11 +21778,57 @@ class EmbedColorSelect(discord.ui.Select):
     def __init__(self, parent_view: "EmbedBuilderView"):
         self.parent_view = parent_view
         options = [discord.SelectOption(label=name, value=name) for name in EMBED_COLOR_OPTIONS]
-        super().__init__(placeholder="枠線の色を選択...", options=options, row=1)
+        super().__init__(placeholder="枠線の色を選択...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.embed_data["color"] = self.values[0]
-        await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
+        self.parent_view._render()
+        await interaction.response.edit_message(view=self.parent_view)
+
+
+class EmbedResponseChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        self.parent_view = parent_view
+        super().__init__(
+            placeholder="回答送信先チャンネル（Modalを付ける場合に選択）",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if self.values:
+            self.parent_view.modal_config["response_channel_id"] = self.values[0].id
+            self.parent_view.modal_config["enabled"] = True
+        else:
+            self.parent_view.modal_config["response_channel_id"] = None
+            self.parent_view.modal_config["enabled"] = False
+        self.parent_view._render()
+        await interaction.response.edit_message(view=self.parent_view)
+
+
+class EmbedMentionRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        self.parent_view = parent_view
+        super().__init__(
+            placeholder="メンションするロール（Modal送信時に通知する場合に選択）",
+            min_values=0,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if self.values:
+            self.parent_view.modal_config["mention_role_id"] = self.values[0].id
+        else:
+            self.parent_view.modal_config["mention_role_id"] = None
+        self.parent_view._render()
+        await interaction.response.edit_message(view=self.parent_view)
 
 
 class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal）の設定"):
@@ -21796,7 +21880,8 @@ class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal�
         pv.modal_config["title_field_label"] = self.title_field_label.value or "タイトル"
         pv.modal_config["body_field_label"] = self.body_field_label.value or "本文"
         pv.modal_config["allow_attachment"] = self.allow_attachment_input.value.strip().lower() in ("yes", "y", "true", "1")
-        await interaction.response.edit_message(embed=pv.build_preview(), view=pv)
+        pv._render()
+        await interaction.response.edit_message(view=pv)
 
 
 class EmbedResponseSubmitModal(discord.ui.Modal):
@@ -21955,31 +22040,41 @@ async def _handle_embed_response_submit(
         await _reply("回答送信先チャンネルが見つかりませんでした。管理者にお問い合わせください。")
         return
 
-    result_embed = discord.Embed(
-        title=title_value[:256],
-        description=body_value[:4000],
-        color=discord.Color.blurple(),
-        timestamp=discord.utils.utcnow()
-    )
-    result_embed.set_footer(text=f"回答者: {interaction.user}（ID: {interaction.user.id}）")
-
+    container = discord.ui.Container(accent_color=discord.Color.blurple())
     mention_role_id = panel.get("mention_role_id")
-    mention_content = f"<@&{mention_role_id}>" if mention_role_id else None
-    allowed_mentions = discord.AllowedMentions(roles=True) if mention_role_id else discord.AllowedMentions.none()
+    if mention_role_id:
+        container.add_item(discord.ui.TextDisplay(f"<@&{mention_role_id}>"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(f"## {title_value[:256]}\n{body_value[:4000]}"))
 
     # 添付ファイルは呼び出し側で（元メッセージ削除前に）ダウンロード済みのものを受け取る。
-    # 画像であればEmbedにも表示する。
+    # 画像であればMediaGalleryにも表示する。
     if file_to_send is not None and is_image:
-        result_embed.set_image(url=f"attachment://{file_to_send.filename}")
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        gallery = discord.ui.MediaGallery(
+            discord.MediaGalleryItem(media=f"attachment://{file_to_send.filename}")
+        )
+        container.add_item(gallery)
+
+    container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+    container.add_item(discord.ui.TextDisplay(
+        f"-# 回答者: {interaction.user}（ID: {interaction.user.id}） | "
+        f"{discord.utils.format_dt(discord.utils.utcnow(), style='f')}"
+    ))
+
+    result_view = discord.ui.LayoutView(timeout=None)
+    result_view.add_item(container)
+
+    allowed_mentions = discord.AllowedMentions(roles=True) if mention_role_id else discord.AllowedMentions.none()
 
     try:
         if file_to_send is not None:
             await response_channel.send(
-                content=mention_content, embed=result_embed, file=file_to_send,
+                view=result_view, file=file_to_send,
                 allowed_mentions=allowed_mentions
             )
         else:
-            await response_channel.send(content=mention_content, embed=result_embed, allowed_mentions=allowed_mentions)
+            await response_channel.send(view=result_view, allowed_mentions=allowed_mentions)
     except discord.Forbidden:
         await _reply("回答送信先チャンネルへの送信権限がBotにありません。管理者にお問い合わせください。")
         return
@@ -21990,8 +22085,10 @@ async def _handle_embed_response_submit(
     await _reply("[OK] 回答を送信しました。ご協力ありがとうございました。")
 
 
-class EmbedBuilderView(discord.ui.View):
-    """Embed作成GUIビュー。"""
+class EmbedBuilderView(discord.ui.LayoutView):
+    """Embed作成GUIビュー（Components V2）。
+    編集画面・最終的にチャンネルへ送信される成果物、いずれもEmbedを使わずContainerで組み立てる。
+    ボタン・セレクトメニューはすべてContainer内に配置される。"""
 
     def __init__(self, author: discord.abc.User, target_channel: discord.TextChannel):
         super().__init__(timeout=600)
@@ -22017,55 +22114,148 @@ class EmbedBuilderView(discord.ui.View):
             "mention_role_id": None,  # Modal送信時にメンションするロール（1つのみ、任意）
             "allow_attachment": False,  # Modal送信後にファイル添付を受け付けるかどうか
         }
-        self.add_item(EmbedColorSelect(self))
+        self._sent = False
+        self._sent_notice: Optional[str] = None
+        self._render()
 
-    def _build_base_embed(self) -> discord.Embed:
-        """Embedの本体（タイトル・本文・フィールド・色など）だけを組み立てる共通処理。"""
+    def _build_base_container(self, *, for_preview: bool) -> discord.ui.Container:
+        """Containerの本体（タイトル・本文・フィールド・色など）だけを組み立てる共通処理。
+        for_preview=True の場合のみ、Modal設定情報の管理者向け表示・操作説明を追加で含める。"""
         color = EMBED_COLOR_OPTIONS.get(self.embed_data.get("color", "ブルー"), discord.Color.blue())
-        embed = discord.Embed(
-            title=self.embed_data.get("title") or "（タイトル未入力）",
-            description=self.embed_data.get("description") or "（本文未入力）",
-            color=color
-        )
-        for f in self.embed_data.get("fields", []):
-            embed.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
-        if self.embed_data.get("footer"):
-            embed.set_footer(text=self.embed_data["footer"])
-        if self.embed_data.get("image_url"):
-            embed.set_image(url=self.embed_data["image_url"])
-        if self.embed_data.get("thumbnail_url"):
-            embed.set_thumbnail(url=self.embed_data["thumbnail_url"])
-        embed.timestamp = discord.utils.utcnow()
-        return embed
+        container = discord.ui.Container(accent_color=color)
 
-    def build_preview(self) -> discord.Embed:
-        """管理者用の編集画面（ephemeral）に表示するプレビュー。Modal設定情報もここでは表示する。"""
-        embed = self._build_base_embed()
-        if self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
+        if for_preview and not self._sent:
+            container.add_item(discord.ui.TextDisplay(
+                f"### Embedビルダー（送信先: {self.target_channel.mention}）\n"
+                "-# 「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。"
+                "回答フォーム（Modal）を付ける場合は、下のチャンネル選択で回答送信先を選び、"
+                "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。"
+            ))
+            container.add_item(discord.ui.Separator())
+
+        title = self.embed_data.get("title") or "（タイトル未入力）"
+        description = self.embed_data.get("description") or "（本文未入力）"
+        header_text = discord.ui.TextDisplay(f"## {title}\n{description}")
+
+        thumb_url = self.embed_data.get("thumbnail_url")
+        if thumb_url:
+            container.add_item(discord.ui.Section(header_text, accessory=discord.ui.Thumbnail(thumb_url)))
+        else:
+            container.add_item(header_text)
+
+        fields = self.embed_data.get("fields", [])
+        if fields:
+            container.add_item(discord.ui.Separator())
+            # 従来のembed.add_fieldに相当。inline指定は1行にまとめて表現する。
+            field_lines = []
+            i = 0
+            while i < len(fields):
+                f = fields[i]
+                if f.get("inline") and i + 1 < len(fields) and fields[i + 1].get("inline"):
+                    f2 = fields[i + 1]
+                    field_lines.append(f"**{f['name']}**：{f['value']}\u3000|\u3000**{f2['name']}**：{f2['value']}")
+                    i += 2
+                else:
+                    field_lines.append(f"**{f['name']}**\n{f['value']}")
+                    i += 1
+            container.add_item(discord.ui.TextDisplay("\n\n".join(field_lines)))
+
+        image_url = self.embed_data.get("image_url")
+        if image_url:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            gallery = discord.ui.MediaGallery(discord.MediaGalleryItem(media=image_url))
+            container.add_item(gallery)
+
+        if self.embed_data.get("footer"):
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            container.add_item(discord.ui.TextDisplay(f"-# {self.embed_data['footer']}"))
+
+        if for_preview and self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
             mc = self.modal_config
             mention_role_id = mc.get("mention_role_id")
             mention_line = f"\nメンションロール: <@&{mention_role_id}>" if mention_role_id else ""
             attachment_line = "\nファイル添付: 許可（送信後にファイルを送ってもらう案内を表示）" if mc.get("allow_attachment") else ""
-            embed.add_field(
-                name="[Modal設定：この項目は実際の送信時には含まれません]",
-                value=(
-                    f"ボタン: 「{mc['button_label']}」\n"
-                    f"Modalタイトル: {mc['modal_title']}\n"
-                    f"入力欄: 「{mc['title_field_label']}」「{mc['body_field_label']}」\n"
-                    f"回答送信先: <#{mc['response_channel_id']}>"
-                    f"{mention_line}"
-                    f"{attachment_line}"
-                ),
-                inline=False
-            )
-        return embed
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(
+                "**[Modal設定：この項目は実際の送信時には含まれません]**\n"
+                f"ボタン: 「{mc['button_label']}」\n"
+                f"Modalタイトル: {mc['modal_title']}\n"
+                f"入力欄: 「{mc['title_field_label']}」「{mc['body_field_label']}」\n"
+                f"回答送信先: <#{mc['response_channel_id']}>"
+                f"{mention_line}"
+                f"{attachment_line}"
+            ))
 
-    def build_final_embed(self) -> discord.Embed:
-        """実際にチャンネルへ送信するEmbed。Modal設定情報などの管理者向け情報は含めない。"""
-        return self._build_base_embed()
+        return container
 
-    @discord.ui.button(label="[NOTE] 内容を編集", style=discord.ButtonStyle.primary, row=0)
-    async def edit_content(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def build_preview_container(self) -> discord.ui.Container:
+        """管理者用の編集画面（ephemeral）に表示するプレビュー。Modal設定情報もここでは表示する。"""
+        container = self._build_base_container(for_preview=True)
+        return container
+
+    def build_final_container(self) -> discord.ui.Container:
+        """実際にチャンネルへ送信するContainer。Modal設定情報などの管理者向け情報は含めない。"""
+        return self._build_base_container(for_preview=False)
+
+    def _render(self):
+        self.clear_items()
+        container = self.build_preview_container()
+
+        if not self._sent:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+            row0 = discord.ui.ActionRow()
+            edit_btn = discord.ui.Button(label="[NOTE] 内容を編集", style=discord.ButtonStyle.primary)
+            edit_btn.callback = self._on_edit_content
+            row0.add_item(edit_btn)
+
+            add_field_btn = discord.ui.Button(label=" フィールド追加", style=discord.ButtonStyle.secondary)
+            add_field_btn.callback = self._on_add_field
+            row0.add_item(add_field_btn)
+
+            remove_field_btn = discord.ui.Button(label="[DEL] フィールド削除", style=discord.ButtonStyle.secondary)
+            remove_field_btn.callback = self._on_remove_field
+            row0.add_item(remove_field_btn)
+            container.add_item(row0)
+
+            color_row = discord.ui.ActionRow()
+            color_row.add_item(EmbedColorSelect(self))
+            container.add_item(color_row)
+
+            channel_row = discord.ui.ActionRow()
+            channel_row.add_item(EmbedResponseChannelSelect(self))
+            container.add_item(channel_row)
+
+            role_row = discord.ui.ActionRow()
+            role_row.add_item(EmbedMentionRoleSelect(self))
+            container.add_item(role_row)
+
+            row4 = discord.ui.ActionRow()
+            modal_btn = discord.ui.Button(label="[Modal] 回答フォームを設定", style=discord.ButtonStyle.secondary)
+            modal_btn.callback = self._on_configure_modal
+            row4.add_item(modal_btn)
+
+            disable_modal_btn = discord.ui.Button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary)
+            disable_modal_btn.callback = self._on_disable_modal
+            row4.add_item(disable_modal_btn)
+            container.add_item(row4)
+
+            row5 = discord.ui.ActionRow()
+            send_btn = discord.ui.Button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success)
+            send_btn.callback = self._on_send_embed
+            row5.add_item(send_btn)
+
+            cancel_btn = discord.ui.Button(label="[NG] キャンセル", style=discord.ButtonStyle.danger)
+            cancel_btn.callback = self._on_cancel
+            row5.add_item(cancel_btn)
+            container.add_item(row5)
+        else:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            container.add_item(discord.ui.TextDisplay(f"-# {self._sent_notice}"))
+
+        self.add_item(container)
+
+    async def _on_edit_content(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22083,8 +22273,7 @@ class EmbedBuilderView(discord.ui.View):
             modal.embed_thumbnail_url.default = self.embed_data["thumbnail_url"]
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label=" フィールド追加", style=discord.ButtonStyle.secondary, row=0)
-    async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_add_field(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22093,8 +22282,7 @@ class EmbedBuilderView(discord.ui.View):
             return
         await interaction.response.send_modal(EmbedFieldModal(self))
 
-    @discord.ui.button(label="[DEL] フィールド削除", style=discord.ButtonStyle.secondary, row=0)
-    async def remove_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_remove_field(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22103,11 +22291,11 @@ class EmbedBuilderView(discord.ui.View):
             return
         # 末尾のフィールドを削除
         removed = self.embed_data["fields"].pop()
-        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
         await interaction.followup.send(f"フィールド「{removed['name']}」を削除しました。", ephemeral=True)
 
-    @discord.ui.button(label="[Modal] 回答フォームを設定", style=discord.ButtonStyle.secondary, row=4)
-    async def configure_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_configure_modal(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22120,45 +22308,7 @@ class EmbedBuilderView(discord.ui.View):
         self.modal_config["enabled"] = True
         await interaction.response.send_modal(modal)
 
-    @discord.ui.select(
-        placeholder="回答送信先チャンネル（Modalを付ける場合に選択）",
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        row=2,
-        min_values=0,
-        max_values=1
-    )
-    async def select_response_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
-            return
-        if select.values:
-            self.modal_config["response_channel_id"] = select.values[0].id
-            self.modal_config["enabled"] = True
-        else:
-            self.modal_config["response_channel_id"] = None
-            self.modal_config["enabled"] = False
-        await interaction.response.edit_message(embed=self.build_preview(), view=self)
-
-    @discord.ui.select(
-        placeholder="メンションするロール（Modal送信時に通知する場合に選択）",
-        cls=discord.ui.RoleSelect,
-        row=3,
-        min_values=0,
-        max_values=1
-    )
-    async def select_mention_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
-            return
-        if select.values:
-            self.modal_config["mention_role_id"] = select.values[0].id
-        else:
-            self.modal_config["mention_role_id"] = None
-        await interaction.response.edit_message(embed=self.build_preview(), view=self)
-
-    @discord.ui.button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary, row=4)
-    async def disable_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_disable_modal(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22166,10 +22316,10 @@ class EmbedBuilderView(discord.ui.View):
         self.modal_config["response_channel_id"] = None
         self.modal_config["mention_role_id"] = None
         self.modal_config["allow_attachment"] = False
-        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+        self._render()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success, row=4)
-    async def send_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_send_embed(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
@@ -22177,7 +22327,6 @@ class EmbedBuilderView(discord.ui.View):
         modal_enabled = self.modal_config.get("enabled") and self.modal_config.get("response_channel_id")
 
         panel_id = None
-        response_view = None
         if modal_enabled:
             all_data = load_data()
             cfg = get_guild_config(all_data, str(interaction.guild.id))
@@ -22194,14 +22343,19 @@ class EmbedBuilderView(discord.ui.View):
                 "allow_attachment": self.modal_config.get("allow_attachment", False),
             }
             save_data(all_data)
-            response_view = EmbedResponsePanelView(interaction.guild.id, panel_id, self.modal_config["button_label"])
 
-        embed = self.build_final_embed()
+        final_container = self.build_final_container()
+        if modal_enabled:
+            # 送信用Containerに回答ボタンをそのまま追加して1つのLayoutViewとして送信する
+            final_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            answer_row = discord.ui.ActionRow()
+            answer_row.add_item(EmbedResponseButton(interaction.guild.id, panel_id, self.modal_config["button_label"]))
+            final_container.add_item(answer_row)
+        send_view = discord.ui.LayoutView(timeout=None)
+        send_view.add_item(final_container)
+
         try:
-            if response_view is not None:
-                await self.target_channel.send(embed=embed, view=response_view)
-            else:
-                await self.target_channel.send(embed=embed)
+            await self.target_channel.send(view=send_view)
         except discord.Forbidden:
             await interaction.response.send_message(
                 f"[NG] {self.target_channel.mention} への送信権限がBotにありません。\n\n"
@@ -22216,22 +22370,20 @@ class EmbedBuilderView(discord.ui.View):
         except Exception as e:
             await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
             return
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content=f"[OK] {self.target_channel.mention} にEmbedを送信しました。",
-            embed=None,
-            view=self
-        )
 
-    @discord.ui.button(label="[NG] キャンセル", style=discord.ButtonStyle.danger, row=4)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._sent = True
+        self._sent_notice = f"[OK] {self.target_channel.mention} にEmbedを送信しました。"
+        self._render()
+        await interaction.response.edit_message(view=self)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="Embed作成をキャンセルしました。", embed=None, view=self)
+        self._sent = True
+        self._sent_notice = "Embed作成をキャンセルしました。"
+        self._render()
+        await interaction.response.edit_message(view=self)
 
 
 class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
@@ -22267,7 +22419,8 @@ class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
             "value": self.field_value.value,
             "inline": inline,
         })
-        await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
+        self.parent_view._render()
+        await interaction.response.edit_message(view=self.parent_view)
 
 
 @embed_group.command(name="builder", description="【管理者専用】画面上でEmbedメッセージを組み立てて、チャンネルに送信できます")
@@ -22282,15 +22435,7 @@ async def embed_builder(
 
     target_ch = 送信先チャンネル or interaction.channel
     view = EmbedBuilderView(author=interaction.user, target_channel=target_ch)
-    await interaction.response.send_message(
-        f"Embedビルダーを起動しました。送信先: {target_ch.mention}\n"
-        "「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。\n"
-        "回答フォーム（Modal）を付ける場合は、下のチャンネル選択で回答送信先を選び、"
-        "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。",
-        embed=view.build_preview(),
-        view=view,
-        ephemeral=True
-    )
+    await interaction.response.send_message(view=view, ephemeral=True)
 
 
 
