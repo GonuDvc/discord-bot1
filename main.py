@@ -2106,11 +2106,25 @@ class DynamicRoleSelect(discord.ui.Select):
         await interaction.response.send_message(message, ephemeral=True)
 
 
-class DynamicRoleView(discord.ui.View):
-    """ロール自動付与用のセレクトメニューを表示する動的パネルビューです。"""
-    def __init__(self, roles):
+class DynamicRoleView(discord.ui.LayoutView):
+    """ロール自動付与用のセレクトメニューを表示する動的パネルビューです（Components V2）。
+    タイトル・説明文・対象ロール一覧・セレクトメニューを1つのContainerにまとめる。
+    custom_idが固定（dynamic_role_select）なのでBot起動時に1回登録すれば全パネルで動作する。"""
+
+    def __init__(self, roles, title: str = "ロールパネル", description: str = "受け取りたいロールを選択してください。"):
         super().__init__(timeout=None)
-        self.add_item(DynamicRoleSelect(roles))
+        container = discord.ui.Container(accent_color=discord.Color.blue())
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n{description}"))
+        if roles:
+            container.add_item(discord.ui.Separator())
+            role_mentions = "\n".join(f"{r.mention}" for r in roles)
+            container.add_item(discord.ui.TextDisplay(f"**対象ロール一覧（{len(roles)}個）**\n{role_mentions}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay("-# 下のメニューから受け取りたいロールを選択してください（複数選択可）"))
+        row = discord.ui.ActionRow()
+        row.add_item(DynamicRoleSelect(roles))
+        container.add_item(row)
+        self.add_item(container)
 
 
 class VerifyButtonView(discord.ui.LayoutView):
@@ -4519,7 +4533,9 @@ async def on_ready():
         if panel_roles and guild:
             roles = [guild.get_role(rid) for rid in panel_roles if guild.get_role(rid)]
             if roles:
-                bot.add_view(DynamicRoleView(roles))
+                panel_title = config.get("panel_roles_title", "ロールパネル")
+                panel_description = config.get("panel_roles_description", "受け取りたいロールを選択してください。")
+                bot.add_view(DynamicRoleView(roles, panel_title, panel_description))
                 print(f"  > ロールパネル: {len(roles)}個のロールを含むセレクトメニューを再活性化しました")
 
         # 統計チャンネルの自動更新ループを再起動
@@ -16505,13 +16521,13 @@ async def server_role_panel(
     ]
     roles = [r for r in raw_roles if r is not None]
     all_data = load_data()
-    get_guild_config(all_data, str(g.id))["panel_roles"] = [r.id for r in roles]
+    cfg = get_guild_config(all_data, str(g.id))
+    cfg["panel_roles"] = [r.id for r in roles]
+    cfg["panel_roles_title"] = title
+    cfg["panel_roles_description"] = description
     save_data(all_data)
-    embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
-    role_mentions = [f"{r.mention}" for r in roles]
-    embed.add_field(name=f"対象ロール一覧（{len(roles)}個）", value="\n".join(role_mentions), inline=False)
-    embed.set_footer(text="下のメニューから受け取りたいロールを選択してください（複数選択可）")
-    await ch.send(embed=embed, view=DynamicRoleView(roles))
+    view = DynamicRoleView(roles, title, description)
+    await ch.send(view=view)
     await interaction.followup.send(f"ロールパネルを設置しました（{len(roles)}個のロール）。", ephemeral=True)
 
 
