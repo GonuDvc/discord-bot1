@@ -1531,7 +1531,6 @@ async def _uptime_periodic_save_loop():
     Botが不意に落ちた場合でも、直近の保存間隔（最大5分）以内の誤差に抑えられます。
     プロセス終了時（Ctrl+C等の正常終了）にも最後の一回を保存します。
     """
-    global _bot_start_time, _bot_prior_uptime_seconds
     await bot.wait_until_ready()
     try:
         while True:
@@ -7509,7 +7508,6 @@ def _collect_leaked_tool_json_prefix(raw_content: str):
     if brace_pos > _LEAKED_JSON_PREFIX_TEXT_MAX_LEN:
         return [], raw_content  # 前置きが長すぎる = 通常の回答文の可能性が高いため対象外
 
-    prefix_text = raw_content[:brace_pos]
     i = brace_pos
     n = len(raw_content)
     collected_blobs = []
@@ -11697,7 +11695,7 @@ async def profile_badge_list(interaction: discord.Interaction):
 
     lines = []
     for b in badge_defs.values():
-        r, g, b_, bl = b.get("color", [200, 170, 60])[0], b.get("color", [200, 170, 60])[1], b.get("color", [200, 170, 60])[2], b
+        r, g, b_ = b.get("color", [200, 170, 60])[0], b.get("color", [200, 170, 60])[1], b.get("color", [200, 170, 60])[2]
         symbol = b.get("symbol") or "(頭文字を使用)"
         lines.append(f"**{b.get('name', '不明')}** — シンボル: {symbol} / カラー: `#{r:02X}{g:02X}{b_:02X}`")
 
@@ -22240,7 +22238,6 @@ async def _handle_embed_response_submit(
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
     # 1つ目の入力欄を見出し、残りを本文相当として表示する
-    first_label = fields_meta[0].get("label", "タイトル") if fields_meta else "タイトル"
     first_value = values[0][:256] if values else ""
     body_lines = []
     for meta, val in zip(fields_meta[1:], values[1:]):
