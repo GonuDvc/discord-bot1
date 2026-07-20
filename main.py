@@ -2113,13 +2113,30 @@ class DynamicRoleView(discord.ui.View):
         self.add_item(DynamicRoleSelect(roles))
 
 
-class VerifyButtonView(discord.ui.View):
-    """サーバー参加時のメンバー認証ボタン用ビューです。"""
-    def __init__(self):
-        super().__init__(timeout=None)
+class VerifyButtonView(discord.ui.LayoutView):
+    """サーバー参加時のメンバー認証ボタン用ビューです（Components V2）。
+    タイトル・説明文・画像・認証ボタンを1つのContainerにまとめる。
+    custom_idが固定（persistent_verify_button）なのでBot起動時に1回登録すれば全パネルで動作する。"""
 
-    @discord.ui.button(label="認証する", style=discord.ButtonStyle.primary, custom_id="persistent_verify_button")
-    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def __init__(self, title: str = "サーバー認証", description: str = "ボタンを押すと認証が完了します。", image_filename: str = None):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_color=discord.Color.green())
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n{description}"))
+        if image_filename:
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            gallery = discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{image_filename}"))
+            container.add_item(gallery)
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        verify_btn = discord.ui.Button(
+            label="認証する", style=discord.ButtonStyle.primary, custom_id="persistent_verify_button"
+        )
+        verify_btn.callback = self._on_verify
+        row.add_item(verify_btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def _on_verify(self, interaction: discord.Interaction):
         if not interaction.guild: return
         guild_id_str = str(interaction.guild.id)
         all_data = load_data()
@@ -2482,15 +2499,29 @@ def _build_guild_dashboard_url(guild_id: int, user_id: int) -> str:
 
 
 
-class VerifyBlacklistButtonView(discord.ui.View):
-    """サーバーブラックリスト認証パネル用のボタンビューです。"""
-    def __init__(self):
-        super().__init__(timeout=None)
+class VerifyBlacklistButtonView(discord.ui.LayoutView):
+    """サーバーブラックリスト認証パネル用のビューです（Components V2）。
+    タイトル・説明文・認証ボタンを1つのContainerにまとめる。
+    custom_idが固定（persistent_verify_blacklist_button）なのでBot起動時に1回登録すれば全パネルで動作する。"""
 
-    @discord.ui.button(label="連携認証を開始する", style=discord.ButtonStyle.success, custom_id="persistent_verify_blacklist_button")
-    async def verify_blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def __init__(self, title: str = "サーバー認証", description: str = "ボタンを押すと連携認証を開始できます。"):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_color=discord.Color.blue())
+        container.add_item(discord.ui.TextDisplay(f"## {title}\n{description}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        row = discord.ui.ActionRow()
+        verify_btn = discord.ui.Button(
+            label="連携認証を開始する", style=discord.ButtonStyle.success,
+            custom_id="persistent_verify_blacklist_button"
+        )
+        verify_btn.callback = self._on_verify_blacklist
+        row.add_item(verify_btn)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def _on_verify_blacklist(self, interaction: discord.Interaction):
         if not interaction.guild: return
-        
+
         # OAuth2設定が不完全な場合はエラー
         if not OAUTH_REDIRECT_URI or not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
             await interaction.response.send_message(
@@ -2505,18 +2536,21 @@ class VerifyBlacklistButtonView(discord.ui.View):
         # まず利用規約確認ページへ誘導する（同意後にDiscordのOAuth2認証へ進む）
         terms_url = _build_terms_url(state)
 
-        embed = discord.Embed(
-            title="外部連携認証",
-            description=(
-                "以下のリンクから利用規約をご確認のうえ、Discordアカウントの連携認証を行ってください。\n"
-                "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
-                "**注意:** このリンクはあなた専用です。他の人に共有しないでください。"
-            ),
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="認証リンク（利用規約の確認 → 認証）", value=f"[ここをクリックして開始する]({terms_url})", inline=False)
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        result_container = discord.ui.Container(accent_color=discord.Color.blue())
+        result_container.add_item(discord.ui.TextDisplay(
+            "## 外部連携認証\n"
+            "以下のリンクから利用規約をご確認のうえ、Discordアカウントの連携認証を行ってください。\n"
+            "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
+            "**注意:** このリンクはあなた専用です。他の人に共有しないでください。"
+        ))
+        result_container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        result_container.add_item(discord.ui.TextDisplay(
+            f"**認証リンク（利用規約の確認 → 認証）**\n[ここをクリックして開始する]({terms_url})"
+        ))
+        result_view = discord.ui.LayoutView(timeout=None)
+        result_view.add_item(result_container)
+
+        await interaction.response.send_message(view=result_view, ephemeral=True)
 
 
 class RestoreConfirmView(discord.ui.View):
@@ -16555,13 +16589,13 @@ async def server_verify_btn(interaction: discord.Interaction, title: str = "サ�
     if not ch:
         await interaction.followup.send("設定されたチャンネルが見つかりません。", ephemeral=True)
         return
-    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
     if image_file:
         file_data = await image_file.to_file()
-        embed.set_image(url=f"attachment://{image_file.filename}")
-        await ch.send(embed=embed, file=file_data, view=VerifyButtonView())
+        view = VerifyButtonView(title, description, image_file.filename)
+        await ch.send(view=view, file=file_data)
     else:
-        await ch.send(embed=embed, view=VerifyButtonView())
+        view = VerifyButtonView(title, description)
+        await ch.send(view=view)
     await interaction.followup.send("認証パネルを送信しました。", ephemeral=True)
 
 
@@ -23883,16 +23917,10 @@ async def sbl_setup(
 
     else:
         # --- パネルモード: このチャンネルにボタンを設置 ---
-        embed_panel = discord.Embed(
-            title=panel_title,
-            description=panel_description,
-            color=discord.Color.blue()
-        )
-
-        view = VerifyBlacklistButtonView()
+        view = VerifyBlacklistButtonView(panel_title, panel_description)
 
         await interaction.response.send_message("認証パネルを設置中...", ephemeral=True)
-        panel_msg = await interaction.channel.send(embed=embed_panel, view=view)
+        panel_msg = await interaction.channel.send(view=view)
 
         cfg["server_blacklist_verify_channel_id"] = interaction.channel.id
         cfg["server_blacklist_verify_message_id"] = panel_msg.id
