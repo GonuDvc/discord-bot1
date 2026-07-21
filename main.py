@@ -22854,10 +22854,15 @@ class EmbedBuilderView(discord.ui.LayoutView):
             return
         # 自分だけに見えるプレビュー確認用。実際の送信（_on_send_embed）とは独立しており、
         # Modal付きパネルの登録や送信済みフラグの更新は行わない。
+        # 注意: Components V2（LayoutView）を使う場合、content引数と併用するとエラーになるため、
+        # 案内文はTextDisplayとしてContainer内に含める。
+        preview_container = self.build_final_container()
         preview_view = discord.ui.LayoutView(timeout=None)
-        preview_view.add_item(self.build_final_container())
+        preview_view.add_item(discord.ui.TextDisplay(
+            "-# [プレビュー] これは実際の送信内容の確認用です（あなたにのみ表示されています）"
+        ))
+        preview_view.add_item(preview_container)
         await interaction.response.send_message(
-            content="-# [プレビュー] これは実際の送信内容の確認用です（あなたにのみ表示されています）",
             view=preview_view,
             ephemeral=True,
         )
