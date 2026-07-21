@@ -616,6 +616,10 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("embed_templates", {}),        # {template_name: {title, description, footer, color, image_url,
                                          #   thumbnail_url, fields, author_name, author_url, author_icon_url,
                                          #   timestamp_enabled, link_buttons}} — /embed builder のテンプレート保存機能
+        ("embed_sent_messages", {}),     # {message_id_str: {"channel_id": int, "embed_data": {...},
+                                         #   "modal_config": {...} | None, "modal_panel_id": int | None,
+                                         #   "created_at": epoch秒}} — /embed builder で送信済みのEmbedを
+                                         # 後から「元メッセージの編集」で再度開けるようにするための保存データ
         # --- Railway監視：常時表示パネルの永続化（Bot再起動後の自動再開用） ---
         ("railway_monitor_panels", {}),  # {"channel_id_str": message_id} 設置済みのRailway監視埋め込み一覧
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
@@ -22498,10 +22502,25 @@ class EmbedBuilderView(discord.ui.LayoutView):
     編集画面・最終的にチャンネルへ送信される成果物、いずれもEmbedを使わずContainerで組み立てる。
     ボタン・セレクトメニューはすべてContainer内に配置される。"""
 
-    def __init__(self, author: discord.abc.User, target_channel: discord.TextChannel):
+    def __init__(
+        self,
+        author: discord.abc.User,
+        target_channel: discord.TextChannel,
+        *,
+        edit_message_id: Optional[int] = None,
+        initial_embed_data: Optional[dict] = None,
+        initial_modal_config: Optional[dict] = None,
+        modal_panel_id: Optional[int] = None,
+    ):
         super().__init__(timeout=600)
         self.author = author
         self.target_channel = target_channel
+        # 編集モード: 送信済みメッセージの内容を書き換える場合はメッセージIDを保持する。
+        # Noneの場合は新規送信（従来通りtarget_channelへ新しいメッセージとして送る）。
+        self.edit_message_id: Optional[int] = edit_message_id
+        # 編集モードで、そのメッセージに既にModal付きパネルが設定されていた場合のpanel_id
+        # （編集時は新規発行せず、この既存panel_idをそのまま使い続ける）
+        self.modal_panel_id: Optional[int] = modal_panel_id
         self.embed_data: dict = {
             "title": None,
             "description": None,
@@ -22516,6 +22535,8 @@ class EmbedBuilderView(discord.ui.LayoutView):
             "timestamp_enabled": False,
             "link_buttons": [],  # [{"label": str, "url": str}]（最大5個）
         }
+        if initial_embed_data:
+            self.embed_data.update(initial_embed_data)
         # Modal（回答フォーム）を付けるかどうかの設定。response_channel が None のままなら付けない。
         self.modal_config: dict = {
             "enabled": False,
@@ -22526,6 +22547,8 @@ class EmbedBuilderView(discord.ui.LayoutView):
             "mention_role_id": None,  # Modal送信時にメンションするロール（1つのみ、任意）
             "allow_attachment": False,  # Modal送信後にファイル添付を受け付けるかどうか
         }
+        if initial_modal_config:
+            self.modal_config.update(initial_modal_config)
         self._sent = False
         self._sent_notice: Optional[str] = None
         self._render()
@@ -22537,12 +22560,19 @@ class EmbedBuilderView(discord.ui.LayoutView):
         container = discord.ui.Container(accent_color=color)
 
         if for_preview and not self._sent:
-            container.add_item(discord.ui.TextDisplay(
-                f"### Embedビルダー（送信先: {self.target_channel.mention}）\n"
-                "-# 「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。"
-                "回答フォーム（Modal）を付ける場合は、下のチャンネル選択で回答送信先を選び、"
-                "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。"
-            ))
+            if self.edit_message_id:
+                container.add_item(discord.ui.TextDisplay(
+                    f"### Embedビルダー（編集モード：{self.target_channel.mention} の既存メッセージを更新）\n"
+                    "-# 「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[更新] 元メッセージに反映」を押してください。"
+                    "内容は送信済みメッセージからそのまま読み込まれています。"
+                ))
+            else:
+                container.add_item(discord.ui.TextDisplay(
+                    f"### Embedビルダー（送信先: {self.target_channel.mention}）\n"
+                    "-# 「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。"
+                    "回答フォーム（Modal）を付ける場合は、下のチャンネル選択で回答送信先を選び、"
+                    "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。"
+                ))
             container.add_item(discord.ui.Separator())
 
         author_name = self.embed_data.get("author_name")
@@ -22754,7 +22784,8 @@ class EmbedBuilderView(discord.ui.LayoutView):
             container.add_item(row4)
 
             row5 = discord.ui.ActionRow()
-            send_btn = discord.ui.Button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success)
+            send_btn_label = "[更新] 元メッセージに反映" if self.edit_message_id else "[OK] このチャンネルに送信"
+            send_btn = discord.ui.Button(label=send_btn_label, style=discord.ButtonStyle.success)
             send_btn.callback = self._on_send_embed
             row5.add_item(send_btn)
 
@@ -22922,13 +22953,17 @@ class EmbedBuilderView(discord.ui.LayoutView):
             return
 
         modal_enabled = self.modal_config.get("enabled") and self.modal_config.get("response_channel_id")
+        is_edit = self.edit_message_id is not None
 
-        panel_id = None
+        # 編集モードで、そのメッセージに元々Modalパネルが設定されていた場合は既存panel_idを使い回す。
+        # 新規にModalを設定した場合（元々は無かった）は新規発行する。
+        panel_id = self.modal_panel_id if is_edit else None
         if modal_enabled:
             all_data = load_data()
             cfg = get_guild_config(all_data, str(interaction.guild.id))
-            panel_id = cfg.get("embed_response_panel_next_id", 1)
-            cfg["embed_response_panel_next_id"] = panel_id + 1
+            if panel_id is None:
+                panel_id = cfg.get("embed_response_panel_next_id", 1)
+                cfg["embed_response_panel_next_id"] = panel_id + 1
             panels = cfg.setdefault("embed_response_panels", {})
             panels[str(panel_id)] = {
                 "button_label": self.modal_config["button_label"],
@@ -22939,6 +22974,16 @@ class EmbedBuilderView(discord.ui.LayoutView):
                 "allow_attachment": self.modal_config.get("allow_attachment", False),
             }
             save_data(all_data)
+        elif is_edit and self.modal_panel_id is not None:
+            # 編集モードで「回答フォームを解除」した場合、既存パネル設定を掃除する
+            # （ボタン自体は付け直さないため、設定だけ残っていても実害はないが、
+            #   誤って別の場面で参照されないよう明示的に削除しておく）
+            all_data = load_data()
+            cfg = get_guild_config(all_data, str(interaction.guild.id))
+            panels = cfg.get("embed_response_panels", {})
+            panels.pop(str(self.modal_panel_id), None)
+            save_data(all_data)
+            panel_id = None
 
         final_container = self.build_final_container()
         if modal_enabled:
@@ -22950,25 +22995,76 @@ class EmbedBuilderView(discord.ui.LayoutView):
         send_view = discord.ui.LayoutView(timeout=None)
         send_view.add_item(final_container)
 
+        target_message_id: Optional[int] = None
+        if is_edit:
+            try:
+                target_message = await self.target_channel.fetch_message(self.edit_message_id)
+                await target_message.edit(view=send_view)
+                target_message_id = target_message.id
+            except discord.NotFound:
+                await interaction.response.send_message(
+                    "[NG] 編集元のメッセージが見つかりませんでした（既に削除された可能性があります）。",
+                    ephemeral=True
+                )
+                return
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"[NG] {self.target_channel.mention} のメッセージを編集する権限がBotにありません。",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"更新エラー: {e}", ephemeral=True)
+                return
+        else:
+            try:
+                sent_message = await self.target_channel.send(view=send_view)
+                target_message_id = sent_message.id
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"[NG] {self.target_channel.mention} への送信権限がBotにありません。\n\n"
+                    f"**対処法**\n"
+                    f"1. {self.target_channel.mention} の「チャンネル設定」→「権限」を開く\n"
+                    f"2. 役職の一覧にBotのロール（例: MAKUMAKUBOT）を追加する\n"
+                    f"3. そのロールの「メッセージを送信」を許可（✓）にする\n\n"
+                    f"（`@everyone` の送信権限がOFFのチャンネルでは、Bot用ロールに個別で許可を出す必要があります）",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
+                return
+
+        # 「元メッセージの編集」機能のため、送信・更新した内容をguild_configに保存しておく。
+        # 保存件数が際限なく増えないよう、上限を超えたら最も古いものから間引く。
         try:
-            await self.target_channel.send(view=send_view)
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                f"[NG] {self.target_channel.mention} への送信権限がBotにありません。\n\n"
-                f"**対処法**\n"
-                f"1. {self.target_channel.mention} の「チャンネル設定」→「権限」を開く\n"
-                f"2. 役職の一覧にBotのロール（例: MAKUMAKUBOT）を追加する\n"
-                f"3. そのロールの「メッセージを送信」を許可（✓）にする\n\n"
-                f"（`@everyone` の送信権限がOFFのチャンネルでは、Bot用ロールに個別で許可を出す必要があります）",
-                ephemeral=True
-            )
-            return
+            all_data = load_data()
+            cfg = get_guild_config(all_data, str(interaction.guild.id))
+            sent_messages = cfg.setdefault("embed_sent_messages", {})
+            sent_messages[str(target_message_id)] = {
+                "channel_id": self.target_channel.id,
+                "embed_data": self.embed_data,
+                "modal_config": self.modal_config if modal_enabled else None,
+                "modal_panel_id": panel_id if modal_enabled else None,
+                "created_at": int(time.time()),
+            }
+            EMBED_SENT_MESSAGES_MAX = 200
+            if len(sent_messages) > EMBED_SENT_MESSAGES_MAX:
+                oldest_ids = sorted(
+                    sent_messages.keys(),
+                    key=lambda k: sent_messages[k].get("created_at", 0)
+                )[: len(sent_messages) - EMBED_SENT_MESSAGES_MAX]
+                for old_id in oldest_ids:
+                    sent_messages.pop(old_id, None)
+            save_data(all_data)
         except Exception as e:
-            await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
-            return
+            print(f"[Embedビルダー] 編集用データの保存に失敗しました: {e}")
 
         self._sent = True
-        self._sent_notice = f"[OK] {self.target_channel.mention} にEmbedを送信しました。"
+        if is_edit:
+            self._sent_notice = f"[OK] {self.target_channel.mention} の元メッセージを更新しました。"
+        else:
+            self._sent_notice = f"[OK] {self.target_channel.mention} にEmbedを送信しました。"
         self._render()
         await interaction.response.edit_message(view=self)
 
@@ -22977,7 +23073,7 @@ class EmbedBuilderView(discord.ui.LayoutView):
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
         self._sent = True
-        self._sent_notice = "Embed作成をキャンセルしました。"
+        self._sent_notice = "編集をキャンセルしました（元メッセージは変更されていません）。" if self.edit_message_id else "Embed作成をキャンセルしました。"
         self._render()
         await interaction.response.edit_message(view=self)
 
@@ -23019,14 +23115,76 @@ class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
         await interaction.response.edit_message(view=self.parent_view)
 
 
+_MESSAGE_LINK_PATTERN = re.compile(r"/channels/\d+/(\d+)/(\d+)")
+
+
+def _parse_message_id_or_link(value: str) -> Optional[int]:
+    """メッセージID（数字のみ）またはDiscordメッセージリンクからメッセージIDを取り出します。
+    どちらの形式でもない場合はNoneを返します。"""
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    m = _MESSAGE_LINK_PATTERN.search(value)
+    if m:
+        return int(m.group(2))
+    return None
+
+
 @embed_group.command(name="builder", description="【管理者専用】画面上でEmbedメッセージを組み立てて、チャンネルに送信できます")
+@discord.app_commands.describe(
+    送信先チャンネル="新規作成時の送信先チャンネル（編集元メッセージIDを指定する場合は不要）",
+    編集元メッセージ="このBotが/embed builderで送信したメッセージのID、またはメッセージリンク。指定すると新規作成ではなく、そのメッセージの編集モードで開きます。",
+)
 async def embed_builder(
     interaction: discord.Interaction,
     送信先チャンネル: discord.TextChannel = None,
+    編集元メッセージ: str = None,
 ):
     if not await is_admin_or_allowed(interaction):
         return
     if not interaction.guild:
+        return
+
+    if 編集元メッセージ:
+        message_id = _parse_message_id_or_link(編集元メッセージ)
+        if message_id is None:
+            await interaction.response.send_message(
+                "編集元メッセージは、メッセージID（数字）またはメッセージリンクの形式で指定してください。\n"
+                "-# メッセージリンクの取得方法: 対象メッセージを右クリック（モバイルは長押し）→「メッセージをコピー」→「リンクをコピー」",
+                ephemeral=True
+            )
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        sent_messages = cfg.get("embed_sent_messages", {})
+        saved = sent_messages.get(str(message_id))
+        if saved is None:
+            await interaction.response.send_message(
+                "[NG] このメッセージの編集用データが見つかりませんでした。\n"
+                "`/embed builder` で送信・更新したメッセージのみ編集できます"
+                "（保存件数の上限（200件）を超えた場合、最も古いものから削除されます）。",
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.guild.get_channel(saved["channel_id"]) or interaction.guild.get_thread(saved["channel_id"])
+        if channel is None:
+            await interaction.response.send_message(
+                "[NG] 編集元メッセージが投稿されたチャンネルが見つかりませんでした（削除された可能性があります）。",
+                ephemeral=True
+            )
+            return
+
+        view = EmbedBuilderView(
+            author=interaction.user,
+            target_channel=channel,
+            edit_message_id=message_id,
+            initial_embed_data=saved.get("embed_data"),
+            initial_modal_config=saved.get("modal_config"),
+            modal_panel_id=saved.get("modal_panel_id"),
+        )
+        await interaction.response.send_message(view=view, ephemeral=True)
         return
 
     target_ch = 送信先チャンネル or interaction.channel
