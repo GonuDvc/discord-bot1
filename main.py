@@ -623,10 +623,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # --- Railway監視：常時表示パネルの永続化（Bot再起動後の自動再開用） ---
         ("railway_monitor_panels", {}),  # {"channel_id_str": message_id} 設置済みのRailway監視埋め込み一覧
         # --- グローバルチャット（サーバー横断のチャンネル中継） ---
-        # 実体（参加サーバー一覧・Webhook URL）は global_config["globalchat_channels"] 側にあるが、
+        # 実体（参加サーバー一覧・Webhook URL）は global_config["globalchat_rooms"] 側にあるが、
         # on_messageで毎回全サーバー分をスキャンせず高速に判定できるよう、このサーバー自身が
-        # 参加しているチャンネルIDだけをここにもミラーしておく（未参加ならNone）。
+        # 参加しているチャンネルID・ルーム名だけをここにもミラーしておく（未参加ならNone）。
         ("globalchat_channel_id", None),
+        ("globalchat_room_name", None),  # 現在参加中のルーム名（未参加ならNone）
         ("globalchat_ng_words_enabled", True),  # True: このサーバーからの投稿にもグローバル共通NGワード判定を適用
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
@@ -1169,9 +1170,18 @@ def get_global_config(all_data: dict) -> dict:
         cfg["dm_ai_chat_cooldown_seconds"] = 10      # /ai コマンドの連投制限（秒）
     if "dm_ai_chat_blocked_users" not in cfg:
         cfg["dm_ai_chat_blocked_users"] = []         # [user_id_int, ...] /ai コマンドの利用をブロックされたユーザー
-    # --- グローバルチャット（サーバー横断のチャンネル中継） ---
-    if "globalchat_channels" not in cfg:
-        cfg["globalchat_channels"] = {}   # {guild_id_str: {"channel_id": int, "webhook_url": str | None}}
+    # --- グローバルチャット（サーバー横断のチャンネル中継、ルーム機能対応） ---
+    # 各サーバーの管理者が任意のルーム名を指定して参加でき、同じルーム名の参加者同士でのみ
+    # メッセージが中継される（ルーム名を分けることで、Bot全体で1つの部屋しか無い従来方式とは異なり
+    # 「仲の良いサーバーだけで独立した部屋を持つ」ことができる）。
+    if "globalchat_rooms" not in cfg:
+        if "globalchat_channels" in cfg and cfg["globalchat_channels"]:
+            # 旧データ（ルーム機能導入前）が存在する場合は "default" ルームへ自動移行する
+            cfg["globalchat_rooms"] = {"default": cfg["globalchat_channels"]}
+        else:
+            cfg["globalchat_rooms"] = {}   # {room_name: {guild_id_str: {"channel_id": int, "webhook_url": str | None}}}
+    if "globalchat_channels" in cfg:
+        del cfg["globalchat_channels"]  # 移行済みのため旧キーは破棄
     if "globalchat_blocked_users" not in cfg:
         cfg["globalchat_blocked_users"] = []  # [user_id_int, ...] グローバルチャットへの参加をブロックされたユーザー
     if "globalchat_enabled" not in cfg:
@@ -1180,6 +1190,8 @@ def get_global_config(all_data: dict) -> dict:
     # 他のDiscord Botとも相互接続できる外部グローバルチャットネットワーク（https://super.globalch.at/）。
     # ハブサーバーの「#super-global-chat」チャンネルにJSON文字列をBotとして送信/受信することで
     # 他Botのグローバルチャットとメッセージをやり取りする（SGC v2 APIドキュメント準拠）。
+    # SGC自体にはルーム概念が無いため、当Bot側では「_SGC_ROOM_NAME という名前の特別なルーム」に
+    # 参加した場合にのみ、そのルームの投稿がSGCハブとも送受信されるものとして扱う。
     if "sgc_hub_channel_id" not in cfg:
         cfg["sgc_hub_channel_id"] = None  # int | None: ハブサーバー内の #super-global-chat チャンネルID
     if "sgc_enabled" not in cfg:
@@ -4606,7 +4618,8 @@ async def on_ready():
         print(f"  > サーバー認証: {'有効' if config.get('verify_channel') else '未設定'}")
         print(f"  > 配信お知らせ: {'有効' if config.get('announce_channel') else '未設定'}")
         print(f"  > 自動メンション: {'有効' if config.get('mention_trigger_channel') else '未設定'}")
-        print(f"  > グローバルチャット: {'参加中' if config.get('globalchat_channel_id') else '未参加'}")
+        _gc_room = config.get("globalchat_room_name")
+        print(f"  > グローバルチャット: {f'参加中（ルーム: {_gc_room}）' if config.get('globalchat_channel_id') else '未参加'}")
         panel_roles = config.get("panel_roles", [])
         if panel_roles and guild:
             roles = [guild.get_role(rid) for rid in panel_roles if guild.get_role(rid)]
@@ -23244,19 +23257,21 @@ async def embed_builder(
 
 
 # ====================================================================
-# セクション 13.5: グローバルチャット（サーバー横断のチャンネル中継）
+# セクション 13.5: グローバルチャット（サーバー横断のチャンネル中継、ルーム機能対応）
 # ====================================================================
 #
 # 概要:
-#   ・各サーバーの管理者が /globalchat setup で1つのテキストチャンネルを登録すると、
-#     そのチャンネルが「グローバルチャット」に参加し、他の参加サーバーの登録チャンネルと
-#     メッセージが相互に中継される（Discordの「学級会」的な複数鯖共有チャットに近い）。
+#   ・各サーバーの管理者が /globalchat setup でルーム名とテキストチャンネルを指定して登録すると、
+#     同じルーム名を指定した参加サーバー同士でのみメッセージが相互に中継される
+#     （ルームを分けることで「仲の良いサーバーとだけ独立した部屋を持つ」ことができる）。
+#     ルーム名を省略した場合は "default" ルームとして扱われる。
 #   ・中継はWebhookを使い、発言者本人のユーザー名・アバターをそのまま模倣して送信する
 #     （Bot名で一律送信するより、誰の発言か一目で分かるようにするため）。
-#   ・参加サーバー一覧・Webhook URLは global_config["globalchat_channels"] に集約して持つ
-#     （{guild_id_str: {"channel_id": int, "webhook_url": str}}）。
-#   ・各guild_config側にも globalchat_channel_id をミラーしておき、on_messageで
-#     「このメッセージがグローバルチャット対象チャンネルか」を高速判定できるようにする。
+#   ・参加サーバー一覧・Webhook URLは global_config["globalchat_rooms"] に集約して持つ
+#     （{room_name: {guild_id_str: {"channel_id": int, "webhook_url": str}}}）。
+#   ・各guild_config側にも globalchat_channel_id / globalchat_room_name をミラーしておき、
+#     on_messageで「このメッセージがグローバルチャット対象チャンネルか」を高速判定できるようにする
+#     （1サーバーにつき同時に参加できるルームは1つのみ）。
 #   ・招待リンクは常にブロックする（自サーバー勧誘による荒らし・スパム対策）。
 #     NGワードはBot全体で一律の簡易フィルタのみ適用し、各サーバー個別のNGワード設定には
 #     依存しない（グローバル空間は特定サーバーのローカル設定と切り離して考えるべきため）。
@@ -23278,10 +23293,12 @@ globalchat_group = app_commands.Group(name="globalchat", description="サーバ�
 #     メッセージ送信権限を得ておく必要がある（招待方法はSGC運営に確認してください）。
 #   ・ハブチャンネルのIDは /globalchat sgc setup をそのチャンネル内で実行して登録する
 #     （global_config["sgc_hub_channel_id"]、オーナー限定）。
-#   ・送信: このBotの既存グローバルチャット（globalchat_channels）に投稿があった場合、
-#     通常の中継に加えてSGC仕様のJSONをハブチャンネルへ送信する。
+#   ・SGC自体にはルームの概念が無いため、当Bot側では room_name == "sgc"（_SGC_ROOM_NAME）という
+#     特別なルームに参加した場合にのみ、そのルームの投稿がSGCハブとも送受信される。
+#   ・送信: このBotのグローバルチャット「sgc」ルームに投稿があった場合、そのルーム内での通常の
+#     中継に加えてSGC仕様のJSONをハブチャンネルへ送信する。
 #   ・受信: on_message内でハブチャンネルからのメッセージ（他Botの投稿）を検知し、
-#     type="message" のJSONをパースできればこのBotのグローバルチャット参加サーバー群へ中継する。
+#     type="message" のJSONをパースできれば「sgc」ルームの参加サーバー群へ中継する。
 #     自Bot自身の投稿（author.id == bot.user.id）は素通しせず無視することでエコーを防止する。
 #   ・返信(reference)対応:
 #     - 送信側: このBot上で他サーバーからの中継メッセージ（Webhook送信、_sgc_webhook_origin_cache
@@ -23294,6 +23311,9 @@ globalchat_group = app_commands.Group(name="globalchat", description="サーバ�
 
 _SGC_VERSION = "2.1.7"
 _SGC_HISTORY_SEARCH_LIMIT = 500  # 返信元メッセージを探すために遡るハブチャンネル履歴の件数上限
+# SGC自体にはルーム概念が無いため、当Bot内では「このルーム名に参加した場合のみSGCとも送受信する」
+# という特別なルーム名として予約する（他の一般ルームとの取り違え防止のため小文字固定）。
+_SGC_ROOM_NAME = "sgc"
 
 # {webhook経由で送信した中継メッセージのID: 元となったSGC上のmessageId(str)}
 # 自サーバー内で他サーバーからの中継発言に返信された際、SGCへ送るreferenceを復元するために使う。
@@ -23316,7 +23336,9 @@ def _sgc_remember_webhook_origin(sent_message_id: int, origin_message_id: str):
 async def _sgc_resolve_reference(message: discord.Message) -> Optional[str]:
     """自Bot上のメッセージ（返信元）から、SGCへ送るべきreference用messageIdを解決します。
     返信元が「SGC由来の中継メッセージ（Webhook送信）」ならその元messageId、
-    「このグローバルチャットチャンネル内の生発言」ならそのメッセージIDそのものを返します。"""
+    「このグローバルチャットチャンネル内の生発言、または通常のグローバルチャット中継メッセージ」
+    であればそのメッセージIDそのものを返します
+    （_globalchat_message_meta_cacheに記録があるかどうかで存在確認するのみで、値自体はID用途では使わない）。"""
     if not message.reference or not message.reference.message_id:
         return None
     ref_id = message.reference.message_id
@@ -23450,7 +23472,9 @@ async def _sgc_relay_from_hub(message: discord.Message):
     username = f"{user_name} (SGC:{guild_name})"[:80]
     origin_message_id = str(data.get("messageId") or message.id)
 
-    channels_registry = global_cfg.get("globalchat_channels", {})
+    # SGCからの受信は「sgc」ルームの参加サーバーにのみ配信する（他ルームには一切影響させない）
+    rooms_registry = global_cfg.get("globalchat_rooms", {})
+    channels_registry = rooms_registry.get(_SGC_ROOM_NAME, {})
     for guild_id_str, entry in list(channels_registry.items()):
         target_channel_id = entry.get("channel_id")
         if not target_channel_id:
@@ -23476,6 +23500,9 @@ async def _sgc_relay_from_hub(message: discord.Message):
             # このサーバーで表示された中継メッセージが、後で返信された場合に元のSGC messageId を
             # 復元できるよう対応表に記録しておく（_sgc_resolve_reference が参照する）。
             _sgc_remember_webhook_origin(sent.id, origin_message_id)
+            # 通常のグローバルチャット中継（_globalchat_relay_message）側でも、この中継メッセージへの
+            # 返信を引用形式で解決できるよう、統一の対応表にも記録しておく。
+            _globalchat_remember_message_meta(sent.id, username, content[:1900] if len(content) > 1900 else content)
         except discord.NotFound:
             _globalchat_webhook_cache.pop(target_channel.id, None)
         except discord.HTTPException as e:
@@ -23490,6 +23517,43 @@ _GLOBALCHAT_INVITE_KEYWORDS = ("discord.gg/", "discord.com/invite/", "discord.me
 _GLOBALCHAT_BASE_NG_WORDS: tuple = ()
 
 _globalchat_webhook_cache: dict = {}  # {channel_id: discord.Webhook} プロセス内キャッシュ（毎回API取得しないため）
+
+# --------------------------------------------------------------------
+# グローバルチャットの返信(reply)対応
+#
+# Discordの仕様上、Webhook経由の送信は「返信」機能（message_reference）に対応していない
+# （webhook.send()にreferenceパラメータが存在しない）ため、他サーバーの発言に返信しても
+# 通常はただの新規発言として中継されてしまう。
+# そこで、送信したメッセージのID→「発言者名・本文」を対応表として記録しておき、
+# 誰かがそのメッセージ（自サーバーの生発言、または他サーバーからの中継メッセージ）に
+# 返信した場合は、引用テキスト（"> @発言者\n> 本文"）を本文の先頭に付加してから送信することで、
+# 疑似的に返信を表現する。
+# --------------------------------------------------------------------
+
+_globalchat_message_meta_cache: dict = {}  # {message_id: {"author": str, "content": str}}
+_GLOBALCHAT_MESSAGE_META_CACHE_MAX = 1000
+
+
+def _globalchat_remember_message_meta(message_id: int, author: str, content: str):
+    """グローバルチャットに流れたメッセージの発言者名・本文を、返信解決用に記録します。"""
+    _globalchat_message_meta_cache[message_id] = {"author": author, "content": content}
+    if len(_globalchat_message_meta_cache) > _GLOBALCHAT_MESSAGE_META_CACHE_MAX:
+        for old_key in list(_globalchat_message_meta_cache.keys())[
+            : len(_globalchat_message_meta_cache) - _GLOBALCHAT_MESSAGE_META_CACHE_MAX
+        ]:
+            _globalchat_message_meta_cache.pop(old_key, None)
+
+
+def _globalchat_build_reply_quote(message: discord.Message) -> str:
+    """メッセージがグローバルチャット内の他発言への返信であれば、引用テキストを組み立てて返します
+    （返信でない、または返信元が対応表に無い＝キャッシュ切れの場合は空文字列）。"""
+    if not message.reference or not message.reference.message_id:
+        return ""
+    meta = _globalchat_message_meta_cache.get(message.reference.message_id)
+    if not meta:
+        return ""
+    quoted_first_line = (meta["content"].splitlines() or [""])[0][:100]
+    return f"> **@{meta['author']}**  {quoted_first_line}\n"
 
 
 def _globalchat_contains_invite(content: str) -> bool:
@@ -23582,9 +23646,19 @@ async def _globalchat_relay_message(message: discord.Message, all_data: dict):
             pass
         return
 
-    channels_registry = global_cfg.get("globalchat_channels", {})
+    guild_config = get_guild_config(all_data, str(message.guild.id))
+    room_name = guild_config.get("globalchat_room_name")
+    if not room_name:
+        return  # ルーム未設定（通常はここに来る前にon_message側でチャンネルIDが一致しているはずだが念のため）
+
+    rooms_registry = global_cfg.get("globalchat_rooms", {})
+    channels_registry = rooms_registry.get(room_name, {})
     if not channels_registry:
         return
+
+    # 返信(reply)対応: 返信先が対応表にあれば、引用テキストを本文の先頭に付加する
+    # （Webhook送信は本来の返信機能に対応していないため、疑似的に表現する）
+    reply_quote = _globalchat_build_reply_quote(message)
 
     # Discordのメッセージ長制限（2000文字）に収まるよう安全側で切り詰める
     display_content = content[:1900] if len(content) > 1900 else content
@@ -23595,10 +23669,14 @@ async def _globalchat_relay_message(message: discord.Message, all_data: dict):
         display_content = f"{display_content}\n{attach_urls}" if display_content else attach_urls
     if not display_content:
         return
-    display_content = display_content[:2000]
+    display_content = (reply_quote + display_content)[:2000]
 
     avatar_url = str(message.author.display_avatar.url) if message.author.display_avatar else None
     username = f"{message.author.display_name} ({message.guild.name})"[:80]
+
+    # このメッセージ自体も、後で誰かに返信された場合に解決できるよう対応表に記録しておく
+    # （contentは引用を含まない元の本文で記録する）
+    _globalchat_remember_message_meta(message.id, username, content[:1900] if len(content) > 1900 else content)
 
     my_guild_id_str = str(message.guild.id)
     for guild_id_str, entry in list(channels_registry.items()):
@@ -23618,42 +23696,64 @@ async def _globalchat_relay_message(message: discord.Message, all_data: dict):
         if webhook is None:
             continue
         try:
-            await webhook.send(
+            sent = await webhook.send(
                 content=display_content,
                 username=username,
                 avatar_url=avatar_url,
                 allowed_mentions=discord.AllowedMentions.none(),  # 他サーバーへのメンション連打を防止
+                wait=True,
             )
+            # 中継先で表示されたこのメッセージも、さらに返信された場合に解決できるよう記録する
+            _globalchat_remember_message_meta(sent.id, username, content[:1900] if len(content) > 1900 else content)
         except discord.NotFound:
             # Webhookが手動削除されていた場合はキャッシュを捨てて次回作り直す
             _globalchat_webhook_cache.pop(target_channel.id, None)
         except discord.HTTPException as e:
             print(f"[グローバルチャット] 中継送信に失敗しました（guild_id={guild_id_str}）: {e}")
 
-    # 参加サーバーへの中継に加えて、SGC（外部グローバルチャットネットワーク）が
-    # 設定されていればそちらにも同じメッセージを送信する。
-    try:
-        await _sgc_send_to_hub(message, all_data)
-    except Exception as e:
-        print(f"[SGC] ハブへの送信処理中にエラーが発生しました: {e}")
+    # 参加サーバーへの中継に加えて、このメッセージが「sgc」ルームへの投稿であり、
+    # かつSGCハブが設定されていれば、SGC（外部グローバルチャットネットワーク）へも送信する。
+    if room_name == _SGC_ROOM_NAME:
+        try:
+            await _sgc_send_to_hub(message, all_data)
+        except Exception as e:
+            print(f"[SGC] ハブへの送信処理中にエラーが発生しました: {e}")
 
 
-@globalchat_group.command(name="setup", description="【管理者専用】このチャンネルをグローバルチャットに参加させます")
-async def globalchat_setup(interaction: discord.Interaction, チャンネル: discord.TextChannel = None):
+@globalchat_group.command(name="setup", description="【管理者専用】このチャンネルを指定ルームのグローバルチャットに参加させます")
+@discord.app_commands.describe(
+    ルーム名="参加/新規作成するルーム名（省略時は「default」。半角英数字推奨。SGCと接続したい場合は「sgc」を指定）",
+    チャンネル="グローバルチャットにするチャンネル（省略時は実行したチャンネル）",
+)
+async def globalchat_setup(
+    interaction: discord.Interaction,
+    ルーム名: str = "default",
+    チャンネル: discord.TextChannel = None,
+):
     if not await is_admin_or_allowed(interaction):
         return
     if not interaction.guild:
+        return
+
+    room_name = ルーム名.strip().lower()
+    if not room_name:
+        await interaction.response.send_message("ルーム名は空にできません。", ephemeral=True)
+        return
+    if len(room_name) > 50:
+        await interaction.response.send_message("ルーム名は50文字以内で指定してください。", ephemeral=True)
         return
 
     target_channel = チャンネル or interaction.channel
     all_data = load_data()
     global_cfg = get_global_config(all_data)
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    rooms_registry = global_cfg["globalchat_rooms"]
 
-    existing = global_cfg["globalchat_channels"].get(str(interaction.guild.id))
-    if existing and existing.get("channel_id") == target_channel.id:
+    current_room = guild_config.get("globalchat_room_name")
+    existing_in_target_room = rooms_registry.get(room_name, {}).get(str(interaction.guild.id))
+    if existing_in_target_room and existing_in_target_room.get("channel_id") == target_channel.id:
         await interaction.response.send_message(
-            f"{target_channel.mention} は既にグローバルチャットに参加しています。",
+            f"{target_channel.mention} は既にルーム「{room_name}」のグローバルチャットに参加しています。",
             ephemeral=True
         )
         return
@@ -23669,19 +23769,42 @@ async def globalchat_setup(interaction: discord.Interaction, チャンネル: di
         )
         return
 
-    global_cfg["globalchat_channels"][str(interaction.guild.id)] = {
+    is_new_room = room_name not in rooms_registry
+    is_room_switch = bool(current_room and current_room != room_name)
+
+    # 1サーバーにつき同時に参加できるルームは1つのみ。別ルームへ切り替える場合は
+    # 旧ルームの登録を先に外しておく（旧ルーム側に自サーバーの残留エントリを残さないため）。
+    if is_room_switch:
+        old_room_entry = rooms_registry.get(current_room)
+        if old_room_entry:
+            old_room_entry.pop(str(interaction.guild.id), None)
+            if not old_room_entry:
+                rooms_registry.pop(current_room, None)
+
+    rooms_registry.setdefault(room_name, {})[str(interaction.guild.id)] = {
         "channel_id": target_channel.id,
         "webhook_url": webhook.url,
     }
     guild_config["globalchat_channel_id"] = target_channel.id
+    guild_config["globalchat_room_name"] = room_name
     save_data(all_data)
 
-    participant_count = len(global_cfg["globalchat_channels"])
+    participant_count = len(rooms_registry[room_name])
+    room_desc = "新規作成" if is_new_room else f"既存ルーム（他 {participant_count - 1} サーバーが参加中）"
+    sgc_note = ""
+    if room_name == _SGC_ROOM_NAME:
+        sgc_note = (
+            "\n-# このルームは特別なルーム名「sgc」のため、SGCハブが設定されていれば"
+            "外部のSGC参加Botとも自動的にメッセージが送受信されます（`/globalchat sgc setup` で設定）。"
+        )
+    switch_note = f"\n-# 以前参加していたルーム「{current_room}」からは自動的に離脱しました。" if is_room_switch else ""
+
     await interaction.followup.send(
-        f"[OK] {target_channel.mention} をグローバルチャットに参加させました。\n"
-        f"現在の参加サーバー数: {participant_count}\n"
+        f"[OK] {target_channel.mention} をルーム「{room_name}」（{room_desc}）のグローバルチャットに参加させました。\n"
+        f"このルームの参加サーバー数: {participant_count}\n"
         "-# 他サーバーの参加者が投稿すると、Webhook経由でそのユーザー名・アイコンのまま"
-        "このチャンネルに中継表示されます。招待リンクとNGワードは自動でブロックされます。",
+        "このチャンネルに中継表示されます。招待リンクとNGワードは自動でブロックされます。"
+        f"{sgc_note}{switch_note}",
         ephemeral=True
     )
 
@@ -23696,15 +23819,24 @@ async def globalchat_leave(interaction: discord.Interaction):
     all_data = load_data()
     global_cfg = get_global_config(all_data)
     guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    rooms_registry = global_cfg["globalchat_rooms"]
 
-    removed = global_cfg["globalchat_channels"].pop(str(interaction.guild.id), None)
+    room_name = guild_config.get("globalchat_room_name")
+    removed = None
+    if room_name and room_name in rooms_registry:
+        removed = rooms_registry[room_name].pop(str(interaction.guild.id), None)
+        if not rooms_registry[room_name]:
+            # 参加者が0になったルームはレジストリごと削除する（一覧を汚さないため）
+            rooms_registry.pop(room_name, None)
+
     guild_config["globalchat_channel_id"] = None
+    guild_config["globalchat_room_name"] = None
     save_data(all_data)
 
     if removed is None:
         await interaction.response.send_message("このサーバーはグローバルチャットに参加していません。", ephemeral=True)
         return
-    await interaction.response.send_message("[OK] グローバルチャットから離脱しました。", ephemeral=True)
+    await interaction.response.send_message(f"[OK] ルーム「{room_name}」のグローバルチャットから離脱しました。", ephemeral=True)
 
 
 @globalchat_group.command(name="status", description="グローバルチャットの参加状況を確認します")
@@ -23713,8 +23845,11 @@ async def globalchat_status(interaction: discord.Interaction):
         return
     all_data = load_data()
     global_cfg = get_global_config(all_data)
-    channels_registry = global_cfg.get("globalchat_channels", {})
-    my_entry = channels_registry.get(str(interaction.guild.id))
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+    rooms_registry = global_cfg.get("globalchat_rooms", {})
+
+    room_name = guild_config.get("globalchat_room_name")
+    my_entry = rooms_registry.get(room_name, {}).get(str(interaction.guild.id)) if room_name else None
 
     embed = discord.Embed(
         title="[グローバルチャット] 参加状況",
@@ -23725,19 +23860,49 @@ async def globalchat_status(interaction: discord.Interaction):
         ch = interaction.guild.get_channel(my_entry.get("channel_id"))
         embed.add_field(
             name="このサーバー",
-            value=f"参加中（{ch.mention if ch else '（削除済みチャンネル）'}）",
+            value=f"ルーム「{room_name}」に参加中（{ch.mention if ch else '（削除済みチャンネル）'}）",
             inline=False
         )
+        embed.add_field(name="このルームの参加サーバー数", value=str(len(rooms_registry.get(room_name, {}))), inline=True)
     else:
-        embed.add_field(name="このサーバー", value="未参加（`/globalchat setup` で参加できます）", inline=False)
+        embed.add_field(
+            name="このサーバー",
+            value="未参加（`/globalchat setup ルーム名:<好きな名前>` で参加できます）",
+            inline=False
+        )
 
-    embed.add_field(name="全体の参加サーバー数", value=str(len(channels_registry)), inline=True)
+    embed.add_field(name="全体のルーム数", value=str(len(rooms_registry)), inline=True)
     embed.add_field(
         name="中継の状態",
         value="稼働中" if global_cfg.get("globalchat_enabled", True) else "オーナーにより緊急停止中",
         inline=True
     )
     embed.set_footer(text="招待リンクの送信、共通NGワードは自動でブロックされます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@globalchat_group.command(name="rooms", description="現在存在するグローバルチャットのルーム一覧を確認します")
+async def globalchat_rooms_list(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    rooms_registry = global_cfg.get("globalchat_rooms", {})
+
+    if not rooms_registry:
+        await interaction.response.send_message("現在、稼働中のルームはありません。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="[グローバルチャット] ルーム一覧",
+        color=discord.Color.blue(),
+        timestamp=discord.utils.utcnow(),
+    )
+    # 荒らし・スパム対策のため、各サーバー名までは表示せず参加サーバー数のみを見せる
+    lines = []
+    for name, entry in sorted(rooms_registry.items(), key=lambda kv: -len(kv[1])):
+        tag = "（SGC接続）" if name == _SGC_ROOM_NAME else ""
+        lines.append(f"・**{name}**{tag} — 参加サーバー数: {len(entry)}")
+    embed.description = "\n".join(lines)[:4000]
+    embed.set_footer(text="/globalchat setup ルーム名:<名前> で好きなルームに参加・新規作成できます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -23812,8 +23977,9 @@ async def sgc_setup(interaction: discord.Interaction):
         f"[OK] {interaction.channel.mention} をSGCのハブチャンネルとして登録しました。\n"
         "-# あらかじめこのチャンネル（通常は #super-global-chat）にBotが参加し、"
         "メッセージの閲覧・送信権限を持っている必要があります。\n"
-        "-# 以降、`/globalchat setup` で登録したこのBotのグローバルチャットと、"
-        "SGCに参加している他のBotのグローバルチャットが相互に中継されます。",
+        "-# 各サーバーが `/globalchat setup ルーム名:sgc` を実行してこのルームに参加すると、"
+        "SGCに参加している他のBotのグローバルチャットともメッセージが相互に中継されます"
+        "（ルーム名を「sgc」以外にした場合はSGCとは連携しません）。",
         ephemeral=True
     )
 
