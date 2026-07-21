@@ -616,6 +616,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("embed_templates", {}),        # {template_name: {title, description, footer, color, image_url,
                                          #   thumbnail_url, fields, author_name, author_url, author_icon_url,
                                          #   timestamp_enabled, link_buttons}} — /embed builder のテンプレート保存機能
+        # --- Railway監視：常時表示パネルの永続化（Bot再起動後の自動再開用） ---
+        ("railway_monitor_panels", {}),  # {"channel_id_str": message_id} 設置済みのRailway監視埋め込み一覧
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
         ("economy_currency_name", "コイン"),
@@ -4597,6 +4599,24 @@ async def on_ready():
         if guild and any(stats_ch_ids):
             _stats_tasks[guild_id_int] = asyncio.create_task(_stats_loop(guild))
             print("  > 統計ループ: 再起動しました")
+
+        # Railway監視パネルの自動更新ループを再起動
+        # （Bot再起動やRailway自体の再デプロイでプロセスが落ちると監視タスクは消えるが、
+        #  設置済みの埋め込みメッセージ自体は残る＝「自動更新中」と表示されたまま実際は
+        #  止まっている状態になってしまうため、on_readyで自動的に監視を再開する）
+        railway_panels = config.get("railway_monitor_panels", {})
+        if guild and railway_panels and RAILWAY_MONITOR_AVAILABLE:
+            for ch_id_str, msg_id in list(railway_panels.items()):
+                try:
+                    ch_id_int = int(ch_id_str)
+                except (TypeError, ValueError):
+                    continue
+                session_key = (guild_id_int, ch_id_int)
+                if session_key in _railway_monitor_sessions:
+                    continue  # 既に稼働中（再接続による重複起動を防ぐ）
+                task = asyncio.create_task(_railway_monitor_update_loop(guild_id_int, ch_id_int, msg_id))
+                _railway_monitor_sessions[session_key] = {"message_id": msg_id, "task": task}
+            print(f"  > Railway監視: {len(railway_panels)}件のパネルを再開しました")
 
         # 進行中プレゼントのタスクを再起動
         # [修正] on_ready はDiscordとの再接続のたびに複数回呼び出される可能性があり、
@@ -9459,7 +9479,7 @@ async def _ai_debate_loop(channel_id: int):
             try:
                 async with channel.typing():
                     reply_text = await _ai_debate_generate_turn(session, current_speaker)
-            except GroqRateLimitError as e:
+            except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError) as e:
                 wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
                 try:
                     await channel.send(
@@ -9692,7 +9712,7 @@ async def ai_debate_random_start(
 
     try:
         setup = await _ai_debate_generate_random_setup(guild_id=interaction.guild.id)
-    except GroqRateLimitError as e:
+    except (GroqRateLimitError, CerebrasRateLimitError, MistralRateLimitError, OpenRouterRateLimitError, GeminiRateLimitError) as e:
         wait_hint = f"（あと約{_format_duration(e.retry_after)}ほどで復帰する見込みです）" if e.retry_after else ""
         await interaction.followup.send(
             f"APIのレート制限に達しているため、ランダム設定を生成できませんでした。{wait_hint}",
@@ -20419,11 +20439,13 @@ async def _railway_build_status_embed() -> discord.Embed:
 
     project = await _railway_fetch_project_overview()
     if project is None:
+        error_detail = f"\n\n**エラー詳細**: {_railway_last_graphql_error[:500]}" if _railway_last_graphql_error else ""
         embed = discord.Embed(
             title="[Railway監視] 取得エラー",
             description=(
                 "Railway APIからプロジェクト情報を取得できませんでした。\n"
                 "`RAILWAY_API_TOKEN` の有効性・`RAILWAY_PROJECT_ID` が正しいかご確認ください。"
+                f"{error_detail}"
             ),
             color=discord.Color.red(),
             timestamp=discord.utils.utcnow(),
@@ -20450,6 +20472,7 @@ async def _railway_build_status_embed() -> discord.Embed:
         metrics = await _railway_fetch_metrics(environment_id)
     else:
         metrics = []
+    metrics_error_detail = _railway_last_graphql_error
 
     if metrics:
         cpu_by_service: dict = {}
@@ -20486,14 +20509,16 @@ async def _railway_build_status_embed() -> discord.Embed:
                 inline=False,
             )
     else:
+        detail = f"\n-# エラー詳細: {metrics_error_detail[:300]}" if metrics_error_detail else ""
         embed.add_field(
             name="CPU・メモリ使用状況",
-            value="取得できませんでした（APIエラー、またはこのプランで利用できない可能性があります）。",
+            value=f"取得できませんでした（APIエラー、またはこのプランで利用できない可能性があります）。{detail}",
             inline=False,
         )
 
     # --- ストレージ（ボリューム） ---
     volumes = await _railway_fetch_volumes()
+    volumes_error_detail = _railway_last_graphql_error
     if volumes:
         lines = []
         for vol in volumes:
@@ -20513,9 +20538,10 @@ async def _railway_build_status_embed() -> discord.Embed:
         else:
             embed.add_field(name="ストレージ（ボリューム）使用状況", value="このプロジェクトにボリュームは見つかりませんでした。", inline=False)
     else:
+        detail = f"\n-# エラー詳細: {volumes_error_detail[:300]}" if volumes_error_detail else ""
         embed.add_field(
             name="ストレージ（ボリューム）使用状況",
-            value="取得できませんでした（ボリューム未作成、またはAPIエラーの可能性があります）。",
+            value=f"取得できませんでした（ボリューム未作成、またはAPIエラーの可能性があります）。{detail}",
             inline=False,
         )
 
@@ -20523,6 +20549,7 @@ async def _railway_build_status_embed() -> discord.Embed:
     # Railway Public APIには金額そのものを返すフィールドが存在しないため、
     # CPU/メモリ/ストレージ/ネットワークの使用量にRailway公式単価をかけて概算する。
     usage_totals = await _railway_fetch_usage_totals()
+    usage_error_detail = _railway_last_graphql_error
     if usage_totals is not None:
         estimated_cost = _railway_estimate_cost_from_usage(usage_totals)
         cost_value = (
@@ -20531,7 +20558,11 @@ async def _railway_build_status_embed() -> discord.Embed:
         )
         embed.add_field(name="今月の推定使用料金（概算）", value=cost_value, inline=False)
     else:
-        cost_value = "取得できませんでした（APIエラー、またはこのプランでは使用量データを取得できない可能性があります。正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。"
+        detail = f"\n-# エラー詳細: {usage_error_detail[:300]}" if usage_error_detail else ""
+        cost_value = (
+            "取得できませんでした（APIエラー、またはこのプランでは使用量データを取得できない可能性があります。"
+            f"正確な金額は Railway ダッシュボードの Usage ページでご確認ください）。{detail}"
+        )
         embed.add_field(name="今月の推定使用料金", value=cost_value, inline=False)
 
     embed.set_footer(text="Railway Public API経由で取得 ／ 値は数分遅延する場合があります ／ 料金は概算です")
@@ -20558,6 +20589,14 @@ async def _railway_monitor_update_loop(guild_id: int, channel_id: int, message_i
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 print(f"[Railway監視] メッセージ取得に失敗したため監視ループを終了します（channel_id={channel_id}）。")
                 _railway_monitor_sessions.pop(key, None)
+                try:
+                    all_data = load_data()
+                    cfg = get_guild_config(all_data, str(guild_id))
+                    panels = cfg.setdefault("railway_monitor_panels", {})
+                    if panels.pop(str(channel_id), None) is not None:
+                        save_data(all_data)
+                except Exception as e:
+                    print(f"[Railway監視] 永続化データからのパネル削除に失敗しました: {e}")
                 return
             try:
                 embed = await _railway_build_status_embed()
@@ -21043,6 +21082,13 @@ async def railway_monitor_start_command(interaction: discord.Interaction):
     task = asyncio.create_task(_railway_monitor_update_loop(interaction.guild.id, interaction.channel.id, message.id))
     _railway_monitor_sessions[key] = {"message_id": message.id, "task": task}
 
+    # Bot再起動後もon_readyで自動的に監視を再開できるよう、設置場所を永続化しておく
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    panels = cfg.setdefault("railway_monitor_panels", {})
+    panels[str(interaction.channel.id)] = message.id
+    save_data(all_data)
+
     await interaction.followup.send(
         f"このチャンネルにRailway監視の埋め込みを設置しました。{RAILWAY_MONITOR_REFRESH_SECONDS}秒ごとに自動更新されます。\n"
         f"停止するには `/railway monitor_stop` を実行してください。",
@@ -21067,6 +21113,13 @@ async def railway_monitor_stop_command(interaction: discord.Interaction):
     task = session.get("task")
     if task is not None and not task.done():
         task.cancel()
+
+    # 永続化データからも設置場所を削除する（残っているとBot再起動時に誤って再開されるため）
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    panels = cfg.setdefault("railway_monitor_panels", {})
+    if panels.pop(str(interaction.channel.id), None) is not None:
+        save_data(all_data)
 
     await interaction.response.send_message("Railway監視の自動更新を停止しました（設置済みの埋め込みメッセージ自体は残ります）。", ephemeral=True)
 
