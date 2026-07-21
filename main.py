@@ -613,6 +613,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
                                          #   "response_channel_id": int,
                                          #   "mention_role_id": int | None}}
         ("embed_response_panel_next_id", 1),
+        ("embed_templates", {}),        # {template_name: {title, description, footer, color, image_url,
+                                         #   thumbnail_url, fields, author_name, author_url, author_icon_url,
+                                         #   timestamp_enabled, link_buttons}} — /embed builder のテンプレート保存機能
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
         ("economy_currency_name", "コイン"),
@@ -1531,6 +1534,7 @@ async def _uptime_periodic_save_loop():
     Botが不意に落ちた場合でも、直近の保存間隔（最大5分）以内の誤差に抑えられます。
     プロセス終了時（Ctrl+C等の正常終了）にも最後の一回を保存します。
     """
+    global _bot_start_time, _bot_prior_uptime_seconds
     await bot.wait_until_ready()
     try:
         while True:
@@ -7508,6 +7512,7 @@ def _collect_leaked_tool_json_prefix(raw_content: str):
     if brace_pos > _LEAKED_JSON_PREFIX_TEXT_MAX_LEN:
         return [], raw_content  # 前置きが長すぎる = 通常の回答文の可能性が高いため対象外
 
+    prefix_text = raw_content[:brace_pos]
     i = brace_pos
     n = len(raw_content)
     collected_blobs = []
@@ -11695,7 +11700,7 @@ async def profile_badge_list(interaction: discord.Interaction):
 
     lines = []
     for b in badge_defs.values():
-        r, g, b_ = b.get("color", [200, 170, 60])[0], b.get("color", [200, 170, 60])[1], b.get("color", [200, 170, 60])[2]
+        r, g, b_, bl = b.get("color", [200, 170, 60])[0], b.get("color", [200, 170, 60])[1], b.get("color", [200, 170, 60])[2], b
         symbol = b.get("symbol") or "(頭文字を使用)"
         lines.append(f"**{b.get('name', '不明')}** — シンボル: {symbol} / カラー: `#{r:02X}{g:02X}{b_:02X}`")
 
@@ -21937,6 +21942,155 @@ class EmbedBuilderModal(discord.ui.Modal, title="Embed内容を入力"):
         await interaction.response.edit_message(view=pv)
 
 
+class EmbedAuthorModal(discord.ui.Modal, title="著者(author)情報を入力"):
+    """Embed上部に表示する著者情報（アイコン画像＋名前＋リンク）を入力するモーダル。
+    既存のEmbedBuilderModalは入力欄が5個で上限に達しているため、専用Modalとして分離する。"""
+    author_name = discord.ui.TextInput(
+        label="著者名",
+        placeholder="例: 運営チーム",
+        max_length=256,
+        required=False
+    )
+    author_url = discord.ui.TextInput(
+        label="著者名のリンク先URL（省略可）",
+        placeholder="https://example.com",
+        required=False
+    )
+    author_icon_url = discord.ui.TextInput(
+        label="著者アイコン画像URL（省略可）",
+        placeholder="https://example.com/icon.png",
+        required=False
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pv = self.parent_view
+        pv.embed_data["author_name"] = self.author_name.value or None
+        pv.embed_data["author_url"] = self.author_url.value or None
+        pv.embed_data["author_icon_url"] = self.author_icon_url.value or None
+        pv._render()
+        await interaction.response.edit_message(view=pv)
+
+
+class EmbedLinkButtonModal(discord.ui.Modal, title="URLボタンを追加"):
+    """Embedの下に表示するリンクボタン（最大5個）を1つ追加するモーダル。"""
+    button_label = discord.ui.TextInput(
+        label="ボタンのラベル",
+        placeholder="例: 公式サイト",
+        max_length=80,
+        required=True
+    )
+    button_url = discord.ui.TextInput(
+        label="リンク先URL",
+        placeholder="https://example.com",
+        required=True
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        url = self.button_url.value.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await interaction.response.send_message(
+                "URLは http:// または https:// から始まる形式で入力してください。", ephemeral=True
+            )
+            return
+        pv = self.parent_view
+        buttons = pv.embed_data.setdefault("link_buttons", [])
+        if len(buttons) >= 5:
+            await interaction.response.send_message("URLボタンは最大5個までです。", ephemeral=True)
+            return
+        buttons.append({"label": self.button_label.value.strip() or "リンク", "url": url})
+        pv._render()
+        await interaction.response.edit_message(view=pv)
+
+
+class EmbedTemplateSaveModal(discord.ui.Modal, title="テンプレートとして保存"):
+    """現在のEmbed内容をサーバー設定にテンプレートとして保存するモーダル。"""
+    template_name = discord.ui.TextInput(
+        label="テンプレート名",
+        placeholder="例: イベント告知",
+        max_length=100,
+        required=True
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pv = self.parent_view
+        name = self.template_name.value.strip()
+        if not name:
+            await interaction.response.send_message("テンプレート名を入力してください。", ephemeral=True)
+            return
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        templates = cfg.setdefault("embed_templates", {})
+        if len(templates) >= 25 and name not in templates:
+            await interaction.response.send_message(
+                "テンプレートは最大25個までです。不要なテンプレートを削除してから保存してください。", ephemeral=True
+            )
+            return
+        templates[name] = {
+            "title": pv.embed_data.get("title"),
+            "description": pv.embed_data.get("description"),
+            "footer": pv.embed_data.get("footer"),
+            "color": pv.embed_data.get("color", "ブルー"),
+            "image_url": pv.embed_data.get("image_url"),
+            "thumbnail_url": pv.embed_data.get("thumbnail_url"),
+            "fields": pv.embed_data.get("fields", []),
+            "author_name": pv.embed_data.get("author_name"),
+            "author_url": pv.embed_data.get("author_url"),
+            "author_icon_url": pv.embed_data.get("author_icon_url"),
+            "timestamp_enabled": pv.embed_data.get("timestamp_enabled", False),
+            "link_buttons": pv.embed_data.get("link_buttons", []),
+        }
+        save_data(all_data)
+        pv._render()
+        await interaction.response.edit_message(view=pv)
+        await interaction.followup.send(f"テンプレート「{name}」として保存しました。", ephemeral=True)
+
+
+class EmbedTemplateLoadSelect(discord.ui.Select):
+    """保存済みテンプレートを一覧から選んで読み込むセレクトメニュー。"""
+
+    def __init__(self, parent_view: "EmbedBuilderView", templates: dict):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=name[:100], value=name)
+            for name in list(templates.keys())[:25]
+        ]
+        super().__init__(placeholder="テンプレートを読み込む...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        templates = cfg.get("embed_templates", {})
+        tpl = templates.get(self.values[0])
+        if tpl is None:
+            await interaction.response.send_message("このテンプレートは見つかりませんでした（削除された可能性があります）。", ephemeral=True)
+            return
+        pv = self.parent_view
+        for key in (
+            "title", "description", "footer", "color", "image_url", "thumbnail_url",
+            "fields", "author_name", "author_url", "author_icon_url",
+            "timestamp_enabled", "link_buttons",
+        ):
+            if key in tpl:
+                pv.embed_data[key] = tpl[key]
+        pv._render()
+        await interaction.response.edit_message(view=pv)
+
+
 EMBED_COLOR_OPTIONS = {
     "ブルー":   discord.Color.blue(),
     "グリーン": discord.Color.green(),
@@ -22238,6 +22392,7 @@ async def _handle_embed_response_submit(
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
     # 1つ目の入力欄を見出し、残りを本文相当として表示する
+    first_label = fields_meta[0].get("label", "タイトル") if fields_meta else "タイトル"
     first_value = values[0][:256] if values else ""
     body_lines = []
     for meta, val in zip(fields_meta[1:], values[1:]):
@@ -22302,6 +22457,11 @@ class EmbedBuilderView(discord.ui.LayoutView):
             "image_url": None,
             "thumbnail_url": None,
             "fields": [],   # [{"name": str, "value": str, "inline": bool}]
+            "author_name": None,
+            "author_url": None,
+            "author_icon_url": None,
+            "timestamp_enabled": False,
+            "link_buttons": [],  # [{"label": str, "url": str}]（最大5個）
         }
         # Modal（回答フォーム）を付けるかどうかの設定。response_channel が None のままなら付けない。
         self.modal_config: dict = {
@@ -22331,6 +22491,17 @@ class EmbedBuilderView(discord.ui.LayoutView):
                 "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。"
             ))
             container.add_item(discord.ui.Separator())
+
+        author_name = self.embed_data.get("author_name")
+        if author_name:
+            author_url = self.embed_data.get("author_url")
+            author_line = f"[{author_name}]({author_url})" if author_url else author_name
+            icon_url = self.embed_data.get("author_icon_url")
+            author_display = discord.ui.TextDisplay(f"**{author_line}**")
+            if icon_url:
+                container.add_item(discord.ui.Section(author_display, accessory=discord.ui.Thumbnail(icon_url)))
+            else:
+                container.add_item(author_display)
 
         title = self.embed_data.get("title") or "（タイトル未入力）"
         description = self.embed_data.get("description") or "（本文未入力）"
@@ -22368,6 +22539,29 @@ class EmbedBuilderView(discord.ui.LayoutView):
         if self.embed_data.get("footer"):
             container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
             container.add_item(discord.ui.TextDisplay(f"-# {self.embed_data['footer']}"))
+
+        if self.embed_data.get("timestamp_enabled"):
+            if not self.embed_data.get("footer"):
+                container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            if for_preview:
+                # プレビュー中は_render()の度に時刻が変わってしまう（＝送信時刻ではなく編集時刻になる）ため、
+                # 実際の時刻は表示せず「送信時に確定する」ことが分かる固定文言にする。
+                container.add_item(discord.ui.TextDisplay("-# [時刻] 送信時刻がここに表示されます"))
+            else:
+                container.add_item(discord.ui.TextDisplay(
+                    f"-# {discord.utils.format_dt(discord.utils.utcnow(), style='f')}"
+                ))
+
+        if self.embed_data.get("link_buttons"):
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            link_row = discord.ui.ActionRow()
+            for btn in self.embed_data["link_buttons"][:5]:
+                link_row.add_item(discord.ui.Button(
+                    label=btn["label"][:80],
+                    style=discord.ButtonStyle.link,
+                    url=btn["url"],
+                ))
+            container.add_item(link_row)
 
         if for_preview and self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
             mc = self.modal_config
@@ -22417,6 +22611,55 @@ class EmbedBuilderView(discord.ui.LayoutView):
             remove_field_btn.callback = self._on_remove_field
             row0.add_item(remove_field_btn)
             container.add_item(row0)
+
+            row_extra = discord.ui.ActionRow()
+            author_btn = discord.ui.Button(label="[著者] 情報を設定", style=discord.ButtonStyle.secondary)
+            author_btn.callback = self._on_edit_author
+            row_extra.add_item(author_btn)
+
+            link_count = len(self.embed_data.get("link_buttons", []))
+            add_link_btn = discord.ui.Button(
+                label=f"[URL] ボタンを追加 ({link_count}/5)",
+                style=discord.ButtonStyle.secondary,
+                disabled=link_count >= 5,
+            )
+            add_link_btn.callback = self._on_add_link_button
+            row_extra.add_item(add_link_btn)
+
+            remove_link_btn = discord.ui.Button(
+                label="[URL] ボタンを削除",
+                style=discord.ButtonStyle.secondary,
+                disabled=link_count <= 0,
+            )
+            remove_link_btn.callback = self._on_remove_link_button
+            row_extra.add_item(remove_link_btn)
+
+            ts_enabled = self.embed_data.get("timestamp_enabled", False)
+            timestamp_btn = discord.ui.Button(
+                label="[時刻] タイムスタンプON" if not ts_enabled else "[時刻] タイムスタンプOFF",
+                style=discord.ButtonStyle.secondary if not ts_enabled else discord.ButtonStyle.success,
+            )
+            timestamp_btn.callback = self._on_toggle_timestamp
+            row_extra.add_item(timestamp_btn)
+
+            preview_send_btn = discord.ui.Button(label="[プレビュー] 自分にだけ送信", style=discord.ButtonStyle.secondary)
+            preview_send_btn.callback = self._on_send_preview
+            row_extra.add_item(preview_send_btn)
+            container.add_item(row_extra)
+
+            row_template = discord.ui.ActionRow()
+            save_template_btn = discord.ui.Button(label="[テンプレ] 現在の内容を保存", style=discord.ButtonStyle.secondary)
+            save_template_btn.callback = self._on_save_template
+            row_template.add_item(save_template_btn)
+            container.add_item(row_template)
+
+            all_data = load_data()
+            cfg = get_guild_config(all_data, str(self.target_channel.guild.id))
+            templates = cfg.get("embed_templates", {})
+            if templates:
+                template_row = discord.ui.ActionRow()
+                template_row.add_item(EmbedTemplateLoadSelect(self, templates))
+                container.add_item(template_row)
 
             color_row = discord.ui.ActionRow()
             color_row.add_item(EmbedColorSelect(self))
@@ -22471,6 +22714,69 @@ class EmbedBuilderView(discord.ui.LayoutView):
             container.add_item(discord.ui.TextDisplay(f"-# {self._sent_notice}"))
 
         self.add_item(container)
+
+    async def _on_edit_author(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        modal = EmbedAuthorModal(self)
+        if self.embed_data.get("author_name"):
+            modal.author_name.default = self.embed_data["author_name"]
+        if self.embed_data.get("author_url"):
+            modal.author_url.default = self.embed_data["author_url"]
+        if self.embed_data.get("author_icon_url"):
+            modal.author_icon_url.default = self.embed_data["author_icon_url"]
+        await interaction.response.send_modal(modal)
+
+    async def _on_add_link_button(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if len(self.embed_data.get("link_buttons", [])) >= 5:
+            await interaction.response.send_message("URLボタンは最大5個までです。", ephemeral=True)
+            return
+        await interaction.response.send_modal(EmbedLinkButtonModal(self))
+
+    async def _on_remove_link_button(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        buttons = self.embed_data.get("link_buttons", [])
+        if not buttons:
+            await interaction.response.send_message("削除できるURLボタンがありません。", ephemeral=True)
+            return
+        removed = buttons.pop()
+        self._render()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"URLボタン「{removed['label']}」を削除しました。", ephemeral=True)
+
+    async def _on_toggle_timestamp(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        self.embed_data["timestamp_enabled"] = not self.embed_data.get("timestamp_enabled", False)
+        self._render()
+        await interaction.response.edit_message(view=self)
+
+    async def _on_save_template(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        await interaction.response.send_modal(EmbedTemplateSaveModal(self))
+
+    async def _on_send_preview(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        # 自分だけに見えるプレビュー確認用。実際の送信（_on_send_embed）とは独立しており、
+        # Modal付きパネルの登録や送信済みフラグの更新は行わない。
+        preview_view = discord.ui.LayoutView(timeout=None)
+        preview_view.add_item(self.build_final_container())
+        await interaction.response.send_message(
+            content="-# [プレビュー] これは実際の送信内容の確認用です（あなたにのみ表示されています）",
+            view=preview_view,
+            ephemeral=True,
+        )
 
     async def _on_edit_content(self, interaction: discord.Interaction):
         if interaction.user.id != self.author.id:
