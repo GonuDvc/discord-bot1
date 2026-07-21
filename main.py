@@ -622,6 +622,12 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
                                          # 後から「元メッセージの編集」で再度開けるようにするための保存データ
         # --- Railway監視：常時表示パネルの永続化（Bot再起動後の自動再開用） ---
         ("railway_monitor_panels", {}),  # {"channel_id_str": message_id} 設置済みのRailway監視埋め込み一覧
+        # --- グローバルチャット（サーバー横断のチャンネル中継） ---
+        # 実体（参加サーバー一覧・Webhook URL）は global_config["globalchat_channels"] 側にあるが、
+        # on_messageで毎回全サーバー分をスキャンせず高速に判定できるよう、このサーバー自身が
+        # 参加しているチャンネルIDだけをここにもミラーしておく（未参加ならNone）。
+        ("globalchat_channel_id", None),
+        ("globalchat_ng_words_enabled", True),  # True: このサーバーからの投稿にもグローバル共通NGワード判定を適用
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
         ("economy_currency_name", "コイン"),
@@ -1163,6 +1169,13 @@ def get_global_config(all_data: dict) -> dict:
         cfg["dm_ai_chat_cooldown_seconds"] = 10      # /ai コマンドの連投制限（秒）
     if "dm_ai_chat_blocked_users" not in cfg:
         cfg["dm_ai_chat_blocked_users"] = []         # [user_id_int, ...] /ai コマンドの利用をブロックされたユーザー
+    # --- グローバルチャット（サーバー横断のチャンネル中継） ---
+    if "globalchat_channels" not in cfg:
+        cfg["globalchat_channels"] = {}   # {guild_id_str: {"channel_id": int, "webhook_url": str | None}}
+    if "globalchat_blocked_users" not in cfg:
+        cfg["globalchat_blocked_users"] = []  # [user_id_int, ...] グローバルチャットへの参加をブロックされたユーザー
+    if "globalchat_enabled" not in cfg:
+        cfg["globalchat_enabled"] = True  # False: オーナーが緊急停止した場合、全サーバーで中継を止める
     return cfg
 
 
@@ -4585,6 +4598,7 @@ async def on_ready():
         print(f"  > サーバー認証: {'有効' if config.get('verify_channel') else '未設定'}")
         print(f"  > 配信お知らせ: {'有効' if config.get('announce_channel') else '未設定'}")
         print(f"  > 自動メンション: {'有効' if config.get('mention_trigger_channel') else '未設定'}")
+        print(f"  > グローバルチャット: {'参加中' if config.get('globalchat_channel_id') else '未参加'}")
         panel_roles = config.get("panel_roles", [])
         if panel_roles and guild:
             roles = [guild.get_role(rid) for rid in panel_roles if guild.get_role(rid)]
@@ -5643,6 +5657,14 @@ async def on_message(message: discord.Message):
                             pass
                     else:
                         await to_channel.send(message.content)
+
+        # 3.5 グローバルチャット中継処理
+        globalchat_ch_id = guild_config.get("globalchat_channel_id")
+        if globalchat_ch_id and message.channel.id == globalchat_ch_id:
+            try:
+                await _globalchat_relay_message(message, all_data)
+            except Exception as e:
+                print(f"[グローバルチャット] 中継処理中にエラーが発生しました: {e}")
 
         # 4. 自動返信ロールメンション処理
         trigger_ch_id = guild_config.get("mention_trigger_channel")
@@ -23196,6 +23218,334 @@ async def embed_builder(
     view = EmbedBuilderView(author=interaction.user, target_channel=target_ch)
     await interaction.response.send_message(view=view, ephemeral=True)
 
+
+
+# ====================================================================
+# セクション 13.5: グローバルチャット（サーバー横断のチャンネル中継）
+# ====================================================================
+#
+# 概要:
+#   ・各サーバーの管理者が /globalchat setup で1つのテキストチャンネルを登録すると、
+#     そのチャンネルが「グローバルチャット」に参加し、他の参加サーバーの登録チャンネルと
+#     メッセージが相互に中継される（Discordの「学級会」的な複数鯖共有チャットに近い）。
+#   ・中継はWebhookを使い、発言者本人のユーザー名・アバターをそのまま模倣して送信する
+#     （Bot名で一律送信するより、誰の発言か一目で分かるようにするため）。
+#   ・参加サーバー一覧・Webhook URLは global_config["globalchat_channels"] に集約して持つ
+#     （{guild_id_str: {"channel_id": int, "webhook_url": str}}）。
+#   ・各guild_config側にも globalchat_channel_id をミラーしておき、on_messageで
+#     「このメッセージがグローバルチャット対象チャンネルか」を高速判定できるようにする。
+#   ・招待リンクは常にブロックする（自サーバー勧誘による荒らし・スパム対策）。
+#     NGワードはBot全体で一律の簡易フィルタのみ適用し、各サーバー個別のNGワード設定には
+#     依存しない（グローバル空間は特定サーバーのローカル設定と切り離して考えるべきため）。
+#   ・オーナーは特定ユーザーをグローバルチャットからブロックでき（global_config
+#     ["globalchat_blocked_users"]）、緊急時は /globalchat emergency_stop で全参加サーバーの
+#     中継を即座に停止できる。
+# --------------------------------------------------------------------
+
+globalchat_group = app_commands.Group(name="globalchat", description="サーバー横断のグローバルチャット機能")
+
+# 招待リンク（自サーバー勧誘）は常にブロックする。他の自動モデレーション設定には依存しない。
+_GLOBALCHAT_INVITE_KEYWORDS = ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")
+
+# Bot全体で一律に適用する最低限のNGワード（グローバル空間全体の品位維持が目的のため、
+# 各サーバーのローカルNGワード設定より厳しめに、必要最小限のみを直書きする）。
+_GLOBALCHAT_BASE_NG_WORDS: tuple = ()
+
+_globalchat_webhook_cache: dict = {}  # {channel_id: discord.Webhook} プロセス内キャッシュ（毎回API取得しないため）
+
+
+def _globalchat_contains_invite(content: str) -> bool:
+    """メッセージ本文に招待リンクが含まれるかを判定します。"""
+    lower = content.lower()
+    return any(kw in lower for kw in _GLOBALCHAT_INVITE_KEYWORDS)
+
+
+def _globalchat_contains_ng_word(content: str) -> bool:
+    """メッセージ本文にグローバル共通NGワードが含まれるかを判定します。"""
+    if not _GLOBALCHAT_BASE_NG_WORDS:
+        return False
+    lower = content.lower()
+    return any(w.lower() in lower for w in _GLOBALCHAT_BASE_NG_WORDS if w)
+
+
+async def _globalchat_get_or_create_webhook(channel: discord.TextChannel) -> Optional[discord.Webhook]:
+    """指定チャンネル用のグローバルチャット中継Webhookを取得します。
+    既存のWebhookキャッシュに無ければ、そのチャンネルのWebhook一覧から既存のもの
+    （名前が _GLOBALCHAT_WEBHOOK_NAME のもの）を探し、無ければ新規作成します。"""
+    if channel.id in _globalchat_webhook_cache:
+        return _globalchat_webhook_cache[channel.id]
+
+    webhook_name = "グローバルチャット中継"
+    try:
+        existing = await channel.webhooks()
+        for wh in existing:
+            if wh.name == webhook_name:
+                _globalchat_webhook_cache[channel.id] = wh
+                return wh
+        new_wh = await channel.create_webhook(name=webhook_name, reason="グローバルチャット機能用")
+        _globalchat_webhook_cache[channel.id] = new_wh
+        return new_wh
+    except discord.Forbidden:
+        print(f"[グローバルチャット] チャンネル {channel.id} でのWebhook作成に権限がありません。")
+        return None
+    except discord.HTTPException as e:
+        print(f"[グローバルチャット] Webhook取得・作成に失敗しました（channel_id={channel.id}）: {e}")
+        return None
+
+
+async def _globalchat_relay_message(message: discord.Message, all_data: dict):
+    """グローバルチャット対象チャンネルへの投稿を、他の参加サーバーへ中継します。"""
+    global_cfg = get_global_config(all_data)
+    if not global_cfg.get("globalchat_enabled", True):
+        return
+    if message.author.id in global_cfg.get("globalchat_blocked_users", []):
+        try:
+            await message.channel.send(
+                f"[!] {message.author.mention} はグローバルチャットの利用をブロックされています。",
+                delete_after=6
+            )
+        except discord.HTTPException:
+            pass
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return
+
+    content = message.content or ""
+    if not content and not message.attachments:
+        return  # 埋め込みのみの投稿（Bot発言等）は中継対象外
+
+    if _globalchat_contains_invite(content):
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        try:
+            await message.channel.send(
+                f"[!] {message.author.mention} グローバルチャットでは招待リンクの送信は禁止されています。",
+                delete_after=6
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    if _globalchat_contains_ng_word(content):
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        try:
+            await message.channel.send(
+                f"[!] {message.author.mention} このメッセージはグローバルチャットのNGワードに抵触するため送信できません。",
+                delete_after=6
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    channels_registry = global_cfg.get("globalchat_channels", {})
+    if not channels_registry:
+        return
+
+    # Discordのメッセージ長制限（2000文字）に収まるよう安全側で切り詰める
+    display_content = content[:1900] if len(content) > 1900 else content
+    # 添付ファイル（画像等）はURLをそのまま文中に付加する（Webhook経由でのファイル再アップロードは
+    # 容量・レート制限の観点でリスクが高いため、リンク共有に留める）
+    if message.attachments:
+        attach_urls = "\n".join(a.url for a in message.attachments[:4])
+        display_content = f"{display_content}\n{attach_urls}" if display_content else attach_urls
+    if not display_content:
+        return
+    display_content = display_content[:2000]
+
+    avatar_url = str(message.author.display_avatar.url) if message.author.display_avatar else None
+    username = f"{message.author.display_name} ({message.guild.name})"[:80]
+
+    my_guild_id_str = str(message.guild.id)
+    for guild_id_str, entry in list(channels_registry.items()):
+        if guild_id_str == my_guild_id_str:
+            continue  # 自分自身のチャンネルには送らない
+        target_channel_id = entry.get("channel_id")
+        if not target_channel_id:
+            continue
+        target_guild = bot.get_guild(int(guild_id_str))
+        if target_guild is None:
+            continue  # Botが参加していないサーバー（脱退済み等）はスキップ
+        target_channel = target_guild.get_channel(target_channel_id)
+        if target_channel is None:
+            continue
+
+        webhook = await _globalchat_get_or_create_webhook(target_channel)
+        if webhook is None:
+            continue
+        try:
+            await webhook.send(
+                content=display_content,
+                username=username,
+                avatar_url=avatar_url,
+                allowed_mentions=discord.AllowedMentions.none(),  # 他サーバーへのメンション連打を防止
+            )
+        except discord.NotFound:
+            # Webhookが手動削除されていた場合はキャッシュを捨てて次回作り直す
+            _globalchat_webhook_cache.pop(target_channel.id, None)
+        except discord.HTTPException as e:
+            print(f"[グローバルチャット] 中継送信に失敗しました（guild_id={guild_id_str}）: {e}")
+
+
+@globalchat_group.command(name="setup", description="【管理者専用】このチャンネルをグローバルチャットに参加させます")
+async def globalchat_setup(interaction: discord.Interaction, チャンネル: discord.TextChannel = None):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    target_channel = チャンネル or interaction.channel
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    existing = global_cfg["globalchat_channels"].get(str(interaction.guild.id))
+    if existing and existing.get("channel_id") == target_channel.id:
+        await interaction.response.send_message(
+            f"{target_channel.mention} は既にグローバルチャットに参加しています。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    webhook = await _globalchat_get_or_create_webhook(target_channel)
+    if webhook is None:
+        await interaction.followup.send(
+            f"[NG] {target_channel.mention} でWebhookを作成できませんでした。"
+            "Botに「Webhookの管理」権限があるかご確認ください。",
+            ephemeral=True
+        )
+        return
+
+    global_cfg["globalchat_channels"][str(interaction.guild.id)] = {
+        "channel_id": target_channel.id,
+        "webhook_url": webhook.url,
+    }
+    guild_config["globalchat_channel_id"] = target_channel.id
+    save_data(all_data)
+
+    participant_count = len(global_cfg["globalchat_channels"])
+    await interaction.followup.send(
+        f"[OK] {target_channel.mention} をグローバルチャットに参加させました。\n"
+        f"現在の参加サーバー数: {participant_count}\n"
+        "-# 他サーバーの参加者が投稿すると、Webhook経由でそのユーザー名・アイコンのまま"
+        "このチャンネルに中継表示されます。招待リンクとNGワードは自動でブロックされます。",
+        ephemeral=True
+    )
+
+
+@globalchat_group.command(name="leave", description="【管理者専用】このサーバーをグローバルチャットから離脱させます")
+async def globalchat_leave(interaction: discord.Interaction):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    guild_config = get_guild_config(all_data, str(interaction.guild.id))
+
+    removed = global_cfg["globalchat_channels"].pop(str(interaction.guild.id), None)
+    guild_config["globalchat_channel_id"] = None
+    save_data(all_data)
+
+    if removed is None:
+        await interaction.response.send_message("このサーバーはグローバルチャットに参加していません。", ephemeral=True)
+        return
+    await interaction.response.send_message("[OK] グローバルチャットから離脱しました。", ephemeral=True)
+
+
+@globalchat_group.command(name="status", description="グローバルチャットの参加状況を確認します")
+async def globalchat_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    channels_registry = global_cfg.get("globalchat_channels", {})
+    my_entry = channels_registry.get(str(interaction.guild.id))
+
+    embed = discord.Embed(
+        title="[グローバルチャット] 参加状況",
+        color=discord.Color.blue() if my_entry else discord.Color.greyple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    if my_entry:
+        ch = interaction.guild.get_channel(my_entry.get("channel_id"))
+        embed.add_field(
+            name="このサーバー",
+            value=f"参加中（{ch.mention if ch else '（削除済みチャンネル）'}）",
+            inline=False
+        )
+    else:
+        embed.add_field(name="このサーバー", value="未参加（`/globalchat setup` で参加できます）", inline=False)
+
+    embed.add_field(name="全体の参加サーバー数", value=str(len(channels_registry)), inline=True)
+    embed.add_field(
+        name="中継の状態",
+        value="稼働中" if global_cfg.get("globalchat_enabled", True) else "オーナーにより緊急停止中",
+        inline=True
+    )
+    embed.set_footer(text="招待リンクの送信、共通NGワードは自動でブロックされます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@globalchat_group.command(name="block_user", description="【オーナー限定】指定ユーザーをグローバルチャットの利用からブロックします")
+async def globalchat_block_user(interaction: discord.Interaction, ユーザー: discord.User):
+    if not await is_owner_check(interaction):
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blocked = global_cfg.setdefault("globalchat_blocked_users", [])
+    if ユーザー.id in blocked:
+        await interaction.response.send_message(f"{ユーザー.mention} は既にブロック済みです。", ephemeral=True)
+        return
+    blocked.append(ユーザー.id)
+    save_data(all_data)
+    await interaction.response.send_message(f"[OK] {ユーザー.mention} をグローバルチャットからブロックしました。", ephemeral=True)
+
+
+@globalchat_group.command(name="unblock_user", description="【オーナー限定】指定ユーザーのグローバルチャットブロックを解除します")
+async def globalchat_unblock_user(interaction: discord.Interaction, ユーザー: discord.User):
+    if not await is_owner_check(interaction):
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blocked = global_cfg.setdefault("globalchat_blocked_users", [])
+    if ユーザー.id not in blocked:
+        await interaction.response.send_message(f"{ユーザー.mention} はブロックされていません。", ephemeral=True)
+        return
+    blocked.remove(ユーザー.id)
+    save_data(all_data)
+    await interaction.response.send_message(f"[OK] {ユーザー.mention} のブロックを解除しました。", ephemeral=True)
+
+
+@globalchat_group.command(name="emergency_stop", description="【オーナー限定】全サーバーのグローバルチャット中継を緊急停止/再開します")
+@discord.app_commands.describe(状態="on: 中継を稼働させる／off: 全サーバーで中継を即座に停止する")
+@discord.app_commands.choices(状態=[
+    app_commands.Choice(name="on（稼働）", value="on"),
+    app_commands.Choice(name="off（緊急停止）", value="off"),
+])
+async def globalchat_emergency_stop(interaction: discord.Interaction, 状態: app_commands.Choice[str]):
+    if not await is_owner_check(interaction):
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["globalchat_enabled"] = (状態.value == "on")
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"[OK] グローバルチャットを{'稼働状態' if 状態.value == 'on' else '緊急停止状態'}にしました。",
+        ephemeral=True
+    )
+
+
+bot.tree.add_command(globalchat_group)
 
 
 # ====================================================================
