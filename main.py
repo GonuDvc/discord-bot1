@@ -1176,6 +1176,14 @@ def get_global_config(all_data: dict) -> dict:
         cfg["globalchat_blocked_users"] = []  # [user_id_int, ...] グローバルチャットへの参加をブロックされたユーザー
     if "globalchat_enabled" not in cfg:
         cfg["globalchat_enabled"] = True  # False: オーナーが緊急停止した場合、全サーバーで中継を止める
+    # --- SGC（Super Global Chat）連携 ---
+    # 他のDiscord Botとも相互接続できる外部グローバルチャットネットワーク（https://super.globalch.at/）。
+    # ハブサーバーの「#super-global-chat」チャンネルにJSON文字列をBotとして送信/受信することで
+    # 他Botのグローバルチャットとメッセージをやり取りする（SGC v2 APIドキュメント準拠）。
+    if "sgc_hub_channel_id" not in cfg:
+        cfg["sgc_hub_channel_id"] = None  # int | None: ハブサーバー内の #super-global-chat チャンネルID
+    if "sgc_enabled" not in cfg:
+        cfg["sgc_enabled"] = True  # False: オーナーが緊急停止した場合、SGCとの送受信を止める
     return cfg
 
 
@@ -5552,6 +5560,21 @@ async def on_message(message: discord.Message):
     また、BOT宛のDM（オーナー⇔ユーザー間のメッセージリレー）も処理します。
     """
     if message.author.bot:
+        # SGC（外部グローバルチャットネットワーク）のハブチャンネルでの他Bot発言は、
+        # JSON形式のメッセージをパースしてこのBotのグローバルチャット参加サーバーへ中継する。
+        # （自Bot自身の発言も message.author.bot == True でここを通るが、
+        # _sgc_relay_from_hub内で author.id == bot.user.id かどうかを見てエコーを弾くため
+        # 無限ループにはならない）
+        if message.guild is not None:
+            all_data_sgc_check = load_data()
+            sgc_hub_id = get_global_config(all_data_sgc_check).get("sgc_hub_channel_id")
+            if sgc_hub_id and message.channel.id == sgc_hub_id:
+                try:
+                    await _sgc_relay_from_hub(message)
+                except Exception as e:
+                    print(f"[SGC] ハブからの受信処理中にエラーが発生しました: {e}")
+                return
+
         # 他Botの発言は原則無視するが、「他BOTへの自動応答」機能で明示的に登録された
         # Botの発言かつAIチャット専用チャンネルでの発言に限り、専用の処理ルートへ回す。
         # （自分自身の発言・無限ループ防止のため、後続のチェックは _handle_ai_chat_bot_reply 内で行う）
@@ -23244,6 +23267,221 @@ async def embed_builder(
 
 globalchat_group = app_commands.Group(name="globalchat", description="サーバー横断のグローバルチャット機能")
 
+# --------------------------------------------------------------------
+# SGC（Super Global Chat, https://super.globalch.at/）連携
+#
+# 概要:
+#   ・SGCは特定のBotに縛られず、様々なDiscord Botから接続できる外部のグローバルチャット網。
+#     ハブサーバー内の「#super-global-chat」チャンネルに、参加Bot同士がJSON形式の文字列を
+#     通常のメッセージとして投稿し合うことでメッセージを中継する（SGC v2 APIドキュメント準拠）。
+#   ・このBotをあらかじめSGCのハブサーバーに招待し、#super-global-chat チャンネルへの閲覧・
+#     メッセージ送信権限を得ておく必要がある（招待方法はSGC運営に確認してください）。
+#   ・ハブチャンネルのIDは /globalchat sgc setup をそのチャンネル内で実行して登録する
+#     （global_config["sgc_hub_channel_id"]、オーナー限定）。
+#   ・送信: このBotの既存グローバルチャット（globalchat_channels）に投稿があった場合、
+#     通常の中継に加えてSGC仕様のJSONをハブチャンネルへ送信する。
+#   ・受信: on_message内でハブチャンネルからのメッセージ（他Botの投稿）を検知し、
+#     type="message" のJSONをパースできればこのBotのグローバルチャット参加サーバー群へ中継する。
+#     自Bot自身の投稿（author.id == bot.user.id）は素通しせず無視することでエコーを防止する。
+#   ・返信(reference)対応:
+#     - 送信側: このBot上で他サーバーからの中継メッセージ（Webhook送信、_sgc_webhook_origin_cache
+#       に記録済み）に返信された場合はそのSGC上の元messageIdを、同チャンネル内の生発言への
+#       返信であればそのメッセージIDをそのまま reference として送信する。
+#     - 受信側: JSONにreferenceがあれば、ハブチャンネルの履歴を遡ってmessageIdが一致する
+#       過去のJSON投稿を探し、「返信先ユーザー名+引用」を本文の先頭に付加してから中継する
+#       （Webhookのcontentのみで完結させるため、Embedのfieldではなくテキストで表現する）。
+# --------------------------------------------------------------------
+
+_SGC_VERSION = "2.1.7"
+_SGC_HISTORY_SEARCH_LIMIT = 500  # 返信元メッセージを探すために遡るハブチャンネル履歴の件数上限
+
+# {webhook経由で送信した中継メッセージのID: 元となったSGC上のmessageId(str)}
+# 自サーバー内で他サーバーからの中継発言に返信された際、SGCへ送るreferenceを復元するために使う。
+# プロセス内キャッシュのため再起動で失われるが、返信チェーンは短命であるため実用上問題ない。
+_sgc_webhook_origin_cache: dict = {}
+_SGC_WEBHOOK_ORIGIN_CACHE_MAX = 500
+
+
+def _sgc_remember_webhook_origin(sent_message_id: int, origin_message_id: str):
+    """Webhookで中継送信したメッセージのIDと、その元になったSGC上のmessageIdを対応付けて記録します。"""
+    _sgc_webhook_origin_cache[sent_message_id] = origin_message_id
+    if len(_sgc_webhook_origin_cache) > _SGC_WEBHOOK_ORIGIN_CACHE_MAX:
+        # 古いものから間引く（挿入順=dictの反復順であることを利用）
+        for old_key in list(_sgc_webhook_origin_cache.keys())[
+            : len(_sgc_webhook_origin_cache) - _SGC_WEBHOOK_ORIGIN_CACHE_MAX
+        ]:
+            _sgc_webhook_origin_cache.pop(old_key, None)
+
+
+async def _sgc_resolve_reference(message: discord.Message) -> Optional[str]:
+    """自Bot上のメッセージ（返信元）から、SGCへ送るべきreference用messageIdを解決します。
+    返信元が「SGC由来の中継メッセージ（Webhook送信）」ならその元messageId、
+    「このグローバルチャットチャンネル内の生発言」ならそのメッセージIDそのものを返します。"""
+    if not message.reference or not message.reference.message_id:
+        return None
+    ref_id = message.reference.message_id
+    if ref_id in _sgc_webhook_origin_cache:
+        return _sgc_webhook_origin_cache[ref_id]
+    return str(ref_id)
+
+
+async def _sgc_send_to_hub(message: discord.Message, all_data: dict):
+    """このBotのグローバルチャットに投稿されたメッセージを、SGC仕様のJSONにしてハブチャンネルへ送信します。"""
+    global_cfg = get_global_config(all_data)
+    if not global_cfg.get("sgc_enabled", True):
+        return
+    hub_channel_id = global_cfg.get("sgc_hub_channel_id")
+    if not hub_channel_id:
+        return
+
+    hub_channel = bot.get_channel(hub_channel_id)
+    if hub_channel is None:
+        try:
+            hub_channel = await bot.fetch_channel(hub_channel_id)
+        except (discord.Forbidden, discord.HTTPException):
+            return
+    if hub_channel.id == message.channel.id:
+        return  # ハブチャンネル自身をグローバルチャットに登録している場合の二重送信防止
+
+    content = message.content or ""
+    if not content and not message.attachments:
+        return
+
+    payload = {
+        "type": "message",
+        "version": _SGC_VERSION,
+        "userId": str(message.author.id),
+        "userName": message.author.name,
+        "userDiscriminator": getattr(message.author, "discriminator", "0") or "0",
+        "userAvatar": (message.author.avatar.key if message.author.avatar else None),
+        "isBot": bool(message.author.bot),
+        "guildId": str(message.guild.id),
+        "guildName": message.guild.name,
+        "guildIcon": (message.guild.icon.key if message.guild.icon else None),
+        "channelId": str(message.channel.id),
+        "channelName": getattr(message.channel, "name", ""),
+        "messageId": str(message.id),
+        "content": content[:1900],
+    }
+    reference_id = await _sgc_resolve_reference(message)
+    if reference_id:
+        payload["reference"] = reference_id
+    if message.attachments:
+        payload["attachmentsUrl"] = [a.url for a in message.attachments[:4]]
+
+    try:
+        json_text = json.dumps(payload, ensure_ascii=False)
+        if len(json_text) > 1900:
+            # 長文はcontentを切り詰めて再生成（Discordの2000文字制限対策）
+            payload["content"] = payload["content"][:500]
+            json_text = json.dumps(payload, ensure_ascii=False)
+        await hub_channel.send(json_text)
+    except discord.Forbidden:
+        print(f"[SGC] ハブチャンネル {hub_channel_id} への送信権限がありません。")
+    except discord.HTTPException as e:
+        print(f"[SGC] ハブチャンネルへの送信に失敗しました: {e}")
+
+
+async def _sgc_find_message_by_id(hub_channel: discord.abc.Messageable, target_message_id: str) -> Optional[dict]:
+    """ハブチャンネルの履歴を遡り、指定されたSGC上のmessageIdを持つJSON投稿を探して返します（無ければNone）。"""
+    try:
+        async for past_message in hub_channel.history(limit=_SGC_HISTORY_SEARCH_LIMIT):
+            try:
+                past_data = json.loads(past_message.content)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(past_data, dict):
+                continue
+            if past_data.get("type") not in (None, "message"):
+                continue
+            past_id = past_data.get("messageId") or str(past_message.id)
+            if str(past_id) == str(target_message_id):
+                return past_data
+    except discord.HTTPException:
+        pass
+    return None
+
+
+async def _sgc_relay_from_hub(message: discord.Message):
+    """SGCハブチャンネルで他Botが投稿したメッセージを受信し、このBotのグローバルチャット参加サーバーへ中継します。"""
+    if bot.user is not None and message.author.id == bot.user.id:
+        return  # 自Bot自身がハブへ送信した投稿（エコー）は無視
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    if not global_cfg.get("sgc_enabled", True):
+        return
+
+    try:
+        data = json.loads(message.content)
+    except (json.JSONDecodeError, TypeError):
+        return  # SGC以外の雑談・独自規格等は無視
+    if not isinstance(data, dict) or data.get("type") != "message":
+        return
+
+    content = str(data.get("content") or "")
+    if not content:
+        return
+    user_name = str(data.get("userName") or "???")
+    guild_name = str(data.get("guildName") or "SGC")
+    attachments_url = data.get("attachmentsUrl") or []
+
+    # 返信(reference)対応: 参照先のJSON投稿をハブ履歴から探し、引用形式で本文の先頭に付加する
+    reference_id = data.get("reference")
+    if reference_id:
+        ref_data = await _sgc_find_message_by_id(message.channel, str(reference_id))
+        if ref_data:
+            ref_author = str(ref_data.get("userName") or "???")
+            ref_content = str(ref_data.get("content") or "")
+            quoted = "\n".join(f"> {line}" for line in ref_content.splitlines()[:5])
+            content = f"**@{ref_author} への返信**\n{quoted}\n{content}"
+
+    if attachments_url:
+        content = f"{content}\n" + "\n".join(str(u) for u in attachments_url[:4])
+    display_content = content[:2000]
+
+    user_id_raw = data.get("userId")
+    user_avatar_hash = data.get("userAvatar")
+    avatar_url = None
+    if user_id_raw and user_avatar_hash:
+        ext = "gif" if str(user_avatar_hash).startswith("a_") else "png"
+        avatar_url = f"https://cdn.discordapp.com/avatars/{user_id_raw}/{user_avatar_hash}.{ext}"
+
+    username = f"{user_name} (SGC:{guild_name})"[:80]
+    origin_message_id = str(data.get("messageId") or message.id)
+
+    channels_registry = global_cfg.get("globalchat_channels", {})
+    for guild_id_str, entry in list(channels_registry.items()):
+        target_channel_id = entry.get("channel_id")
+        if not target_channel_id:
+            continue
+        target_guild = bot.get_guild(int(guild_id_str))
+        if target_guild is None:
+            continue
+        target_channel = target_guild.get_channel(target_channel_id)
+        if target_channel is None:
+            continue
+
+        webhook = await _globalchat_get_or_create_webhook(target_channel)
+        if webhook is None:
+            continue
+        try:
+            sent = await webhook.send(
+                content=display_content,
+                username=username,
+                avatar_url=avatar_url,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+            # このサーバーで表示された中継メッセージが、後で返信された場合に元のSGC messageId を
+            # 復元できるよう対応表に記録しておく（_sgc_resolve_reference が参照する）。
+            _sgc_remember_webhook_origin(sent.id, origin_message_id)
+        except discord.NotFound:
+            _globalchat_webhook_cache.pop(target_channel.id, None)
+        except discord.HTTPException as e:
+            print(f"[SGC] 中継送信に失敗しました（guild_id={guild_id_str}）: {e}")
+
+
 # 招待リンク（自サーバー勧誘）は常にブロックする。他の自動モデレーション設定には依存しない。
 _GLOBALCHAT_INVITE_KEYWORDS = ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")
 
@@ -23391,6 +23629,13 @@ async def _globalchat_relay_message(message: discord.Message, all_data: dict):
             _globalchat_webhook_cache.pop(target_channel.id, None)
         except discord.HTTPException as e:
             print(f"[グローバルチャット] 中継送信に失敗しました（guild_id={guild_id_str}）: {e}")
+
+    # 参加サーバーへの中継に加えて、SGC（外部グローバルチャットネットワーク）が
+    # 設定されていればそちらにも同じメッセージを送信する。
+    try:
+        await _sgc_send_to_hub(message, all_data)
+    except Exception as e:
+        print(f"[SGC] ハブへの送信処理中にエラーが発生しました: {e}")
 
 
 @globalchat_group.command(name="setup", description="【管理者専用】このチャンネルをグローバルチャットに参加させます")
@@ -23541,6 +23786,90 @@ async def globalchat_emergency_stop(interaction: discord.Interaction, 状態: ap
     save_data(all_data)
     await interaction.response.send_message(
         f"[OK] グローバルチャットを{'稼働状態' if 状態.value == 'on' else '緊急停止状態'}にしました。",
+        ephemeral=True
+    )
+
+
+sgc_group = app_commands.Group(
+    name="sgc", description="SGC（Super Global Chat / 外部グローバルチャット網）との連携設定", parent=globalchat_group
+)
+
+
+@sgc_group.command(name="setup", description="【オーナー限定】現在のチャンネルをSGCのハブチャンネルとして登録します")
+async def sgc_setup(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["sgc_hub_channel_id"] = interaction.channel.id
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[OK] {interaction.channel.mention} をSGCのハブチャンネルとして登録しました。\n"
+        "-# あらかじめこのチャンネル（通常は #super-global-chat）にBotが参加し、"
+        "メッセージの閲覧・送信権限を持っている必要があります。\n"
+        "-# 以降、`/globalchat setup` で登録したこのBotのグローバルチャットと、"
+        "SGCに参加している他のBotのグローバルチャットが相互に中継されます。",
+        ephemeral=True
+    )
+
+
+@sgc_group.command(name="leave", description="【オーナー限定】SGCとの連携を解除します")
+async def sgc_leave(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["sgc_hub_channel_id"] = None
+    save_data(all_data)
+    await interaction.response.send_message("[OK] SGCとの連携を解除しました。", ephemeral=True)
+
+
+@sgc_group.command(name="status", description="SGC連携の状態を確認します")
+async def sgc_status(interaction: discord.Interaction):
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    hub_channel_id = global_cfg.get("sgc_hub_channel_id")
+    hub_channel = bot.get_channel(hub_channel_id) if hub_channel_id else None
+
+    embed = discord.Embed(
+        title="[SGC] 連携状況",
+        color=discord.Color.blue() if hub_channel_id else discord.Color.greyple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="ハブチャンネル",
+        value=(hub_channel.mention if hub_channel else f"`{hub_channel_id}`（参照不可）") if hub_channel_id else "未設定",
+        inline=False
+    )
+    embed.add_field(
+        name="連携の状態",
+        value="稼働中" if global_cfg.get("sgc_enabled", True) else "オーナーにより緊急停止中",
+        inline=True
+    )
+    embed.set_footer(text="このサーバーの /globalchat 参加チャンネルとSGCが相互に中継されます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@sgc_group.command(name="emergency_stop", description="【オーナー限定】SGCとの送受信を緊急停止/再開します")
+@discord.app_commands.describe(状態="on: SGCとの送受信を稼働させる／off: 送受信を即座に停止する")
+@discord.app_commands.choices(状態=[
+    app_commands.Choice(name="on（稼働）", value="on"),
+    app_commands.Choice(name="off（緊急停止）", value="off"),
+])
+async def sgc_emergency_stop(interaction: discord.Interaction, 状態: app_commands.Choice[str]):
+    if not await is_owner_check(interaction):
+        return
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    global_cfg["sgc_enabled"] = (状態.value == "on")
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"[OK] SGCとの送受信を{'稼働状態' if 状態.value == 'on' else '緊急停止状態'}にしました。",
         ephemeral=True
     )
 
